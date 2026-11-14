@@ -236,6 +236,212 @@ pub fn matches_payload(payload: &[u64; 32], keys: &[u16]) -> u32 {
     payload::matches(payload, keys)
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
+mod meets {
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    fn meets_v4(ranges: &[u32; 32], keys: &[u16]) -> u32 {
+        use core::arch::x86_64::*;
+        // the lanes of the 16-bit `min` (`odd = 0`) or `max` (`odd = 1`) ends of
+        // the 32 ranges, in order, among the 64 16-bit lanes of two vectors
+        const fn halves(odd: u16) -> [u16; 32] {
+            let mut x = [0; 32];
+            let mut i = 0;
+            while i < 32 {
+                x[i] = 2 * i as u16 + odd;
+                i += 1;
+            }
+            x
+        }
+        static MIN: [u16; 32] = halves(0);
+        static MAX: [u16; 32] = halves(1);
+        let p = ranges.as_ptr();
+        let x0 = unsafe { _mm512_loadu_si512(p.cast()) };
+        let x1 = unsafe { _mm512_loadu_si512(p.add(16).cast()) };
+        let min = unsafe { _mm512_loadu_si512(MIN.as_ptr().cast()) };
+        let max = unsafe { _mm512_loadu_si512(MAX.as_ptr().cast()) };
+        let min = _mm512_permutex2var_epi16(x0, min, x1);
+        let max = _mm512_permutex2var_epi16(x0, max, x1);
+        let mut mask = 0;
+        for &key in keys {
+            let t = _mm512_set1_epi16(key as i16);
+            mask |= _mm512_mask_cmpge_epu16_mask(_mm512_cmple_epu16_mask(min, t), max, t);
+        }
+        mask
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    fn meets_v4_test() {
+        if !crate::is_cpu_detected!("v4") {
+            println!("test {} ... skipped (v4)", module_path!());
+            return;
+        }
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let (ranges, keys) = sample();
+            for n in 0..=keys.len() {
+                let specialized = unsafe { meets_v4(&ranges, &keys[..n]) };
+                let fallback = fallback(&ranges, &keys[..n]);
+                assert_eq!(specialized, fallback);
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v3")]
+    fn meets_v3(ranges: &[u32; 32], keys: &[u16]) -> u32 {
+        use core::arch::x86_64::*;
+        /// The ends of 16 ranges, in order, as 16-bit lanes biased by 0x8000,
+        /// so that signed comparisons order them.
+        #[inline]
+        #[crate::target_cpu(enable = "v3")]
+        fn narrow(p: &[u32; 16]) -> (__m256i, __m256i) {
+            let p = p.as_ptr();
+            let x0 = unsafe { _mm256_loadu_si256(p.cast()) };
+            let x1 = unsafe { _mm256_loadu_si256(p.add(8).cast()) };
+            let low = _mm256_set1_epi32(0xffff);
+            let bias = _mm256_set1_epi16(i16::MIN);
+            // per 128-bit lane: ranges 0..4 8..12 | 4..8 12..16
+            let min = _mm256_packus_epi32(_mm256_and_si256(x0, low), _mm256_and_si256(x1, low));
+            let max = _mm256_packus_epi32(_mm256_srli_epi32::<16>(x0), _mm256_srli_epi32::<16>(x1));
+            let min = _mm256_permute4x64_epi64(min, 0b11_01_10_00);
+            let max = _mm256_permute4x64_epi64(max, 0b11_01_10_00);
+            (_mm256_xor_si256(min, bias), _mm256_xor_si256(max, bias))
+        }
+
+        let (lo, hi) = ranges.split_at(16);
+        let (min0, max0) = narrow(lo.try_into().unwrap());
+        let (min1, max1) = narrow(hi.try_into().unwrap());
+        let mut miss0 = _mm256_set1_epi16(-1);
+        let mut miss1 = _mm256_set1_epi16(-1);
+        for &key in keys {
+            let t = _mm256_set1_epi16((key ^ 0x8000) as i16);
+            let out0 = _mm256_or_si256(_mm256_cmpgt_epi16(min0, t), _mm256_cmpgt_epi16(t, max0));
+            let out1 = _mm256_or_si256(_mm256_cmpgt_epi16(min1, t), _mm256_cmpgt_epi16(t, max1));
+            miss0 = _mm256_and_si256(miss0, out0);
+            miss1 = _mm256_and_si256(miss1, out1);
+        }
+        // bytes per 64-bit lane: ranges 0..8 16..24 8..16 24..32
+        let y = _mm256_packs_epi16(miss0, miss1);
+        !(_mm256_movemask_epi8(_mm256_permute4x64_epi64(y, 0b11_01_10_00)) as u32)
+    }
+
+    #[cfg(all(target_arch = "x86_64", test))]
+    #[test]
+    fn meets_v3_test() {
+        if !crate::is_cpu_detected!("v3") {
+            println!("test {} ... skipped (v3)", module_path!());
+            return;
+        }
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let (ranges, keys) = sample();
+            for n in 0..=keys.len() {
+                let specialized = unsafe { meets_v3(&ranges, &keys[..n]) };
+                let fallback = fallback(&ranges, &keys[..n]);
+                assert_eq!(specialized, fallback);
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    fn meets_a2(ranges: &[u32; 32], keys: &[u16]) -> u32 {
+        use core::arch::aarch64::*;
+        let p = ranges.as_ptr().cast::<u16>();
+        // the ends of 8 ranges each, in order
+        let x: [uint16x8x2_t; 4] = std::array::from_fn(|i| unsafe { vld2q_u16(p.add(16 * i)) });
+        let mut y = [vdupq_n_u16(0); 4];
+        for &key in keys {
+            let t = vdupq_n_u16(key);
+            for i in 0..4 {
+                let hit = vandq_u16(vcleq_u16(x[i].0, t), vcgeq_u16(x[i].1, t));
+                y[i] = vorrq_u16(y[i], hit);
+            }
+        }
+        let bits = unsafe { vld1q_u16([1_u16, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
+        let mut mask = 0;
+        for i in 0..4 {
+            mask |= (vaddvq_u16(vandq_u16(y[i], bits)) as u32) << (8 * i);
+        }
+        mask
+    }
+
+    #[cfg(all(target_arch = "aarch64", test))]
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn meets_a2_test() {
+        if !crate::is_cpu_detected!("a2") {
+            println!("test {} ... skipped (a2)", module_path!());
+            return;
+        }
+        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+            let (ranges, keys) = sample();
+            for n in 0..=keys.len() {
+                let specialized = unsafe { meets_a2(&ranges, &keys[..n]) };
+                let fallback = fallback(&ranges, &keys[..n]);
+                assert_eq!(specialized, fallback);
+            }
+        }
+    }
+
+    /// Random ranges, some empty and some of one key, and random keys, about
+    /// half of which lie in a range.
+    #[cfg(test)]
+    fn sample() -> ([u32; 32], Vec<u16>) {
+        let ranges: [u32; 32] = std::array::from_fn(|_| {
+            let (a, b) = (rand::random::<u16>(), rand::random::<u16>());
+            let (min, max) = match rand::random::<u8>() % 4 {
+                0 => (a.max(b), a.min(b)),
+                1 => (a, a),
+                2 => (a, a.saturating_add(b % 256)),
+                _ => (a.min(b), a.max(b)),
+            };
+            min as u32 | (max as u32) << 16
+        });
+        let keys = (0..20)
+            .map(|_| {
+                let x = ranges[rand::random::<u32>() as usize % 32];
+                match rand::random::<u8>() % 4 {
+                    0 => x as u16,
+                    1 => (x >> 16) as u16,
+                    _ => rand::random(),
+                }
+            })
+            .collect();
+        (ranges, keys)
+    }
+
+    #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+    pub fn meets(ranges: &[u32; 32], keys: &[u16]) -> u32 {
+        let mut hit = [false; 32];
+        for &key in keys {
+            for i in 0..32 {
+                let (min, max) = (ranges[i] as u16, (ranges[i] >> 16) as u16);
+                hit[i] |= min <= key && key <= max;
+            }
+        }
+        let mut mask = 0;
+        for i in 0..32 {
+            mask |= (hit[i] as u32) << i;
+        }
+        mask
+    }
+}
+
+/// The ranges of 16-bit keys, each `min | max << 16` and empty if `min > max`,
+/// that hold one of `keys`, as a bitmask: bit `i` is range `i`. The cost is
+/// linear in the number of keys, so keep it to a few.
+#[inline(always)]
+pub fn meets(ranges: &[u32; 32], keys: &[u16]) -> u32 {
+    meets::meets(ranges, keys)
+}
+
 /// The portable compare of every value with every key, which the dispatchers
 /// compile for the targets without a kernel and the tests check the kernels
 /// against.
