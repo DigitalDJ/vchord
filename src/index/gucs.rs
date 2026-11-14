@@ -85,6 +85,8 @@ static mut VCHORDRQ_EPSILON_CONFIG: *mut pgrx::pg_sys::config_generic = core::pt
 
 static VCHORDRQ_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
+static VCHORDRQ_MAX_PROBES: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
 static VCHORDRQ_MAXSIM_REFINE: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 static mut VCHORDRQ_MAXSIM_REFINE_CONFIG: *mut pgrx::pg_sys::config_generic = core::ptr::null_mut();
@@ -149,6 +151,16 @@ pub fn init() {
         c"`max_scan_tuples` argument of vchordrq.",
         c"`max_scan_tuples` argument of vchordrq.",
         &VCHORDRQ_MAX_SCAN_TUPLES,
+        -1,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"vchordrq.max_probes",
+        c"`max_probes` argument of vchordrq.",
+        c"The most lists a scan with filter keys reads once its probed lists run out of candidates; -1 reads every list. Rows from further lists can be nearer than rows already returned.",
+        &VCHORDRQ_MAX_PROBES,
         -1,
         i32::MAX,
         GucContext::Userset,
@@ -515,6 +527,11 @@ pub unsafe fn vchordrq_epsilon(index: pgrx::pg_sys::Relation) -> f32 {
 
 pub fn vchordrq_max_scan_tuples() -> Option<u32> {
     let x = VCHORDRQ_MAX_SCAN_TUPLES.get();
+    if x < 0 { None } else { Some(x as u32) }
+}
+
+pub fn vchordrq_max_probes() -> Option<u32> {
+    let x = VCHORDRQ_MAX_PROBES.get();
     if x < 0 { None } else { Some(x as u32) }
 }
 

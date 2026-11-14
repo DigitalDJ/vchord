@@ -1,0 +1,540 @@
+# A scan with filter keys does not end while the index holds more matching
+# rows: once it has returned every row of the lists read so far and another
+# row is asked for, it reads further lists, nearest first. A scan without
+# filter keys still ends with its probed lists. Here 4 of 64 lists are probed,
+# and they hold few rows of a small owner.
+
+statement ok
+CREATE TABLE rf (id int PRIMARY KEY, owner int4, v vector(3));
+
+# owner 1: 300 rows, owner 2: 2,000 rows, owners 10..19: the rest
+statement ok
+INSERT INTO rf SELECT i,
+  CASE WHEN i % 200 = 0 THEN 1 WHEN i % 30 = 1 THEN 2 ELSE 10 + i % 10 END,
+  ARRAY[sin(i), cos(1.3 * i), sin(0.7 * i)]::real[]::vector
+FROM generate_series(1, 60000) i;
+
+statement ok
+CREATE INDEX rf_v ON rf USING vchordrq (v vector_l2_ops, owner int4_ops) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [64]
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+statement ok
+CREATE FUNCTION rf_count(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE n bigint; d bigint;
+BEGIN
+  EXECUTE format('SELECT count(*), count(DISTINCT id) FROM (%s) s', q) INTO n, d;
+  RETURN n || ' ' || d;
+END
+$$;
+
+statement ok
+CREATE FUNCTION rf_blocks(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || q INTO plan;
+  RETURN (plan -> 0 -> 'Plan' ->> 'Shared Hit Blocks')::bigint
+    + (plan -> 0 -> 'Plan' ->> 'Shared Read Blocks')::bigint;
+END
+$$;
+
+statement ok
+CREATE FUNCTION rf_blocks_at(probes text, q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE old text := current_setting('vchordrq.probes'); b bigint;
+BEGIN
+  PERFORM set_config('vchordrq.probes', probes, false);
+  b := rf_blocks(q);
+  PERFORM set_config('vchordrq.probes', old, false);
+  RETURN b;
+END
+$$;
+
+# the probed lists hold fewer rows of owner 1 than the LIMIT: a filter above
+# a scan without filter keys keeps ending with them
+query T
+SELECT count(*) < 50 FROM (SELECT id, owner FROM rf ORDER BY v <-> '[0.5,0.5,0.5]' OFFSET 0) s
+WHERE owner = 1;
+----
+t
+
+# a scan without filter keys returns the rows of its probed lists only: its
+# whole stream, and a filter above it that matches nothing, read a fraction of
+# what probing every list reads
+query T
+SELECT count(*) < 60000 FROM (SELECT id FROM rf ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+t
+
+query T
+SELECT rf_blocks_at('4', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''') * 8
+  < rf_blocks_at('64', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+query T
+SELECT rf_blocks_at('4', 'SELECT id FROM (SELECT id, owner FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]'' OFFSET 0) s WHERE owner = 999') * 8
+  < rf_blocks_at('64', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+# with the key, owner 1 gets the full LIMIT
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+50 50
+
+# and the stream reaches the owner's last row
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+300 300
+
+# a 2,000-row scroll by OFFSET reaches the owner's last row, without repeats
+statement ok
+CREATE FUNCTION rf_scroll(o int, page int) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE ids int[] := '{}'; p int[]; i int := 0;
+BEGIN
+  LOOP
+    SELECT ARRAY(SELECT id FROM rf WHERE owner = o ORDER BY v <-> '[0.5,0.5,0.5]'
+      LIMIT page OFFSET i * page) INTO p;
+    EXIT WHEN cardinality(p) = 0;
+    ids := ids || p;
+    i := i + 1;
+  END LOOP;
+  RETURN i || ' ' || cardinality(ids) || ' '
+    || (SELECT count(DISTINCT x) FROM unnest(ids) x) || ' '
+    || (SELECT count(*) FROM rf WHERE owner = o AND id = ANY(ids));
+END
+$$;
+
+query T
+SELECT rf_scroll(2, 100);
+----
+20 2000 2000 2000
+
+query T
+SELECT rf_scroll(1, 25);
+----
+12 300 300 300
+
+# a cursor fetching one row at a time across further lists
+statement ok
+CREATE FUNCTION rf_cursor(o int) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE c refcursor; r record; n int := 0; seen int[] := '{}';
+BEGIN
+  OPEN c FOR SELECT id FROM rf WHERE owner = o ORDER BY v <-> '[0.5,0.5,0.5]';
+  LOOP
+    FETCH c INTO r;
+    EXIT WHEN NOT FOUND;
+    n := n + 1;
+    seen := seen || r.id;
+  END LOOP;
+  CLOSE c;
+  RETURN n || ' ' || (SELECT count(DISTINCT x) FROM unnest(seen) x);
+END
+$$;
+
+query T
+SELECT rf_cursor(1);
+----
+300 300
+
+# rescans: a LATERAL join scans once per owner, each with its own key
+query II rowsort
+SELECT o.o, count(x.id) FROM unnest('{1,2,3,10}'::int[]) o(o)
+  LEFT JOIN LATERAL (SELECT id FROM rf WHERE rf.owner = o.o ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 350) x ON true
+GROUP BY o.o;
+----
+1	300
+10	350
+2	350
+3	0
+
+# a generic plan
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+statement ok
+PREPARE rf_p(int, int) AS SELECT count(*) FROM (SELECT id FROM rf WHERE owner = $1 ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT $2) s;
+
+query I
+EXECUTE rf_p(1, 1000);
+----
+300
+
+query I
+EXECUTE rf_p(2, 1500);
+----
+1500
+
+statement ok
+DEALLOCATE rf_p;
+
+statement ok
+RESET plan_cache_mode;
+
+# a filter above the scan that drops every row: the scan ends once it has
+# read every list
+query I
+SELECT count(*) FROM (SELECT id FROM rf WHERE owner = 1 AND id < 0 ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 10) s;
+----
+0
+
+# vchordrq.max_probes bounds the lists a scan with filter keys reads, the
+# probed ones included; by default there is no bound
+query T
+SHOW vchordrq.max_probes;
+----
+-1
+
+statement ok
+CREATE FUNCTION rf_ids(probes text, max_probes text, q text) RETURNS int[] LANGUAGE plpgsql AS $$
+DECLARE r int[];
+BEGIN
+  PERFORM set_config('vchordrq.probes', probes, true);
+  PERFORM set_config('vchordrq.max_probes', max_probes, true);
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (%s) s', q) INTO r;
+  RETURN coalesce(r, '{}');
+END
+$$;
+
+# below and at the probes: no further lists, the rows of the probed lists only
+query T
+SELECT rf_ids('4', '2', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''')
+  = ARRAY(SELECT id FROM (SELECT id, owner FROM rf ORDER BY v <-> '[0.5,0.5,0.5]' OFFSET 0) s WHERE owner = 1 ORDER BY id);
+----
+t
+
+query T
+SELECT rf_ids('4', '4', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''')
+  = ARRAY(SELECT id FROM (SELECT id, owner FROM rf ORDER BY v <-> '[0.5,0.5,0.5]' OFFSET 0) s WHERE owner = 1 ORDER BY id);
+----
+t
+
+# above the probes: the round that reaches the bound reads its nearest lists
+# only, so 4 probes bounded at 6 read the 6 lists that 6 probes read
+query T
+SELECT rf_ids('4', '6', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''')
+  = rf_ids('6', '6', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+query T
+SELECT rf_ids('4', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''')
+  = rf_ids('8', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+# rows grow with the bound (two more lists need not hold a row of owner 1,
+# four do here) and stop growing at it, whatever the LIMIT
+query T
+SELECT cardinality(rf_ids('4', '4', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  <= cardinality(rf_ids('4', '6', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  AND cardinality(rf_ids('4', '6', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  <= cardinality(rf_ids('4', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  AND cardinality(rf_ids('4', '4', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  < cardinality(rf_ids('4', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  AND cardinality(rf_ids('4', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''))
+  = cardinality(rf_ids('4', '8', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 250'));
+----
+t
+
+# a bound past the number of lists reads every list
+query T
+SELECT cardinality(rf_ids('4', '1000', 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'''));
+----
+300
+
+# it does not bound a scan without filter keys
+query T
+SELECT rf_ids('4', '2', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''')
+  = rf_ids('4', '-1', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+statement ok
+RESET vchordrq.max_probes;
+
+statement ok
+SET vchordrq.probes = '4';
+
+# max_scan_tuples still bounds the rows a scan returns
+statement ok
+SET vchordrq.max_scan_tuples = 30;
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+30 30
+
+statement ok
+RESET vchordrq.max_scan_tuples;
+
+# Further lists are read on demand only. The probed lists hold rows of owner
+# 1, so LIMIT 1 reads exactly the blocks of the same scan capped at the probed
+# lists, in every io mode (the default is read_stream on PostgreSQL 17 and
+# later, prefetch_buffer before). (How many blocks twice as many lists take
+# depends on the sizes of the lists, which the clustering decides.)
+statement ok
+CREATE FUNCTION rf_on_demand() RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE q text := 'SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 1';
+  b bigint; capped bigint; n bigint;
+BEGIN
+  b := rf_blocks_at('4', q);
+  PERFORM set_config('vchordrq.max_probes', '4', true);
+  capped := rf_blocks_at('4', q);
+  PERFORM set_config('vchordrq.probes', '4', true);
+  EXECUTE format('SELECT count(*) FROM (%s) s', q) INTO n;
+  PERFORM set_config('vchordrq.max_probes', '-1', true);
+  RETURN n = 1 AND b = capped;
+END
+$$;
+
+query T
+SELECT rf_on_demand();
+----
+t
+
+statement ok
+SET vchordrq.io_rerank = 'prefetch_buffer';
+
+query T
+SELECT rf_on_demand();
+----
+t
+
+statement ok
+SET vchordrq.io_rerank = 'read_buffer';
+
+query T
+SELECT rf_on_demand();
+----
+t
+
+statement ok
+RESET vchordrq.io_rerank;
+
+# each io mode, with and without prefilter
+statement ok
+SET vchordrq.prefilter = on;
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 AND id % 400 = 0 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+150 150
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+SET vchordrq.io_search = 'read_buffer';
+
+statement ok
+SET vchordrq.io_rerank = 'read_buffer';
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+50 50
+
+statement ok
+SET vchordrq.io_search = 'prefetch_buffer';
+
+statement ok
+SET vchordrq.io_rerank = 'prefetch_buffer';
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+50 50
+
+statement ok
+SET vchordrq.prefilter = on;
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 AND id % 400 = 0 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+150 150
+
+statement ok
+SET vchordrq.io_search = 'read_buffer';
+
+statement ok
+SET vchordrq.io_rerank = 'read_buffer';
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 AND id % 400 = 0 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+150 150
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+RESET vchordrq.io_search;
+
+statement ok
+RESET vchordrq.io_rerank;
+
+# A sphere around the ORDER BY vector bounds the scan, further lists
+# included: it returns rows inside the radius only, and it reads no further
+# lists once a candidate falls past the radius. Reading every list costs many
+# times the blocks of the bounded scan.
+statement ok
+CREATE FUNCTION rf_recheck(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  RETURN (plan -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Rows Removed by Index Recheck')::bigint;
+END
+$$;
+
+query T
+SELECT rf_blocks('SELECT id FROM rf WHERE owner = 1 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 1000') * 4
+  < rf_blocks('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 1000');
+----
+t
+
+query T
+SELECT rf_blocks('SELECT id FROM rf WHERE owner = 1 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)') * 4
+  < rf_blocks('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 1000');
+----
+t
+
+# no row past the radius reaches the executor
+query I
+SELECT rf_recheck('SELECT id FROM rf WHERE owner = 1 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 1000');
+----
+0
+
+query T
+SELECT count(*) = count(*) FILTER (WHERE v <-> '[0.5,0.5,0.5]' < 0.3) FROM (
+  SELECT id, v FROM rf WHERE owner = 1 AND v <<->> sphere('[0.5,0.5,0.5]'::vector, 0.3)
+  ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 1000) s;
+----
+t
+
+# With an absent key no candidate falls past the radius, so the sphere does
+# not stop the scan: it reads every list, as it does without the sphere.
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 999 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10');
+----
+0 0
+
+query T
+SELECT rf_blocks('SELECT id FROM rf WHERE owner = 999 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  = rf_blocks('SELECT id FROM rf WHERE owner = 999 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10');
+----
+t
+
+# The same holds for a key whose rows all lie inside the radius: once they
+# are returned and more are asked for, the scan reads every list.
+statement ok
+INSERT INTO rf SELECT 100000 + i, 5, ARRAY[0.5 + 0.01 * sin(i), 0.5 + 0.01 * cos(i), 0.5]::real[]::vector
+FROM generate_series(1, 20) i;
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 5 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+20 20
+
+query T
+SELECT rf_blocks('SELECT id FROM rf WHERE owner = 5 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10') * 4
+  < rf_blocks('SELECT id FROM rf WHERE owner = 5 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+t
+
+query T
+SELECT rf_blocks('SELECT id FROM rf WHERE owner = 5 AND v <<->> sphere(''[0.5,0.5,0.5]''::vector, 0.3)
+  ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50')
+  = rf_blocks('SELECT id FROM rf WHERE owner = 5 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+t
+
+# A hierarchical, non-residual index with vectors reranked from the table:
+# each refill round doubles the probes at both levels, until they cover
+# every list.
+statement ok
+DROP INDEX rf_v;
+
+statement ok
+CREATE INDEX rf_h ON rf USING vchordrq (v vector_l2_ops, owner int4_ops) WITH (options = $$
+residual_quantization = false
+rerank_in_table = true
+[build.internal]
+lists = [8, 64]
+$$);
+
+statement ok
+SET vchordrq.probes = '1,4';
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 50');
+----
+50 50
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+300 300
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 999 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+0 0
+
+query T
+SELECT rf_scroll(2, 100);
+----
+20 2000 2000 2000
+
+statement ok
+SET vchordrq.prefilter = on;
+
+query T
+SELECT rf_count('SELECT id FROM rf WHERE owner = 1 AND id % 400 = 0 ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+150 150
+
+statement ok
+RESET vchordrq.prefilter;
+
+# a scan without filter keys reads only the probed lists of both levels
+query T
+SELECT rf_blocks_at('1,4', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''') * 8
+  < rf_blocks_at('8,64', 'SELECT id FROM rf ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+t
+
+statement ok
+DROP TABLE rf;
+
+statement ok
+DROP FUNCTION rf_count, rf_scroll, rf_cursor, rf_blocks, rf_blocks_at, rf_on_demand, rf_recheck, rf_ids;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;

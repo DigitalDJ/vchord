@@ -73,6 +73,10 @@ where
     fn into_inner(self) -> Self::Inner {
         self.sequence.into_inner()
     }
+
+    fn refill(&mut self) -> bool {
+        self.sequence.refill()
+    }
 }
 
 pub fn filter<S, P>(sequence: S, predicate: P) -> Filter<S, P> {

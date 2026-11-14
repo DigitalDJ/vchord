@@ -697,6 +697,8 @@ where
     type Inner =
         Chain<std::collections::vec_deque::IntoIter<I::Item>, Flatten<std::option::IntoIter<I>>>;
 
+    type Iter = I;
+
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     fn next(&mut self) -> Option<(I::Item, Self::Guards)> {
         panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
@@ -739,6 +741,22 @@ where
             .window
             .into_iter()
             .chain(cache.iter.into_iter().flatten())
+    }
+
+    fn refill(&mut self, refill: impl FnOnce(&mut I) -> bool) -> bool {
+        // Every item has been taken: no buffer is pinned or queued.
+        let Some(iter) = unsafe { self.cache.as_mut() }.iter.as_mut() else {
+            return false;
+        };
+        if !refill(iter) {
+            return false;
+        }
+        // The stream ended when the iterator ran out; start it again.
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+        unsafe {
+            pgrx::pg_sys::read_stream_reset(self.raw);
+        }
+        true
     }
 }
 
