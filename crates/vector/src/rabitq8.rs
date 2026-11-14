@@ -199,8 +199,7 @@ impl<'a> Rabitq8Borrowed<'a> {
         self.sum_of_x2
     }
 
-    /// Whether the encoded vector has a direction: its squared norm is
-    /// positive and finite. See `VectBorrowed::direction_norm`.
+    /// Whether the encoded vector has a direction: its squared norm is positive and finite.
     #[inline(always)]
     pub fn has_direction(&self) -> bool {
         self.sum_of_x2 > 0.0 && self.sum_of_x2.is_finite()

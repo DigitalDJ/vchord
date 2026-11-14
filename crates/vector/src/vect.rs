@@ -99,20 +99,10 @@ impl<'a, S: Floating> VectBorrowed<'a, S> {
         self.0
     }
 
-    /// The norm, if the vector has a direction: positive and finite.
-    ///
-    /// Cosine is undefined without one. `function_normalize` and the cosine
-    /// operator classes use this same test, so a vector a cosine index
-    /// stores is always one that normalization can scale to unit length.
-    #[inline(always)]
-    pub fn direction_norm(&self) -> Option<f32> {
-        let l = S::reduce_sum_of_x2(self.0).sqrt();
-        (l > 0.0 && l.is_finite()).then_some(l)
-    }
-
+    /// Non-zero; the cosine opclasses and `function_normalize` share this test.
     #[inline(always)]
     pub fn has_direction(&self) -> bool {
-        self.direction_norm().is_some()
+        crate::has_direction(self.0)
     }
 }
 
@@ -162,19 +152,10 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
         unimplemented!()
     }
 
-    /// Scales the vector to unit length.
-    ///
-    /// A vector whose norm is zero (or not finite) has no direction, and
-    /// scaling it by `1 / l` would fill it with NaN, so it is returned
-    /// unchanged. A zero vector therefore stays zero: its dot product with any
-    /// unit vector is 0, i.e. it is treated as orthogonal to everything.
+    /// Scales to unit length; a vector without a direction is returned unchanged.
     #[inline(always)]
     fn function_normalize(&self) -> VectOwned<S> {
-        let mut data = self.0.to_vec();
-        if let Some(l) = self.direction_norm() {
-            S::vector_mul_scalar_inplace(&mut data, 1.0 / l);
-        }
-        VectOwned(data)
+        VectOwned(crate::normalized(self.0).unwrap_or_else(|| self.0.to_vec()))
     }
 
     fn operator_add(&self, rhs: Self) -> Self::Owned {
@@ -272,15 +253,6 @@ mod tests {
             let r = VectBorrowed::new(&zero).function_normalize();
             assert!(r.slice().iter().all(|x| x._to_f32() == 0.0));
         }
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn normalize_non_finite_norm() {
-        // `1e30^2` overflows f32, so the norm is infinite and `1 / l` is zero.
-        let x = vec![1e30f32, -1e30, 3.0];
-        let r = VectBorrowed::new(&x).function_normalize();
-        assert_eq!(r.slice(), &x[..]);
     }
 
     #[test]

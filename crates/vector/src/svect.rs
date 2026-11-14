@@ -224,11 +224,11 @@ impl<S: Floating> VectorBorrowed for SVectBorrowed<'_, S> {
 
     #[inline(always)]
     fn function_normalize(&self) -> SVectOwned<S> {
-        let l = S::reduce_sum_of_x2(self.values).sqrt();
+        let Some(mut values) = crate::normalized(self.values) else {
+            return self.own();
+        };
         let mut indexes = self.indexes.to_vec();
-        let mut values = self.values.to_vec();
         let n = indexes.len();
-        S::vector_mul_scalar_inplace(&mut values, 1.0 / l);
         let mut j = 0_usize;
         for i in 0..n {
             if values[i] != S::zero() {
@@ -429,5 +429,25 @@ impl<S: Floating> PartialOrd for SVectBorrowed<'_, S> {
                 (None, None) => Some(Ordering::Equal),
             };
         }
+    }
+}
+
+#[test]
+fn normalize_and_cosine_out_of_range() {
+    let unit = |x: &SVectOwned<f32>| f32::reduce_sum_of_x2(x.as_borrowed().values()).sqrt();
+    let empty = SVectOwned::<f32>::new(8, vec![], vec![]);
+    let r = empty.as_borrowed().function_normalize();
+    assert!(r.as_borrowed().values().is_empty());
+    for values in [vec![3.0f32, 4.0], vec![1e30, -1e30], vec![1e-23, 2e-23]] {
+        let x = SVectOwned::new(8, vec![1, 5], values);
+        let r = x.as_borrowed().function_normalize();
+        assert!((unit(&r) - 1.0).abs() < 1e-6);
+        assert!(x.as_borrowed().operator_cos(x.as_borrowed()).to_f32().abs() < 1e-6);
+        assert!(
+            x.as_borrowed()
+                .operator_cos(empty.as_borrowed())
+                .to_f32()
+                .is_nan()
+        );
     }
 }

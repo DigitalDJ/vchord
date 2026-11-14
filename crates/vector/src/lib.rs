@@ -104,6 +104,24 @@ fn rescaled<S: Floating>(values: &[S]) -> Option<Vec<f32>> {
     ))
 }
 
+/// Whether `values` is non-zero, so that `normalized` returns a vector.
+pub(crate) fn has_direction<S: Floating>(values: &[S]) -> bool {
+    let x2 = S::reduce_sum_of_x2(values);
+    (MIN_FAST_X2..f32::INFINITY).contains(&x2) || scale(values).is_some()
+}
+
+/// `values` at unit length, or `None` without a direction.
+pub(crate) fn normalized<S: Floating>(values: &[S]) -> Option<Vec<S>> {
+    let x2 = S::reduce_sum_of_x2(values);
+    if (MIN_FAST_X2..f32::INFINITY).contains(&x2) {
+        return Some(S::vector_mul_scalar(values, 1.0 / x2.sqrt()));
+    }
+    let mut x = rescaled(values)?;
+    let l = f32::reduce_sum_of_x2(&x).sqrt();
+    f32::vector_mul_scalar_inplace(&mut x, 1.0 / l);
+    Some(S::vector_from_f32(&x))
+}
+
 #[test]
 fn cosine_distance_extremes() {
     let cos = |x: &[f32], y: &[f32]| {
@@ -137,4 +155,18 @@ fn cosine_distance_extremes() {
     ones[0] = -65533.0;
     assert_eq!(cos(&sub, &ones).to_bits(), cos(&up(&sub), &ones).to_bits());
     assert!((cos(&sub, &ones) - 1.0).abs() < 1e-4);
+}
+
+#[test]
+fn normalized_subnormal_squares() {
+    let norm = |x: &[f32]| x.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
+    let up = |x: &[f32]| x.iter().map(|&x| x * 2f32.powi(70)).collect::<Vec<_>>();
+    let mut mixed = vec![1e-21f32; 65535];
+    mixed[0] = 1.1e-21;
+    for x in [vec![1.1e-21f32; 65535], mixed] {
+        assert!(has_direction(&x));
+        let r = normalized(&x).unwrap();
+        assert_eq!(r, normalized(&up(&x)).unwrap());
+        assert!((norm(&r) - 1.0).abs() < 1e-4, "{}", norm(&r));
+    }
 }
