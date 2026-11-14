@@ -76,27 +76,16 @@ impl Floating for f16 {
 
     #[inline(always)]
     fn reduce_sum_of_d2_approx(lhs: &[f16], rhs: &[f16]) -> f32 {
-        #[cfg(target_arch = "aarch64")]
-        {
-            reduce_sum_of_d2_approx::reduce_sum_of_d2_approx(lhs, rhs)
+        if reduce_sum_of_d2_approx::is_fast_path_detected() {
+            return reduce_sum_of_d2_approx::reduce_sum_of_d2_approx(lhs, rhs);
         }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            // No additional runtime dispatch on CPUs without a fast kernel.
-            Self::reduce_sum_of_d2(lhs, rhs)
-        }
+        // No additional runtime dispatch on CPUs without a fast kernel.
+        Self::reduce_sum_of_d2(lhs, rhs)
     }
 
     #[inline(always)]
     fn reduce_sum_of_d2_approx_is_exact() -> bool {
-        #[cfg(target_arch = "aarch64")]
-        {
-            !reduce_sum_of_d2_approx::is_fast_path_detected()
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            true
-        }
+        !reduce_sum_of_d2_approx::is_fast_path_detected()
     }
 
     #[inline(always)]
@@ -462,19 +451,71 @@ mod reduce_sum_of_d2 {
     }
 }
 
-#[cfg(any(target_arch = "aarch64", test))]
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_d2_approx {
     use crate::{Floating, f16};
 
-    /// Mirrors the dispatch condition of `reduce_sum_of_d2_approx` below.
-    #[cfg(target_arch = "aarch64")]
+    /// Whether `reduce_sum_of_d2_approx` has a fast kernel; CPUs with this feature have the rest.
+    #[inline]
     pub fn is_fast_path_detected() -> bool {
-        crate::is_cpu_detected!("a2")
-            && crate::is_feature_detected!("fp16")
-            && crate::is_feature_detected!("fhm")
+        #[cfg(target_arch = "aarch64")]
+        return crate::is_feature_detected!("fp16");
+        #[cfg(target_arch = "x86_64")]
+        return crate::is_feature_detected!("avx512fp16");
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        false
+    }
+
+    /// Retries in f32 when the difference of two finite halves overflows f16.
+    #[inline(always)]
+    fn finite_or_exact(result: f32, lhs: &[f16], rhs: &[f16]) -> f32 {
+        if result.is_finite() {
+            result
+        } else {
+            f16::reduce_sum_of_d2(lhs, rhs)
+        }
     }
 
     // Only the difference is rounded (to f16), so each term is within a relative (1 + 2^-11)^2 - 1 of exact.
+
+    #[inline]
+    #[cfg(target_arch = "x86_64")]
+    #[crate::target_cpu(enable = "v4")]
+    #[target_feature(enable = "avx512fp16")]
+    fn reduce_sum_of_d2_approx_v4_avx512fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+        use core::arch::x86_64::*;
+        let load = |p: *const f16, len: usize| unsafe {
+            if len == 32 {
+                _mm512_castsi512_ph(_mm512_loadu_epi16(p.cast()))
+            } else {
+                let mask = _bzhi_u32(0xffffffff, len as u32);
+                _mm512_castsi512_ph(_mm512_maskz_loadu_epi16(mask, p.cast()))
+            }
+        };
+        let add =
+            |x: [__m512; 2], y: [__m512; 2]| [_mm512_add_ps(x[0], y[0]), _mm512_add_ps(x[1], y[1])];
+        let sum = crate::reduce::fold::<_, _, 2, 32, 2, 2>(
+            [lhs, rhs],
+            [_mm512_setzero_ps(); 2],
+            add,
+            |s, [x, y], len| {
+                let d = _mm512_sub_ph(load(x, len), load(y, len));
+                let d_0 = _mm512_cvtxph_ps(_mm512_castph512_ph256(d));
+                let d_1 = _mm512_castph_si512(d);
+                let d_1 =
+                    _mm512_cvtxph_ps(_mm256_castsi256_ph(_mm512_extracti64x4_epi64::<1>(d_1)));
+                [
+                    _mm512_fmadd_ps(d_0, d_0, s[0]),
+                    _mm512_fmadd_ps(d_1, d_1, s[1]),
+                ]
+            },
+        );
+        finite_or_exact(
+            _mm512_reduce_add_ps(_mm512_add_ps(sum[0], sum[1])),
+            lhs,
+            rhs,
+        )
+    }
 
     #[inline]
     #[cfg(target_arch = "aarch64")]
@@ -482,20 +523,28 @@ mod reduce_sum_of_d2_approx {
     #[target_feature(enable = "fp16,fhm")]
     fn reduce_sum_of_d2_approx_a2_fp16_fhm(lhs: &[f16], rhs: &[f16]) -> f32 {
         use core::arch::aarch64::*;
-        let result = crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
+        let sum = crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
             let d = vsubq_f16(x, y);
             [vfmlalq_low_f16(s[0], d, d), vfmlalq_high_f16(s[1], d, d)]
         });
-        if result.is_finite() {
-            result
-        } else {
-            // Finite f16 operands can have a difference beyond the f16 range.
-            // Retry in f32 without adding a range scan to the ordinary path.
-            f16::reduce_sum_of_d2(lhs, rhs)
-        }
+        finite_or_exact(sum, lhs, rhs)
     }
 
-    #[crate::multiversion(@"a2:fp16:fhm")]
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    #[target_feature(enable = "fp16")]
+    fn reduce_sum_of_d2_approx_a2_fp16(lhs: &[f16], rhs: &[f16]) -> f32 {
+        use core::arch::aarch64::*;
+        let sum = crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
+            let d = vsubq_f16(x, y);
+            let (d_0, d_1) = (vcvt_f32_f16(vget_low_f16(d)), vcvt_high_f32_f16(d));
+            [vfmaq_f32(s[0], d_0, d_0), vfmaq_f32(s[1], d_1, d_1)]
+        });
+        finite_or_exact(sum, lhs, rhs)
+    }
+
+    #[crate::multiversion(@"v4:avx512fp16", @"a2:fp16:fhm", @"a2:fp16")]
     pub fn reduce_sum_of_d2_approx(lhs: &[f16], rhs: &[f16]) -> f32 {
         f16::reduce_sum_of_d2(lhs, rhs)
     }

@@ -132,6 +132,12 @@ fn floating(c: &mut Criterion) {
         random_f16,
         h::reduce_sum_of_d2::implementations(),
     );
+    binary(
+        c,
+        "floating_f16::reduce_sum_of_d2_approx",
+        random_f16,
+        h::reduce_sum_of_d2_approx::implementations(),
+    );
 }
 
 // RaBitQ's binary and block query LUTs.
