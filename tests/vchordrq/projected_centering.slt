@@ -1,0 +1,94 @@
+# Neighbors are compared as sets: two at nearly the same distance may come in either order.
+
+statement ok
+CREATE TABLE projected_centering (id integer, v vector(32), h halfvec(32));
+
+statement ok
+INSERT INTO projected_centering
+SELECT i, a::vector, a::halfvec FROM (
+  SELECT i, ARRAY(SELECT 2 * (hashint4(32 * i + j) & 65535) / 65536.0
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(1, 2000) i
+) s;
+
+statement ok
+CREATE TABLE projected_centering_q (k integer, v vector(32), h halfvec(32));
+
+statement ok
+INSERT INTO projected_centering_q
+SELECT k, a::vector, a::halfvec FROM (
+  SELECT k, ARRAY(SELECT 2 * (hashint4(-32 * k - j) & 65535) / 65536.0 - 0.9
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(1, 20) k
+) s;
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (v vector_ip_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (h halfvec_ip_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+INSERT INTO projected_centering
+SELECT i, a::vector, a::halfvec FROM (
+  SELECT i, ARRAY(SELECT 2 * (hashint4(32 * i + j) & 65535) / 65536.0
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(2001, 2200) i
+) s;
+
+statement ok
+SET enable_indexscan = off;
+
+statement ok
+CREATE TABLE projected_centering_exact AS
+SELECT q.k,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <#> q.v, id LIMIT 10) n ORDER BY id) AS v_ip,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <#> q.h, id LIMIT 10) n ORDER BY id) AS h_ip
+FROM projected_centering_q q;
+
+statement ok
+RESET enable_indexscan;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+SET vchordrq.epsilon = 4.0;
+
+query II
+SELECT count(*) FILTER (WHERE got = want), count(*) FROM (
+  SELECT e.v_ip want,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <#> q.v LIMIT 10) n ORDER BY id) got
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT e.h_ip,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <#> q.h LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+) s;
+----
+40 40
+
+statement ok
+RESET vchordrq.epsilon;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE projected_centering, projected_centering_q, projected_centering_exact;

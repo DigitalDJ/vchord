@@ -437,7 +437,13 @@ pub trait Operator: 'static + Debug + Copy {
     /// `dis_f`.
     fn routing_is_exact() -> bool;
 
+    /// Centered on the query's projection on the centroid; L2 cannot be, lacking `<r, c>`.
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual;
+
+    /// Centred on the centroid: routing's `dis_f` is an estimate, and a projection would build on it.
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Self::residual(lut, dis_f, norm)
+    }
 
     fn block_access(
         lut: &BlockLut,
@@ -563,7 +569,11 @@ impl Operator for Op<VectOwned<f32>, Dot> {
     }
 
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
-        Residual::dot(lut, dis_f, norm)
+        Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
+    }
+
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, 1.0)
     }
 
     fn block_access(
@@ -734,7 +744,11 @@ impl Operator for Op<VectOwned<f16>, Dot> {
     }
 
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
-        Residual::dot(lut, dis_f, norm)
+        Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
+    }
+
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, 1.0)
     }
 
     fn block_access(

@@ -186,7 +186,8 @@ where
         let mut step = |lists: Vec<List<'b>>| {
             let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
             for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in lists {
-                let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm));
+                let residual =
+                    is_residual.then(|| O::routing_residual(&lut.0, dis_f.to_f32(), norm));
                 tape::read_h1_tape::<R, _, _>(
                     by_next(index, first),
                     || O::block_access(&lut.0, residual),
