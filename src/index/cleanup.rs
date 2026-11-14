@@ -27,7 +27,18 @@ pub fn pg_cleanup_allowed() -> bool {
 /// This scope only destroys objects; it must not advance iterators or evaluate
 /// user expressions. MemoryContext and ResourceOwner cleanup may already have
 /// invalidated their PostgreSQL pointers.
+///
+/// A FATAL error exits the backend from inside the scan without unwinding, and
+/// the MemoryContext callbacks run on the way out. The scan's objects may then
+/// be in the middle of an operation in the frames it left: a `LazyCell` being
+/// forced still holds the closure it moved out and is running. Dropping them
+/// would drop that closure a second time, so they are leaked to the exit.
 pub fn abandon<T>(value: T) {
+    if unsafe { pgrx::pg_sys::proc_exit_inprogress } {
+        std::mem::forget(value);
+        return;
+    }
+
     struct Restore(bool);
 
     impl Drop for Restore {
