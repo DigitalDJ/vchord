@@ -26,6 +26,17 @@ use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::{VectBorrowed, VectOwned};
 
+/// The page ids that every vector of `dim` dimensions keeps, to prefetch it.
+pub fn prefetch(vector_kind: VectorKind, dim: u32) -> usize {
+    use vchordrq::operator::Vector;
+    (match vector_kind {
+        VectorKind::Vecf32 => VectOwned::<f32>::count(dim),
+        VectorKind::Vecf16 => VectOwned::<f16>::count(dim),
+        VectorKind::Rabitq8 => Rabitq8Owned::count(dim),
+        VectorKind::Rabitq4 => Rabitq4Owned::count(dim),
+    }) as usize
+}
+
 pub fn prewarm<R>(opfamily: Opfamily, index: &R, height: i32) -> String
 where
     R: RelationRead,
@@ -212,6 +223,7 @@ where
 pub fn build<R>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexOptions,
+    keys: &vchordrq::keys::Keys,
     index: &R,
     structures: Vec<Structure<Normalized>>,
 ) where
@@ -222,48 +234,56 @@ pub fn build<R>(
         (VectorKind::Vecf32, DistanceKind::L2S) => vchordrq::build::<_, Op<VectOwned<f32>, L2S>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf32, DistanceKind::Dot) => vchordrq::build::<_, Op<VectOwned<f32>, Dot>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf16, DistanceKind::L2S) => vchordrq::build::<_, Op<VectOwned<f16>, L2S>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Vecf16, DistanceKind::Dot) => vchordrq::build::<_, Op<VectOwned<f16>, Dot>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Rabitq8, DistanceKind::L2S) => vchordrq::build::<_, Op<Rabitq8Owned, L2S>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::build::<_, Op<Rabitq8Owned, Dot>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Rabitq4, DistanceKind::L2S) => vchordrq::build::<_, Op<Rabitq4Owned, L2S>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
         (VectorKind::Rabitq4, DistanceKind::Dot) => vchordrq::build::<_, Op<Rabitq4Owned, Dot>>(
             vector_options,
             vchordrq_options,
+            keys,
             index,
             map_structures(structures, Normalize::denormalize),
         ),
@@ -274,6 +294,7 @@ pub fn insert<R>(
     opfamily: Opfamily,
     index: &R,
     payload: NonZero<u64>,
+    columns: &[u8],
     vector: OwnedVector,
     skip_freespaces: bool,
     skip_search: bool,
@@ -298,6 +319,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f32>, L2S>>(
                 index,
                 payload,
+                columns,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -318,6 +340,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f32>, Dot>>(
                 index,
                 payload,
+                columns,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -338,6 +361,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f16>, L2S>>(
                 index,
                 payload,
+                columns,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -358,6 +382,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<VectOwned<f16>, Dot>>(
                 index,
                 payload,
+                columns,
                 projected.as_borrowed(),
                 key,
                 bump,
@@ -377,6 +402,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq8Owned, Dot>>(
                 index,
                 payload,
+                columns,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -396,6 +422,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq8Owned, L2S>>(
                 index,
                 payload,
+                columns,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -415,6 +442,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq4Owned, Dot>>(
                 index,
                 payload,
+                columns,
                 vector.as_borrowed(),
                 key,
                 bump,
@@ -434,6 +462,7 @@ pub fn insert<R>(
             vchordrq::insert::<_, Op<Rabitq4Owned, L2S>>(
                 index,
                 payload,
+                columns,
                 vector.as_borrowed(),
                 key,
                 bump,

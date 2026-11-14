@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::keys::Keys;
 use crate::tape::TapeWriter;
 use crate::tuples::*;
 use crate::{Branch, Opaque};
@@ -113,6 +114,9 @@ where
 {
     tape: TapeWriter<'a, R, FrozenTuple>,
     branches: Vec<Branch<NonZero<u64>>>,
+    keys: &'a Keys,
+    /// The branches' filter key columns, a row's after another's.
+    columns: Vec<u8>,
 }
 
 impl<'a, R> FrozenTapeWriter<'a, R>
@@ -120,14 +124,18 @@ where
     R: RelationWrite + 'a,
     R::Page: Page<Opaque = Opaque>,
 {
-    pub fn create(index: &'a R, tracking_freespace: bool) -> Self {
+    pub fn create(index: &'a R, keys: &'a Keys, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
+            keys,
+            columns: Vec::new(),
         }
     }
-    pub fn push(&mut self, branch: Branch<NonZero<u64>>) {
+    /// `columns`: the branch's, as an appendable tuple stores them.
+    pub fn push(&mut self, branch: Branch<NonZero<u64>>, columns: &[u8]) {
         self.branches.push(branch);
+        self.columns.extend_from_slice(columns);
         if let Ok(chunk) = <&[_; 32]>::try_from(self.branches.as_slice()) {
             self.tape.push_parts(FrozenTuple0 {
                 metadata: [
@@ -143,12 +151,20 @@ where
                 elements: padding_pack(
                     chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)),
                 ),
+                columns: self.keys.block(&self.columns),
             });
             self.branches.clear();
+            self.columns.clear();
         }
     }
-    pub fn into_inner(self) -> (TapeWriter<'a, R, FrozenTuple>, Vec<Branch<NonZero<u64>>>) {
-        (self.tape, self.branches)
+    pub fn into_inner(
+        self,
+    ) -> (
+        TapeWriter<'a, R, FrozenTuple>,
+        Vec<Branch<NonZero<u64>>>,
+        Vec<u8>,
+    ) {
+        (self.tape, self.branches, self.columns)
     }
 }
 
@@ -209,10 +225,11 @@ mod tests {
     fn parts() {
         for dim in [64, 768, 1000, 1536, 3000] {
             let relation = MemoryRelation::<Opaque>::new([]);
-            let mut tape = FrozenTapeWriter::create(&relation, false);
+            let keys = Keys::new([]);
+            let mut tape = FrozenTapeWriter::create(&relation, &keys, false);
             let n = 32 * 40;
             for i in 0..n {
-                tape.push(branch(i, dim, NonZero::new(1 + i as u64).unwrap()));
+                tape.push(branch(i, dim, NonZero::new(1 + i as u64).unwrap()), &[]);
             }
             let first = tape.into_inner().0.first();
             let mut rows = 0;

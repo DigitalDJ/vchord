@@ -64,6 +64,7 @@ where
 pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     payload: NonZero<u64>,
+    columns: &[u8],
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
@@ -198,6 +199,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         prefetch,
         head,
         elements: rabitq::bit::binary::pack_code(&code.1),
+        columns: columns.to_vec(),
     });
 
     tape::append(

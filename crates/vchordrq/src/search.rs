@@ -7,9 +7,10 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2};
+use crate::keys::KeyFilter;
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::tape::{by_directory, by_next};
+use crate::tape::{Filter, Row, by_directory, by_next};
 use crate::tuples::*;
 use crate::{Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
@@ -59,6 +60,7 @@ pub type MaxsimCandidate<'b> = (
 pub struct SearchParams {
     pub probes: Vec<u32>,
     pub epsilon: f32,
+    pub filter: Option<KeyFilter>,
 }
 
 struct Searcher<'b, R, O, V, B, H1, H0> {
@@ -268,10 +270,13 @@ where
     }
 
     /// Returns how many rows the list holds.
+    // Inlined with its callback, whose per-row work is most of a scan's.
+    #[inline(always)]
     fn read_list(
         &mut self,
         (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location)): List<'b>,
-        mut callback: impl for<'a> FnMut((f32, f32), u16, NonZero<u64>, &'a [u32]),
+        filter: impl Filter,
+        mut callback: impl for<'a> FnMut(Row<'a, (f32, f32)>),
     ) -> u64 {
         let Self {
             index,
@@ -310,37 +315,42 @@ where
             tape::read_frozen_tape::<R, _, _>(
                 by_directory(prefetch_h0_tuples, directory),
                 block_access,
+                filter,
                 &mut callback,
             );
         } else {
             tape::read_frozen_tape::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
                 block_access,
+                filter,
                 &mut callback,
             );
         }
         tape::read_appendable_tape::<R, _>(
             by_next(index, jump_tuple.appendable_first()),
             O::binary_access(&lut.1, residual),
+            filter,
             &mut callback,
         );
         jump_tuple.tuples()
     }
 
-    fn read(&mut self, lists: Vec<List<'b>>) -> Vec<Candidate<'b>> {
+    fn read(&mut self, lists: Vec<List<'b>>, filter: impl Filter) -> Vec<Candidate<'b>> {
         let (bump, epsilon) = (self.bump, self.epsilon);
         let mut results = LinkedVec::new();
         for list in lists {
             self.read_list(
                 list,
-                id_2(|(rough, err), head, payload, prefetch| {
+                filter,
+                id_2(|row| {
+                    let (rough, err) = row.value;
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
                         (Reverse(lowerbound), AlwaysEqual(())),
                         AlwaysEqual(PackedRefMut4(bump.alloc((
-                            payload,
-                            head,
-                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                            row.payload,
+                            row.head,
+                            BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
                         )))),
                     ));
                 }),
@@ -406,7 +416,11 @@ where
         prefetch_h0_tuples,
     );
     let Route { lists, .. } = searcher.route(&params.probes, false);
-    Candidates::new(searcher.read(lists), bound)
+    let results = match &params.filter {
+        None => searcher.read(lists, ()),
+        Some(filter) => searcher.read(lists, filter),
+    };
+    Candidates::new(results, bound)
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
@@ -435,15 +449,17 @@ where
     for list in lists {
         let tuples = searcher.read_list(
             list,
-            id_2(|(rough, err), head, payload, prefetch| {
+            (),
+            id_2(|row| {
+                let (rough, err) = row.value;
                 let lowerbound = Distance::from_f32(rough - err * epsilon);
                 let rough = Distance::from_f32(rough);
                 results.push((
                     (Reverse(lowerbound), AlwaysEqual(rough)),
                     AlwaysEqual(PackedRefMut8(bump.alloc((
-                        payload,
-                        head,
-                        BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                        row.payload,
+                        row.head,
+                        BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
                     )))),
                 ));
             }),

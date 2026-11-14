@@ -15,6 +15,8 @@ pub const ALIGN: usize = 8;
 pub type Tag = u64;
 const MAGIC: Tag = Tag::from_ne_bytes(*b"vchordrq");
 const VERSION: u64 = 1001;
+/// Binaries that accept only `VERSION` refuse keyed indexes.
+const VERSION_KEYED: u64 = 1002;
 
 #[inline(always)]
 fn tag(source: &[u8]) -> Tag {
@@ -66,7 +68,9 @@ struct MetaTupleHeader {
     vectors_first_s: u16,
     vectors_first_e: u16,
     freepages_first: u32,
-    _padding_1: [Padding; 6],
+    keys_s: u16,
+    keys_e: u16,
+    _padding_1: [Padding; 2],
     // tree
     centroid_prefetch_s: u16,
     centroid_prefetch_e: u16,
@@ -76,6 +80,8 @@ struct MetaTupleHeader {
 }
 
 pub struct MetaTuple {
+    /// [`crate::keys::Keys::descriptors`].
+    pub keys: Option<Vec<u8>>,
     pub dim: u32,
     pub height_of_root: u32,
     pub is_residual: bool,
@@ -96,6 +102,7 @@ impl Tuple for MetaTuple {
         let mut buffer = Vec::<u8>::new();
         match self {
             MetaTuple {
+                keys,
                 dim,
                 height_of_root,
                 is_residual,
@@ -132,10 +139,23 @@ impl Tuple for MetaTuple {
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
+                let (mut keys_s, mut keys_e) = (0, 0);
+                if let Some(keys) = keys {
+                    keys_s = buffer.len() as u16;
+                    buffer.extend(keys.as_slice());
+                    keys_e = buffer.len() as u16;
+                    while buffer.len() % ALIGN != 0 {
+                        buffer.push(0);
+                    }
+                }
                 // header
                 buffer[size_of::<Tag>()..][..size_of::<MetaTupleHeader>()].copy_from_slice(
                     MetaTupleHeader {
-                        version: VERSION,
+                        version: if keys.is_some() {
+                            VERSION_KEYED
+                        } else {
+                            VERSION
+                        },
                         dim: *dim,
                         height_of_root: *height_of_root,
                         is_residual: (*is_residual).into(),
@@ -146,6 +166,8 @@ impl Tuple for MetaTuple {
                         vectors_first_s,
                         vectors_first_e,
                         freepages_first: *freepages_first,
+                        keys_s,
+                        keys_e,
                         centroid_prefetch_s,
                         centroid_prefetch_e,
                         centroid_head: *centroid_head,
@@ -169,7 +191,10 @@ impl WithReader for MetaTuple {
         match tag {
             MAGIC => {
                 let checker = RefChecker::new(source);
-                if VERSION != *checker.prefix::<u64>(size_of::<Tag>()) {
+                if !matches!(
+                    *checker.prefix::<u64>(size_of::<Tag>()),
+                    VERSION | VERSION_KEYED
+                ) {
                     panic!(
                         "deserialization: bad version number; {}",
                         "after upgrading vchord, please use REINDEX to rebuild the index."
@@ -180,11 +205,13 @@ impl WithReader for MetaTuple {
                 let vectors_first = checker.bytes(header.vectors_first_s, header.vectors_first_e);
                 let centroid_prefetch =
                     checker.bytes(header.centroid_prefetch_s, header.centroid_prefetch_e);
+                let keys = checker.bytes(header.keys_s, header.keys_e);
                 MetaTupleReader {
                     header,
                     cells,
                     vectors_first,
                     centroid_prefetch,
+                    keys,
                 }
             }
             _ => panic!("deserialization: bad magic number"),
@@ -198,6 +225,7 @@ pub struct MetaTupleReader<'a> {
     cells: &'a [u32],
     vectors_first: &'a [u32],
     centroid_prefetch: &'a [u32],
+    keys: &'a [u8],
 }
 
 impl<'a> MetaTupleReader<'a> {
@@ -236,6 +264,9 @@ impl<'a> MetaTupleReader<'a> {
     }
     pub fn first(self) -> u32 {
         self.header.first
+    }
+    pub fn keys(self) -> Option<&'a [u8]> {
+        (self.header.version == VERSION_KEYED).then_some(self.keys)
     }
 }
 
@@ -1149,6 +1180,11 @@ impl JumpTupleWriter<'_> {
     }
 }
 
+/// Key columns begin after the elements, aligned.
+fn columns_s(elements_e: u16) -> usize {
+    (elements_e as usize).next_multiple_of(ALIGN)
+}
+
 #[repr(C, align(8))]
 #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FrozenTupleHeader0 {
@@ -1186,15 +1222,18 @@ pub struct FrozenTuple0 {
     pub prefetch: Vec<[u32; 32]>,
     pub head: [u16; 32],
     pub elements: Vec<[u8; 16]>,
+    /// From the elements to the end of the tuple.
+    pub columns: Vec<u8>,
 }
 
 impl FrozenTuple {
-    pub fn estimate_size_0(prefetch: usize, elements: usize) -> usize {
+    pub fn estimate_size_0(prefetch: usize, elements: usize, columns: usize) -> usize {
         let mut size = 0_usize;
         size += size_of::<Tag>();
         size += size_of::<FrozenTupleHeader0>();
         size += (prefetch * size_of::<[u32; 32]>()).next_multiple_of(ALIGN);
         size += (elements * size_of::<[u8; 16]>()).next_multiple_of(ALIGN);
+        size += columns;
         size
     }
     pub fn fit_1(prefetch: usize, freespace: u16) -> Option<usize> {
@@ -1221,7 +1260,7 @@ impl Parts for FrozenTuple0 {
         &mut self.elements
     }
     fn size(&self) -> usize {
-        FrozenTuple::estimate_size_0(self.prefetch.len(), self.elements.len())
+        FrozenTuple::estimate_size_0(self.prefetch.len(), self.elements.len(), self.columns.len())
     }
     fn fit(&self, freespace: u16) -> Option<usize> {
         FrozenTuple::fit_1(self.prefetch.len(), freespace)
@@ -1245,6 +1284,7 @@ impl Tuple for FrozenTuple {
                 prefetch,
                 head,
                 elements,
+                columns,
             }) => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<FrozenTupleHeader0>()));
@@ -1262,6 +1302,7 @@ impl Tuple for FrozenTuple {
                 while buffer.len() % ALIGN != 0 {
                     buffer.push(0);
                 }
+                buffer.extend(columns.as_slice());
                 // header
                 buffer[size_of::<Tag>()..][..size_of::<FrozenTupleHeader0>()].copy_from_slice(
                     FrozenTupleHeader0 {
@@ -1317,6 +1358,7 @@ impl WithReader for FrozenTuple {
                     header,
                     prefetch,
                     elements,
+                    source,
                 })
             }
             1 => {
@@ -1364,6 +1406,7 @@ pub struct FrozenTupleReader0<'a> {
     header: &'a FrozenTupleHeader0,
     prefetch: &'a [[u32; 32]],
     elements: &'a [[u8; 16]],
+    source: &'a [u8],
 }
 
 impl<'a> FrozenTupleReader0<'a> {
@@ -1384,6 +1427,10 @@ impl<'a> FrozenTupleReader0<'a> {
     }
     pub fn elements(self) -> &'a [[u8; 16]] {
         self.elements
+    }
+    pub fn columns(self) -> &'a [u8] {
+        let columns = self.source.get(columns_s(self.header.elements_e)..);
+        columns.expect("deserialization: bad bytes")
     }
 }
 
@@ -1451,6 +1498,18 @@ pub struct AppendableTuple {
     pub head: u16,
     pub elements: Vec<u64>,
     pub payload: Option<NonZero<u64>>,
+    /// From the elements to the end of the tuple.
+    pub columns: Vec<u8>,
+}
+
+impl AppendableTuple {
+    pub fn estimate_size(prefetch: usize, elements: usize, columns: usize) -> usize {
+        let mut size = size_of::<AppendableTupleHeader>();
+        size += (prefetch * size_of::<u32>()).next_multiple_of(ALIGN);
+        size += (elements * size_of::<u64>()).next_multiple_of(ALIGN);
+        size += columns;
+        size
+    }
 }
 
 impl Tuple for AppendableTuple {
@@ -1471,6 +1530,7 @@ impl Tuple for AppendableTuple {
         while buffer.len() % ALIGN != 0 {
             buffer.push(0);
         }
+        buffer.extend(self.columns.as_slice());
         // header
         buffer[..size_of::<AppendableTupleHeader>()].copy_from_slice(
             AppendableTupleHeader {
@@ -1502,6 +1562,7 @@ impl WithReader for AppendableTuple {
             header,
             prefetch,
             elements,
+            source,
         }
     }
 }
@@ -1522,6 +1583,7 @@ pub struct AppendableTupleReader<'a> {
     header: &'a AppendableTupleHeader,
     prefetch: &'a [u32],
     elements: &'a [u64],
+    source: &'a [u8],
 }
 
 impl<'a> AppendableTupleReader<'a> {
@@ -1543,6 +1605,10 @@ impl<'a> AppendableTupleReader<'a> {
     pub fn elements(self) -> &'a [u64] {
         self.elements
     }
+    pub fn columns(self) -> &'a [u8] {
+        let columns = self.source.get(columns_s(self.header.elements_e)..);
+        columns.expect("deserialization: bad bytes")
+    }
 }
 
 #[derive(Debug)]
@@ -1555,5 +1621,52 @@ pub struct AppendableTupleWriter<'a> {
 impl AppendableTupleWriter<'_> {
     pub fn payload(&mut self) -> &mut Option<NonZero<u64>> {
         &mut self.header.payload
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meta_version() {
+        let meta = |keys: Option<Vec<u8>>| {
+            let bytes = MetaTuple {
+                keys,
+                dim: 3,
+                height_of_root: 1,
+                is_residual: false,
+                rerank_in_heap: false,
+                cells: vec![1],
+                centroids_first: 2,
+                vectors_first: vec![3],
+                freepages_first: 1,
+                centroid_prefetch: vec![4],
+                centroid_head: 1,
+                centroid_norm: 1.0,
+                first: 5,
+            }
+            .serialize();
+            let mut words = vec![0_u64; bytes.len().div_ceil(8)];
+            words.as_mut_bytes()[..bytes.len()].copy_from_slice(&bytes);
+            (words, bytes.len())
+        };
+        let version = |words: &[u64]| words[1];
+        let (unkeyed, n) = meta(None);
+        assert_eq!(version(&unkeyed), VERSION);
+        assert_eq!(VERSION, 1001);
+        let (keyed, k) = meta(Some(vec![5, 0, 3]));
+        assert_eq!(version(&keyed), VERSION_KEYED);
+        let read = |words: &[u64], n| {
+            let meta = MetaTuple::deserialize_ref(&words.as_bytes()[..n]);
+            (meta.dim(), meta.keys().map(<[u8]>::to_vec))
+        };
+        assert_eq!(read(&unkeyed, n), (3, None));
+        assert_eq!(read(&keyed, k), (3, Some(vec![5, 0, 3])));
+        let mut unknown = unkeyed.clone();
+        unknown[1] = 1003;
+        let result =
+            std::panic::catch_unwind(|| MetaTuple::deserialize_ref(&unknown.as_bytes()[..n]).dim());
+        assert!(result.is_err());
     }
 }

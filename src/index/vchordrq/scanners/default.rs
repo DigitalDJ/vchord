@@ -94,11 +94,10 @@ impl SearchBuilder for DefaultBuilder {
     {
         let mut vector = None;
         let mut threshold = None;
-        // Let PostgreSQL recheck every sphere qual against the heap tuple, as
-        // vchordg does. Only the first non-null sphere around the searched
-        // vector bounds the search; other spheres, including null ones, are
-        // filtered entirely by the recheck.
-        let recheck = !self.spheres.is_empty();
+        // PostgreSQL rechecks spheres, as for vchordg; only the first one around the search vector
+        // bounds the search.
+        let recheck = !self.spheres.is_empty()
+            || (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);

@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::keys::Keys;
 use crate::operator::{Operator, Vector};
 use crate::tape::TapeWriter;
 use crate::tape_writer::{DirectoryTapeWriter, H1TapeWriter};
@@ -18,6 +19,7 @@ use vector::{VectorBorrowed, VectorOwned};
 pub fn build<R: RelationWrite, O: Operator>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexOptions,
+    keys: &Keys,
     index: &R,
     structures: Vec<Structure<O::Vector>>,
 ) where
@@ -109,6 +111,7 @@ pub fn build<R: RelationWrite, O: Operator>(
         pointer_of_firsts.push(level);
     }
     meta.push(MetaTuple {
+        keys: (!keys.is_empty()).then(|| keys.descriptors()),
         dim,
         height_of_root: structures.len() as u32,
         is_residual,

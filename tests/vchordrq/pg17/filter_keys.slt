@@ -1,0 +1,41 @@
+# From PostgreSQL 17, `key = ANY(...)` on any filter key column is an index condition.
+
+statement ok
+CREATE TABLE fc_any (id int PRIMARY KEY, a int4, b uuid, v vector(3));
+
+statement ok
+INSERT INTO fc_any SELECT i, i % 10, ('00000000-0000-0000-0000-' || lpad((i % 7)::text, 12, '0'))::uuid,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector
+FROM generate_series(1, 5000) i;
+
+statement ok
+CREATE INDEX fc_any_v ON fc_any USING vchordrq (v vector_l2_ops, a, b uuid_ops (bytes = 16)) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [4]
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM fc_any WHERE b = ANY('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}')
+  AND a = ANY('{1,2}') ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 10;
+----
+Limit
+  ->  Index Scan using fc_any_v on fc_any
+        Index Cond: ((a = ANY ('{1,2}'::integer[])) AND (b = ANY ('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}'::uuid[])))
+        Order By: (v <-> '[0.5,0.5,0.5]'::vector)
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fc_any WHERE b = ANY('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}'))
+FROM (SELECT id FROM fc_any WHERE b = ANY('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}')
+  ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+t
+
+statement ok
+DROP TABLE fc_any;

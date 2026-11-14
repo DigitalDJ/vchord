@@ -26,9 +26,9 @@ where
 }
 
 #[inline(always)]
-pub fn id_2<F, A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, R: ?Sized>(f: F) -> F
+pub fn id_2<F, T, R: ?Sized>(f: F) -> F
 where
-    F: for<'a> FnMut(A, B, C, &'a D) -> R,
+    F: for<'a> FnMut(crate::tape::Row<'a, T>) -> R,
 {
     f
 }

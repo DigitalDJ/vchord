@@ -13,6 +13,7 @@ use crate::index::fetcher::*;
 use crate::index::gucs;
 use crate::index::scanners::SearchBuilder;
 use crate::index::storage::PostgresRelation;
+use crate::index::vchordrq::filter_key::FilterKeys;
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::scanners::*;
 use crate::recorder::DefaultRecorder;
@@ -219,8 +220,13 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
 
     am_routine.type_ = pgrx::pg_sys::NodeTag::T_IndexAmRoutine;
 
-    am_routine.amsupport = 1;
+    // Support function 2 of a key column's operator class takes `bytes`.
+    am_routine.amsupport = 2;
+    am_routine.amoptsprocnum = 2;
     am_routine.amcanorderbyop = true;
+    // A filter key column: its `=` and `= ANY(array)` quals become scan keys.
+    am_routine.amcanmulticol = true;
+    am_routine.amsearcharray = true;
 
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     {
@@ -301,7 +307,8 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         // paths lose to any usable plan: count them as disabled (PostgreSQL
         // 18 compares disabled nodes first) and give them a dominating finite
         // cost (before PostgreSQL 18, `disable_cost` is additive) (#32).
-        let unusable = ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
+        // Clauses on the filter key column, or arrays of spheres, give no vector.
+        let unusable = ((*path).indexorderbys.is_null() && !has_vector_clause(path))
             || (*path).path.pathtype == pgrx::pg_sys::NodeTag::T_IndexOnlyScan;
         if unusable {
             #[cfg(any(feature = "pg18", feature = "pg19"))]
@@ -440,11 +447,15 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 .filter(|_| filtered_rows > 0.0)
                 .map(|limit| (limit / filtered_rows).clamp(1e-9, 1.0))
                 .unwrap_or(1.0);
+            // Only rows the keys select become candidates.
+            let key_selectivity = filter_key_selectivity(root, path).clamp(1e-9, 1.0);
+            let candidates = node_count * key_selectivity;
+            let filter_selectivity = (filter_selectivity / key_selectivity).clamp(1e-9, 1.0);
             // The scan cannot process more candidates than the configured IVF
             // budget, even for very selective filters or an unbounded query.
             let next_count = limit_tuples
-                .map(|limit| (limit * f64::min(1000.0, 1.0 / filter_selectivity)).min(node_count))
-                .unwrap_or(node_count);
+                .map(|limit| (limit * f64::min(1000.0, 1.0 / filter_selectivity)).min(candidates))
+                .unwrap_or(candidates);
             let full_path_count = next_count / limit_fraction;
             let scan_selectivity = if total_rows > 0.0 {
                 (full_path_count / total_rows).clamp(1e-9, 1.0)
@@ -463,6 +474,48 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         *index_selectivity = filter_selectivity;
         *index_correlation = 0.0;
         *index_pages = 1.0;
+    }
+}
+
+/// A clause on the vector column that gives a vector: a sphere, not an array of spheres.
+unsafe fn has_vector_clause(path: *mut pgrx::pg_sys::IndexPath) -> bool {
+    use pgrx::pg_sys::{IndexClause, NodeTag, RestrictInfo};
+    unsafe {
+        pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses)
+            .iter_ptr()
+            .any(|clause| {
+                (*clause).indexcol == 0
+                    && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
+                        .iter_ptr()
+                        .all(|qual| (*(*qual).clause).type_ != NodeTag::T_ScalarArrayOpExpr)
+            })
+    }
+}
+
+unsafe fn filter_key_selectivity(
+    root: *mut pgrx::pg_sys::PlannerInfo,
+    path: *mut pgrx::pg_sys::IndexPath,
+) -> f64 {
+    use pgrx::pg_sys::{IndexClause, RestrictInfo};
+    unsafe {
+        let mut quals = pgrx::PgList::<RestrictInfo>::new();
+        for clause in pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses).iter_ptr() {
+            if (*clause).indexcol >= 1 {
+                for qual in pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals).iter_ptr() {
+                    quals.push(qual);
+                }
+            }
+        }
+        if quals.is_empty() {
+            return 1.0;
+        }
+        pgrx::pg_sys::clauselist_selectivity(
+            root,
+            quals.into_pg(),
+            (*(*(*path).indexinfo).rel).relid as _,
+            pgrx::pg_sys::JoinType::JOIN_INNER,
+            std::ptr::null_mut(),
+        )
     }
 }
 
@@ -489,6 +542,8 @@ pub unsafe extern "C-unwind" fn aminsert(
     let datum = unsafe { (!is_null.add(0).read()).then_some(values.add(0).read()) };
     let ctid = unsafe { heap_tid.read() };
     if let Some(store) = unsafe { datum.and_then(|x| opfamily.store(x)) } {
+        let keys = unsafe { FilterKeys::of_index(index_relation) };
+        let columns = unsafe { keys.row(values, is_null) };
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
@@ -498,6 +553,7 @@ pub unsafe extern "C-unwind" fn aminsert(
                 opfamily,
                 &index,
                 payload,
+                &columns,
                 vector,
                 false,
                 false,
@@ -605,7 +661,16 @@ pub unsafe extern "C-unwind" fn amrescan(
         if !orderbys.is_null() && (*scan).numberOfOrderBys > 0 {
             std::ptr::copy(orderbys, (*scan).orderByData, (*scan).numberOfOrderBys as _);
         }
-        if (*scan).numberOfOrderBys == 0 && (*scan).numberOfKeys == 0 {
+        let keys = if (*scan).numberOfKeys > 0 {
+            std::slice::from_raw_parts((*scan).keyData, (*scan).numberOfKeys as _)
+        } else {
+            &[]
+        };
+        // An array of spheres gives no search vector: the recheck takes it, as a NULL sphere.
+        let is_vector_key = |key: &pgrx::pg_sys::ScanKeyData| {
+            key.sk_attno == 1 && key.sk_flags & pgrx::pg_sys::SK_SEARCHARRAY as i32 == 0
+        };
+        if (*scan).numberOfOrderBys == 0 && !keys.iter().any(is_vector_key) {
             pgrx::error!(
                 "vector search with no WHERE clause and no ORDER BY clause is not supported"
             );
@@ -613,6 +678,34 @@ pub unsafe extern "C-unwind" fn amrescan(
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
         drop(scanner.scanning.take());
         scanner.bump.reset();
+        // Per filter key column, the stored keys that all scan keys on it accept.
+        let constrained = keys.iter().any(|key| key.sk_attno >= 2);
+        let filter = constrained.then(|| {
+            let filter_keys = FilterKeys::of_index((*scan).indexRelation);
+            let mut sets = vec![None::<Vec<u128>>; filter_keys.keys.as_slice().len()];
+            for key in keys.iter().filter(|key| key.sk_attno >= 2) {
+                let i = key.sk_attno as usize - 2;
+                let accepted = filter_keys.of_scan_key(i, key);
+                sets[i] = Some(match sets[i].take() {
+                    None => accepted,
+                    Some(mut set) => {
+                        set.retain(|x| accepted.binary_search(x).is_ok());
+                        set
+                    }
+                });
+            }
+            vchordrq::keys::KeyFilter::new(filter_keys.keys, sets)
+        });
+        let filter = match filter {
+            None => None,
+            Some(Some(filter)) => Some(filter),
+            Some(None) => {
+                scanner.scanning = Some(LazyCell::new(Box::new(|| -> Iter {
+                    Box::new(std::iter::empty())
+                })));
+                return;
+            }
+        };
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
         let probes = gucs::vchordrq_probes((*scan).indexRelation);
@@ -632,6 +725,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             search: SearchParams {
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
+                filter,
             },
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),
@@ -688,11 +782,10 @@ pub unsafe extern "C-unwind" fn amrescan(
                     let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                for i in 0..(*scan).numberOfKeys {
-                    let data = (*scan).keyData.add(i as usize);
-                    let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
-                    builder.add((*data).sk_strategy, (!is_null).then_some(value));
+                for key in keys.iter().filter(|key| key.sk_attno == 1) {
+                    let is_null = (key.sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let value = (is_vector_key(key) && !is_null).then_some(key.sk_argument);
+                    builder.add(key.sk_strategy, value);
                 }
                 LazyCell::new(Box::new(move || {
                     // only do this since `PostgresRelation` has no destructor
