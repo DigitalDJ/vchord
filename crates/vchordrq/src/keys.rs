@@ -20,12 +20,28 @@
 //!
 //! The hash functions and the stored forms are part of the on-disk format:
 //! they must never change.
+//!
+//! A list that a maintenance pass (`crate::maintain`, which also ends a build)
+//! rewrites gets its frozen rows ordered by their first keys' 16-bit keys
+//! ([`Key::sort_key`]), unless they take more memory than it is given, and
+//! its directory gets the layout of its frozen tape: the range of those keys
+//! of each block and the first block of each page. A search that constrains
+//! the first key reads only the blocks whose range meets a wanted key's, and
+//! only the
+//! pages that hold them, so a key's rows cost a few pages per list; the other
+//! keys are tested in the blocks it reads, and a search that constrains only
+//! them reads every block. The ranges hold whatever the order of the rows, so
+//! correctness never depends on it. Rows inserted since the list was
+//! rewritten wait, unsorted, in the appendable tape, which a search reads in
+//! full; a list without a layout, such as one that no pass has rewritten
+//! since an older build, is read in full too.
 
 use crate::tape::Filter;
 use crate::tuples::{AppendableTuple, FrozenTuple, MetaTuple, MetaTupleReader, WithReader};
 use index::relation::{Page, RelationRead};
 use simd::column::{Set, Value};
 use std::num::NonZero;
+use std::rc::Rc;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 /// The splitmix64 finalizer: every output bit depends on every input bit.
@@ -71,6 +87,34 @@ pub const fn raw_int(x: i64, bytes: usize) -> Option<u64> {
     Some((x as u64 ^ 1 << (bits - 1)) & (u64::MAX >> (64 - bits)))
 }
 
+/// The 16-bit fold of a stored key: the exclusive or of its 16-bit lanes
+/// ([`Value::fold_one`]).
+pub fn fold16(x: u128) -> u16 {
+    [x as u64, (x >> 64) as u64].fold_one()
+}
+
+/// A range of 16-bit keys `min | max << 16` ([`Key::sort_key`]), such as that
+/// of a block's first keys. This one, with `min > max`, holds none.
+pub const EMPTY_RANGE: u32 = u16::MAX as u32;
+
+/// Whether `bitmap` has a 16-bit key in `range`. The words between the ends are
+/// tested whole; a block of a sorted list spans few of them.
+#[inline(always)]
+fn meets_bitmap(bitmap: &[u64; 1024], range: u32) -> bool {
+    let (min, max) = (range as u16 as usize, (range >> 16) as usize);
+    if min > max {
+        return false;
+    }
+    let (a, b) = (min / 64, max / 64);
+    let first = bitmap[a] & u64::MAX << (min % 64);
+    let last = bitmap[b] & u64::MAX >> (63 - max % 64);
+    if a == b {
+        first & last != 0
+    } else {
+        first != 0 || last != 0 || bitmap[a + 1..b].iter().any(|&x| x != 0)
+    }
+}
+
 /// How a key is stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
@@ -88,6 +132,17 @@ impl Key {
     /// zeros like one key (the least integer, the nil uuid).
     pub fn exact(&self, set: &[u128]) -> bool {
         !self.hashed && !set.contains(&0)
+    }
+    /// The 16-bit key by which the rows of a list are ordered and its blocks
+    /// ranged, when this is the first key, of a stored key: a 2-byte key
+    /// itself, the fold of a hash, and a hash of a wider whole key, folded, as
+    /// its bytes need not spread evenly (`00000000-…-000000012345`).
+    pub fn sort_key(&self, stored: u128) -> u16 {
+        if self.bytes == 2 || self.hashed {
+            fold16(stored)
+        } else {
+            fold(hash_uuid(&stored.to_le_bytes()), 2) as u16
+        }
     }
     /// The stored form, the low `bytes` bytes of the result in little-endian
     /// order, of a key whose whole form is `raw` and whose hash is `hash`.
@@ -153,6 +208,26 @@ impl Keys {
     /// The bytes of a row's columns; those of a block are 32 times as many.
     pub fn columns(&self) -> usize {
         self.columns
+    }
+    /// The 16-bit key of a row's first key ([`Key::sort_key`]), by which a
+    /// maintenance pass orders the rows of a list.
+    pub fn sort_key(&self, payload: NonZero<u64>, columns: Columns<'_>) -> u16 {
+        let key = &self.keys[0];
+        match key.slot {
+            Slot::Payload => key.sort_key(payload.get() as u16 as u128),
+            Slot::Column(offset) => {
+                let mut x = [0; 16];
+                x[..key.bytes].copy_from_slice(columns.get(offset, key.bytes));
+                key.sort_key(u128::from_le_bytes(x))
+            }
+        }
+    }
+    /// The range of the 16-bit keys of the first keys of a block's rows.
+    pub fn range_of_block(&self, payload: &[Option<NonZero<u64>>; 32], columns: &[u8]) -> u32 {
+        let rows = (0..32).filter_map(|i| Some((i, payload[i]?)));
+        let folds = rows.map(|(i, x)| self.sort_key(x, Columns::block(columns, i)));
+        let (min, max) = folds.fold((u16::MAX, 0), |(a, b), x| (a.min(x), b.max(x)));
+        min as u32 | (max as u32) << 16
     }
     /// The columns of a block, each key's 32 values in order, of 32 rows'
     /// own (`rows`, a row's after another's).
@@ -272,13 +347,14 @@ impl<'a> Columns<'a> {
     }
 }
 
-/// A set of stored keys of one width.
-#[derive(Debug)]
+/// A set of stored keys of one width. A clone copies a few keys, and shares a
+/// large set.
+#[derive(Debug, Clone)]
 enum Values<T> {
     /// A few, each compared with a whole block at once.
     Few(Vec<T>),
     /// A set too large to compare key by key.
-    Many(Box<Set<T>>),
+    Many(Rc<Set<T>>),
 }
 
 impl<T: Value> Values<T> {
@@ -306,7 +382,7 @@ impl<T: Value> Values<T> {
         } else if keys.len() <= Self::FEW {
             Some(Self::Few(keys))
         } else {
-            Some(Self::Many(Box::new(Set::new(&keys))))
+            Some(Self::Many(Rc::new(Set::new(&keys))))
         }
     }
 
@@ -403,6 +479,10 @@ impl Column {
 /// keys it constrains.
 #[derive(Debug)]
 pub struct KeyFilter {
+    /// The 16-bit keys ([`Key::sort_key`]) of the set of the first key, by
+    /// which a search reads blocks, if it is constrained; for the key in the
+    /// payload, whose stored keys they are, a clone of its set.
+    first: Option<Values<u16>>,
     /// The set of the key in the payload, if it is constrained.
     payload: Option<Values<u16>>,
     /// The sets of the constrained keys in the columns, at their offsets.
@@ -415,10 +495,11 @@ impl KeyFilter {
     pub fn new(keys: &Keys, sets: Vec<Option<Vec<u128>>>) -> Option<Self> {
         assert_eq!(sets.len(), keys.keys.len());
         let mut filter = Self {
+            first: None,
             payload: None,
             columns: Vec::new(),
         };
-        for (key, set) in std::iter::zip(&keys.keys, sets) {
+        for (key, set) in std::iter::zip(&keys.keys, &sets) {
             let Some(set) = set else { continue };
             match key.slot {
                 Slot::Payload => {
@@ -426,15 +507,43 @@ impl KeyFilter {
                     filter.payload = Some(Values::new(keys)?);
                 }
                 Slot::Column(offset) => {
-                    filter.columns.push((offset, Column::new(key.bytes, &set)?));
+                    filter.columns.push((offset, Column::new(key.bytes, set)?));
                 }
             }
+        }
+        if let (Some(key), Some(Some(set))) = (keys.keys.first(), sets.first()) {
+            filter.first = match key.slot {
+                Slot::Payload => filter.payload.clone(),
+                Slot::Column(_) => {
+                    Some(Values::new(set.iter().map(|&x| key.sort_key(x)).collect())?)
+                }
+            };
         }
         Some(filter)
     }
 }
 
 impl Filter for &KeyFilter {
+    #[inline(always)]
+    fn selects_blocks(self) -> bool {
+        self.first.is_some()
+    }
+
+    #[inline(always)]
+    fn ranges(self, ranges: &[u32; 32]) -> u32 {
+        match &self.first {
+            Some(Values::Few(keys)) => simd::column::meets(ranges, keys),
+            Some(Values::Many(set)) => {
+                let mut mask = 0;
+                for (i, &range) in ranges.iter().enumerate() {
+                    mask |= (meets_bitmap(set.bitmap(), range) as u32) << i;
+                }
+                mask
+            }
+            None => u32::MAX,
+        }
+    }
+
     #[inline(always)]
     fn block(self, payload: &[Option<NonZero<u64>>; 32], columns: &[u8]) -> u32 {
         let mut mask = match &self.payload {
@@ -659,6 +768,61 @@ mod tests {
         }
         // an empty set: no row
         assert!(KeyFilter::new(&all[0], vec![Some(Vec::new())]).is_none());
+    }
+
+    #[test]
+    fn ranges() {
+        let range = |min: u16, max: u16| min as u32 | (max as u32) << 16;
+        let keys = Keys::new([(2, true)]);
+        let payload = |keys: &[u16]| {
+            std::array::from_fn(|i| {
+                let key = *keys.get(i)?;
+                NonZero::new(rand::random::<u64>() << 16 | 1 << 16 | key as u64)
+            })
+        };
+        assert_eq!(keys.range_of_block(&payload(&[]), &[]), EMPTY_RANGE);
+        assert_eq!(keys.range_of_block(&payload(&[7]), &[]), range(7, 7));
+        let block = payload(&[9, 0, 65535, 3]);
+        assert_eq!(keys.range_of_block(&block, &[]), range(0, 65535));
+        // a first key in the columns, stored whole: ranged by a hash
+        let keys = Keys::new([(4, false), (2, true)]);
+        let values: [u32; 32] = std::array::from_fn(|i| 0x0001_0000 * i as u32 + 5);
+        let full = std::array::from_fn(|_| NonZero::new(1 << 16));
+        let r = keys.range_of_block(&full, values.as_bytes());
+        let folds = values.map(|x| keys.as_slice()[0].sort_key(x as u128));
+        let (min, max) = (*folds.iter().min().unwrap(), *folds.iter().max().unwrap());
+        assert_eq!(r, range(min, max));
+        let filter = KeyFilter::new(&keys, vec![Some(vec![values[3] as u128]), None]).unwrap();
+        let mut ranges = [EMPTY_RANGE; 32];
+        ranges[1] = range(folds[3], folds[3]);
+        ranges[2] = range(folds[3].wrapping_add(1), folds[3].wrapping_add(1));
+        assert_eq!((&filter).ranges(&ranges), 0b10);
+        // only a later key constrained: no block is selected by range
+        let filter = KeyFilter::new(&keys, vec![None, Some(vec![1])]).unwrap();
+        assert!(!(&filter).selects_blocks());
+        // a set too large to compare fold by fold tests each range in a bitmap
+        let keys = Keys::new([(2, true)]);
+        for n in [1, 40, 200, 5000] {
+            let tags = (0..n).map(|_| rand::random::<u16>()).collect::<Vec<_>>();
+            let set = tags.iter().map(|&x| x as u128).collect();
+            let filter = KeyFilter::new(&keys, vec![Some(set)]).unwrap();
+            for _ in 0..64 {
+                let ranges: [u32; 32] = std::array::from_fn(|i| match i % 4 {
+                    0 => EMPTY_RANGE,
+                    1 => range(tags[i % n], tags[i % n]),
+                    _ => {
+                        let min = rand::random::<u16>();
+                        range(min, min.saturating_add(rand::random::<u16>() >> (i % 16)))
+                    }
+                });
+                let expected = (0..32).fold(0, |mask, i| {
+                    let (min, max) = (ranges[i] as u16, (ranges[i] >> 16) as u16);
+                    let hit = tags.iter().any(|&t| min <= t && t <= max);
+                    mask | (hit as u32) << i
+                });
+                assert_eq!((&filter).ranges(&ranges), expected);
+            }
+        }
     }
 
     /// The hashes of consecutive keys and of random keys spread evenly: with

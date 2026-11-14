@@ -132,7 +132,10 @@ CREATE OPERATOR FAMILY integer_ops USING vchordrq;
 -- List of operator classes
 
 -- Filter key columns: USING vchordrq (embedding ..., key [, key ...]), each with the
--- parameter `bytes` (support function 2): `key uuid_ops (bytes = 16)`
+-- parameter `bytes` (support function 2): `key uuid_ops (bytes = 16)`. The first filter
+-- key column orders the rows of each list and selects the blocks a scan reads; the others
+-- are tested in the blocks it selects, and a scan that constrains only them reads every
+-- block of the probed lists: put the most selective column first.
 
 CREATE OPERATOR CLASS uuid_ops
     DEFAULT FOR TYPE uuid USING vchordrq FAMILY uuid_ops AS

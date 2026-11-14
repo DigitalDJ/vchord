@@ -10,7 +10,7 @@ use crate::closure_lifetime_binder::{id_0, id_1, id_2};
 use crate::keys::{Columns, KeyFilter};
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::tape::{Filter, by_directory, by_next};
+use crate::tape::{All, Filter, Selected, by_directory, by_next};
 use crate::tuples::*;
 use crate::{Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
@@ -89,6 +89,8 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
     projected_centering: bool,
     prefetch_h1_vectors: H1,
     prefetch_h0_tuples: H0,
+    /// Scratch space for directories, kept across lists.
+    words: Vec<u32>,
     _operator: PhantomData<fn() -> O>,
 }
 
@@ -179,6 +181,7 @@ where
             projected_centering: params.projected_centering,
             prefetch_h1_vectors,
             prefetch_h0_tuples,
+            words: Vec::new(),
             _operator: PhantomData,
         }
     }
@@ -306,6 +309,7 @@ where
             ref lut,
             projected_centering,
             ref mut prefetch_h0_tuples,
+            ref mut words,
             ..
         } = *self;
         // Between lists nothing is locked (#28).
@@ -338,11 +342,41 @@ where
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
         let block_access = || O::block_access(&lut.0, residual);
-        if prefetch_h0_tuples.is_not_plain() {
-            let directory =
-                tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+        // The directory gives the pages to prefetch and the blocks that
+        // `filter` selects.
+        let mut pages = None;
+        if filter.selects_blocks() || prefetch_h0_tuples.is_not_plain() {
+            let directory = by_next(index, jump_tuple.directory_first());
+            pages = Some(tape::read_directory_words::<R>(
+                directory,
+                words,
+                filter.selects_blocks(),
+            ));
+        }
+        let selected = match pages {
+            Some(pages) if filter.selects_blocks() => {
+                tape::plan(words, pages, filter).map(|n| (pages, n))
+            }
+            _ => None,
+        };
+        if let Some((pages, n)) = selected {
+            let (ids, layout) = words.split_at(pages);
+            let (firsts, masks) = layout.split_at(pages);
+            if n != 0 {
+                tape::read_frozen_tape::<R, _, _>(
+                    by_directory(prefetch_h0_tuples, ids[..n].iter().copied()),
+                    Selected::new(&firsts[..n], masks),
+                    block_access,
+                    filter,
+                    &mut callback,
+                );
+            }
+        } else if let Some(pages) = pages
+            && prefetch_h0_tuples.is_not_plain()
+        {
             tape::read_frozen_tape::<R, _, _>(
-                by_directory(prefetch_h0_tuples, directory),
+                by_directory(prefetch_h0_tuples, words[..pages].iter().copied()),
+                All,
                 block_access,
                 filter,
                 &mut callback,
@@ -350,6 +384,7 @@ where
         } else {
             tape::read_frozen_tape::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
+                All,
                 block_access,
                 filter,
                 &mut callback,

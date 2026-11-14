@@ -652,10 +652,17 @@ struct DirectoryTupleHeader1 {
     _padding_0: [Padding; 4],
 }
 
+/// The page ids of a frozen tape, in tape order (`_0` and `_1`). In an index
+/// with filter keys (`crate::keys`), they are followed by the tape's layout
+/// (`_2`, whose header is that of `_1`): for each page, the index of the block
+/// its first tuple belongs to, with `tape::CONTINUED` if that block begins on
+/// an earlier page; then for each block, the range of the 16-bit keys of its
+/// rows' first keys (`crate::keys::Key::sort_key`).
 #[derive(Debug, Clone)]
 pub enum DirectoryTuple {
     _0 { elements: Vec<u32> },
     _1 { elements: Vec<u32> },
+    _2 { elements: Vec<u32> },
 }
 
 impl DirectoryTuple {
@@ -705,8 +712,9 @@ impl Tuple for DirectoryTuple {
                     .as_bytes(),
                 );
             }
-            Self::_1 { elements } => {
-                buffer.extend((1 as Tag).to_ne_bytes());
+            Self::_1 { elements } | Self::_2 { elements } => {
+                let tag: Tag = if let Self::_1 { .. } = self { 1 } else { 2 };
+                buffer.extend(tag.to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<DirectoryTupleHeader1>()));
                 // elements
                 let elements_s = buffer.len() as u16;
@@ -748,6 +756,12 @@ impl WithReader for DirectoryTuple {
                 let elements = checker.bytes(header.elements_s, header.elements_e);
                 DirectoryTupleReader::_1(DirectoryTupleReader1 { header, elements })
             }
+            2 => {
+                let checker = RefChecker::new(source);
+                let header: &DirectoryTupleHeader1 = checker.prefix(size_of::<Tag>());
+                let elements = checker.bytes(header.elements_s, header.elements_e);
+                DirectoryTupleReader::_2(DirectoryTupleReader1 { header, elements })
+            }
             _ => panic!("deserialization: bad bytes"),
         }
     }
@@ -757,6 +771,7 @@ impl WithReader for DirectoryTuple {
 pub enum DirectoryTupleReader<'a> {
     _0(DirectoryTupleReader0<'a>),
     _1(DirectoryTupleReader1<'a>),
+    _2(DirectoryTupleReader1<'a>),
 }
 
 #[derive(Debug, Clone, Copy)]

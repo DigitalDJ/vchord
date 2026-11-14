@@ -7,7 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
-use crate::keys::Keys;
+use crate::keys::{Columns, Keys};
 use crate::operator::{Operator, Vector};
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
@@ -19,6 +19,7 @@ use index::relation::{
 use index_accessor::FunctionalAccessor;
 use rabitq::packing::unpack;
 use std::cell::RefCell;
+use std::num::NonZero;
 
 pub trait MaintainChooser {
     fn choose(&mut self, i: usize) -> bool;
@@ -38,10 +39,14 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
+/// `memory`: the bytes that a list of an index with filter keys may take to
+/// be sorted by its first keys (`crate::keys`); a larger list is written in
+/// the order it is read.
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
     chooser: &mut impl MaintainChooser,
+    memory: usize,
     check: impl Fn(),
 ) -> Maintain
 where
@@ -54,6 +59,7 @@ where
     let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
     let keys = Keys::of_meta(meta_tuple);
+    let keyed = !keys.is_empty();
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -144,20 +150,36 @@ where
         let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
+        // An index with filter keys writes the rows ordered by their first
+        // keys (`crate::keys`), unless they take more than `memory`.
+        let mut rows = Rows::new(dim as _);
+        let mut sorting = keyed;
         let mut row = Vec::new();
         let mut callback = id_2(
             |(code, delta): (_, _), head, payload, prefetch: &[_], columns| {
-                let branch = Branch {
-                    code,
-                    delta,
-                    prefetch: prefetch.to_vec(),
-                    head,
-                    norm: 0.0,
-                    extra: payload,
-                };
-                row.clear();
-                columns.extend(&keys, &mut row);
-                tape.push(branch, &row);
+                if sorting {
+                    rows.push((code, delta), head, payload, prefetch, columns, &keys);
+                    if rows.bytes() > memory {
+                        for i in 0..rows.len() {
+                            let (branch, columns) = rows.branch(i);
+                            tape.push(branch, columns);
+                        }
+                        rows = Rows::new(dim as _);
+                        sorting = false;
+                    }
+                } else {
+                    let branch = Branch {
+                        code,
+                        delta,
+                        prefetch: prefetch.to_vec(),
+                        head,
+                        norm: 0.0,
+                        extra: payload,
+                    };
+                    row.clear();
+                    columns.extend(&keys, &mut row);
+                    tape.push(branch, &row);
+                }
                 tuples += 1;
             },
         );
@@ -168,6 +190,7 @@ where
         tape::read_frozen_tape::<R, _, _>(
             tape::by_directory(&mut prefetch_h0_tuples, directory)
                 .inspect(|guard| trace_forzen.push(guard.id())),
+            tape::All,
             || {
                 FunctionalAccessor::new(
                     Vec::<[u8; 16]>::new(),
@@ -201,28 +224,21 @@ where
         tape::read_appendable_tape::<R, _>(
             tape::by_next(index, *jump_tuple.appendable_first())
                 .inspect(|guard| trace_appendable.push(guard.id())),
-            |metadata, elements, delta| {
-                let signs = elements
-                    .iter()
-                    .flat_map(|x| std::array::from_fn::<_, 64, _>(|i| *x & (1 << i) != 0))
-                    .take(dim as _)
-                    .collect::<Vec<_>>();
-                (
-                    (
-                        rabitq::bit::CodeMetadata {
-                            dis_u_2: metadata[0],
-                            factor_cnt: metadata[1],
-                            factor_ip: metadata[2],
-                            factor_err: metadata[3],
-                        },
-                        signs,
-                    ),
-                    delta,
-                )
-            },
+            |metadata, elements, delta| (unpack_code(metadata, elements, dim as _), delta),
             (),
             &mut callback,
         );
+
+        for i in rows.sorted() {
+            let (branch, columns) = rows.branch(i as _);
+            tape.push(branch, columns);
+        }
+        if keyed {
+            // the reader of page ids stopped at the layout, before its last pages
+            trace_directory = tape::by_next(index, *jump_tuple.directory_first())
+                .map(|guard| guard.id())
+                .collect();
+        }
 
         let (frozen_tape, branches, columns) = tape.into_inner();
 
@@ -248,12 +264,27 @@ where
 
         let frozen_first = { frozen_tape }.first();
 
-        let directory = tape::by_next(index, frozen_first)
-            .map(|guard| guard.id())
-            .collect::<Vec<_>>();
+        let mut directory = tape::Layout::default();
+        for guard in tape::by_next(index, frozen_first) {
+            directory.page(guard.id());
+            if keyed {
+                for i in 1..=guard.len() {
+                    let bytes = guard.get(i).expect("data corruption");
+                    directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
+                        FrozenTupleReader::_0(x) => {
+                            Some(keys.range_of_block(x.payload(), x.columns()))
+                        }
+                        FrozenTupleReader::_1(_) => None,
+                    });
+                }
+            }
+        }
 
         let mut directory_tape = DirectoryTapeWriter::create(&hooked_index, false);
-        directory_tape.push(directory.as_slice());
+        directory_tape.push(directory.ids.as_slice());
+        if keyed {
+            directory_tape.push_layout(&directory.words());
+        }
         let directory_tape = directory_tape.into_inner();
 
         *jump_tuple.directory_first() = { directory_tape }.first();
@@ -300,6 +331,9 @@ where
 /// deleted (raw payload slots are inspected; the tape readers skip deleted
 /// entries) and the appendable tape holds fewer tuples than one frozen block,
 /// so compaction would write the same frozen blocks and the same remainder.
+/// In an index with filter keys it would sort that remainder into the frozen
+/// blocks;
+/// that can wait, and the list keeps its layout, or its lack of one.
 /// Returns the live tuple count of an unchanged list (#24).
 fn inspect_unchanged<R: RelationRead>(index: &R, first: u32) -> Option<u64>
 where
@@ -338,6 +372,93 @@ where
     }
     drop(jump_guard);
     Some(frozen + appendable)
+}
+
+/// The rows of a list of an index with filter keys, packed, to be written
+/// ordered by their first keys.
+struct Rows {
+    dim: usize,
+    /// per row: code metadata, delta, head, payload, the fold of its first key
+    fixed: Vec<([f32; 4], f32, u16, NonZero<u64>, u16)>,
+    /// per row: the signs of the code, a bit each
+    signs: Vec<u64>,
+    /// per row: the same number of pages
+    prefetch: Vec<u32>,
+    /// per row: the filter key columns, as an appendable tuple stores them
+    columns: Vec<u8>,
+}
+
+impl Rows {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            fixed: Vec::new(),
+            signs: Vec::new(),
+            prefetch: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.fixed.len()
+    }
+    /// The bytes held, with those to sort.
+    fn bytes(&self) -> usize {
+        let fixed = size_of::<([f32; 4], f32, u16, NonZero<u64>, u16)>() + size_of::<u32>();
+        let words = self.signs.len() * size_of::<u64>() + self.prefetch.len() * 4;
+        self.len() * fixed + words + self.columns.len()
+    }
+    fn push(
+        &mut self,
+        (code, delta): (rabitq::bit::Code, f32),
+        head: u16,
+        payload: NonZero<u64>,
+        prefetch: &[u32],
+        columns: Columns<'_>,
+        keys: &Keys,
+    ) {
+        let m = code.0;
+        let metadata = [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err];
+        let key = keys.sort_key(payload, columns);
+        self.fixed.push((metadata, delta, head, payload, key));
+        // a frozen code is padded to a multiple of 4 signs, with zeros
+        let signs = rabitq::bit::binary::pack_code(&code.1[..self.dim]);
+        self.signs.extend_from_slice(&signs);
+        self.prefetch.extend_from_slice(prefetch);
+        columns.extend(keys, &mut self.columns);
+    }
+    /// The rows in the order of their first keys, stable.
+    fn sorted(&self) -> Vec<u32> {
+        let mut order = (0..self.len() as u32).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&i| (self.fixed[i as usize].4, i));
+        order
+    }
+    /// A row, with its filter key columns.
+    fn branch(&self, i: usize) -> (Branch<NonZero<u64>>, &[u8]) {
+        let (metadata, delta, head, payload, _) = self.fixed[i];
+        let words = self.dim.div_ceil(64);
+        let n = self.prefetch.len() / self.len();
+        let width = self.columns.len() / self.len();
+        let branch = Branch {
+            code: unpack_code(metadata, &self.signs[i * words..][..words], self.dim),
+            delta,
+            prefetch: self.prefetch[i * n..][..n].to_vec(),
+            head,
+            norm: 0.0,
+            extra: payload,
+        };
+        (branch, &self.columns[i * width..][..width])
+    }
+}
+
+/// A code from its metadata and its first `dim` signs, packed in words
+/// (`rabitq::bit::binary::pack_code`), as an appendable tuple stores them.
+fn unpack_code(metadata: [f32; 4], words: &[u64], dim: usize) -> rabitq::bit::Code {
+    let signs = words
+        .iter()
+        .flat_map(|x| std::array::from_fn::<_, 64, _>(|j| x & (1 << j) != 0))
+        .take(dim)
+        .collect();
+    (rabitq::bit::CodeMetadata::from_array(metadata), signs)
 }
 
 #[derive(Clone)]

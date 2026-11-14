@@ -1,0 +1,62 @@
+# From PostgreSQL 17, `key = ANY(...)` on a filter key column is an index
+# condition, so a scan with many keys, which the filter keeps as a bitmap,
+# skips the blocks of other keys in a sorted list
+# (`tests/vchordrq/filter_key_sorted.slt`).
+
+statement ok
+CREATE TABLE fs_any (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs_any SELECT i, 7,
+  ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 768) j)::real[]::halfvec
+FROM generate_series(1, 3000) i;
+
+statement ok
+CREATE INDEX ON fs_any USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [4]
+$$);
+
+statement ok
+CREATE TABLE fs_any_q AS SELECT v FROM fs_any WHERE id = 2321;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+statement ok
+CREATE FUNCTION fs_any_buffers(cond text) RETURNS int LANGUAGE plpgsql AS $$
+DECLARE r json;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM fs_any WHERE %s '
+    'ORDER BY v <-> (SELECT v FROM fs_any_q) LIMIT 10', cond) INTO r;
+  RETURN (r->0->'Plan'->>'Shared Hit Blocks')::int + (r->0->'Plan'->>'Shared Read Blocks')::int;
+END
+$$;
+
+query T
+SELECT fs_any_buffers(format('owner = ANY(%L)',
+  (SELECT array_agg(k)::text FROM generate_series(100001, 100040) k))) * 4 < fs_any_buffers('true');
+----
+t
+
+statement ok
+DROP TABLE fs_any, fs_any_q;
+
+statement ok
+DROP FUNCTION fs_any_buffers;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET vchordrq.probes;

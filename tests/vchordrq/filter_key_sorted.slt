@@ -1,0 +1,494 @@
+# Sorted lists: a build or VACUUM writes the frozen rows of each list of an
+# index with a filter key column ordered by tag, and the list's directory keeps
+# the tag range of each block, so a filtered scan reads only the blocks whose
+# range meets a wanted key, and only their pages. Inserted rows wait, unsorted,
+# in the appendable tape. Whatever the order, the filtered stream (all lists
+# probed, no LIMIT) is exactly the heap's rows satisfying the condition, and
+# the top 10 at full probes matches an exact search. At 768 dimensions about
+# half of the blocks straddle two pages; at 4096, every block spans three.
+
+statement ok
+CREATE TABLE fs (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+# 61 owners of about 100 rows, one of 2,000, and NULL keys
+statement ok
+INSERT INTO fs SELECT i,
+  CASE WHEN i % 97 = 0 THEN NULL WHEN i <= 6000 THEN (i * 7919) % 61 ELSE 1000 END,
+  ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 768) j)::real[]::halfvec
+FROM generate_series(1, 8000) i;
+
+statement ok
+SET max_parallel_maintenance_workers = 2;
+
+statement ok
+ALTER TABLE fs SET (parallel_workers = 2);
+
+statement ok
+CREATE INDEX fs_v ON fs USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [8]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+ALTER TABLE fs RESET (parallel_workers);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '8';
+
+# a margin wide enough that every top 10 at full probes is exact on these
+# synthetic vectors, whatever centroids the build samples
+statement ok
+SET vchordrq.epsilon = 4;
+
+statement ok
+CREATE TABLE fs_q AS SELECT v FROM fs WHERE id = 4321;
+
+# filtered stream (index) == heap rows satisfying the condition
+statement ok
+CREATE FUNCTION fs_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[]; q text := (SELECT v::text FROM fs_q);
+BEGIN
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fs WHERE %s '
+    'ORDER BY v <-> %L) s', cond, q) INTO a;
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM fs WHERE (%s) IS TRUE', cond) INTO b;
+  RETURN a IS NOT DISTINCT FROM b;
+END
+$$;
+
+# the top 10: the same distances as an exact search, and as filtering above an
+# unfiltered scan of the same index
+statement ok
+CREATE FUNCTION fs_top(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a real[]; b real[]; c real[]; q text := (SELECT v::text FROM fs_q);
+BEGIN
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT v <-> %L AS d FROM fs WHERE %s '
+    'ORDER BY v <-> %L LIMIT 10) s', q, cond, q) INTO a;
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT v <-> %L AS d FROM fs WHERE %s '
+    'ORDER BY (v <-> %L) + 0 LIMIT 10) s', q, cond, q) INTO b;
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT d FROM (SELECT fs.*, v <-> %L AS d FROM fs '
+    'ORDER BY v <-> %L OFFSET 0) u WHERE %s LIMIT 10) s', q, q, cond) INTO c;
+  RETURN a = b AND a = c;
+END
+$$;
+
+# the buffers a top 10 touches
+statement ok
+CREATE FUNCTION fs_buffers(cond text) RETURNS int LANGUAGE plpgsql AS $$
+DECLARE r json; q text := (SELECT v::text FROM fs_q);
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM fs WHERE %s '
+    'ORDER BY v <-> %L LIMIT 10', cond, q) INTO r;
+  RETURN (r->0->'Plan'->>'Shared Hit Blocks')::int + (r->0->'Plan'->>'Shared Read Blocks')::int;
+END
+$$;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 1000');
+----
+t
+
+query T
+SELECT fs_same('owner = ANY(''{3,17,42}'')');
+----
+t
+
+query T
+SELECT fs_same('owner IN (1000, 9)');
+----
+t
+
+# many keys; more than the filter compares one by one (32 on x86_64, 8
+# elsewhere) become a bitmap, which reads every block
+query T
+SELECT fs_same('owner = ANY(''{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}'')');
+----
+t
+
+query T
+SELECT fs_same(format('owner = ANY(%L)', (SELECT array_agg(k)::text FROM generate_series(1, 40) k)));
+----
+t
+
+query T
+SELECT fs_same('owner = 123456');
+----
+t
+
+query T
+SELECT fs_same('owner IS NULL');
+----
+t
+
+query T
+SELECT fs_top('true') AND fs_top('owner = 17') AND fs_top('owner = ANY(''{3,17,42}'')')
+  AND fs_top('owner = 1000');
+----
+t
+
+# a key no row has reads almost no frozen page
+query T
+SELECT fs_buffers('owner = 123456') * 4 < fs_buffers('true');
+----
+t
+
+# without prefetching, and with the buffered prefetcher
+statement ok
+SET vchordrq.io_search = 'read_buffer';
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = ANY(''{3,17,42}'')') AND fs_top('owner = ANY(''{3,17,42}'')')
+  AND fs_buffers('owner = 123456') * 4 < fs_buffers('true');
+----
+t
+
+statement ok
+SET vchordrq.io_search = 'prefetch_buffer';
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = ANY(''{3,17,42}'')') AND fs_top('owner = ANY(''{3,17,42}'')')
+  AND fs_buffers('owner = 123456') * 4 < fs_buffers('true');
+----
+t
+
+statement ok
+RESET vchordrq.io_search;
+
+# inserted rows, of known keys and a new one, wait in the appendable tape
+statement ok
+INSERT INTO fs SELECT i, CASE WHEN i % 2 = 0 THEN 2000 ELSE (i * 7919) % 61 END,
+  ARRAY(SELECT cos(i * 0.29 + j * (1 + i % 11)) FROM generate_series(1, 768) j)::real[]::halfvec
+FROM generate_series(8001, 9000) i;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 2000') AND fs_same('owner = ANY(''{2000,17,1000}'')');
+----
+t
+
+query T
+SELECT fs_top('owner = 2000') AND fs_top('owner = ANY(''{2000,17}'')');
+----
+t
+
+statement ok
+DELETE FROM fs WHERE owner = 5 OR id % 10 = 3;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 2000') AND fs_same('owner = 1000') AND fs_same('owner = ANY(''{5,6}'')');
+----
+t
+
+# VACUUM rewrites the lists, sorting the inserted rows in
+statement ok
+VACUUM fs;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 2000') AND fs_same('owner = ANY(''{2000,17,1000}'')')
+  AND fs_same('owner IS NULL');
+----
+t
+
+query T
+SELECT fs_top('owner = 2000') AND fs_top('owner = ANY(''{3,17,42}'')') AND fs_top('true');
+----
+t
+
+query T
+SELECT fs_buffers('owner = 123456') * 4 < fs_buffers('true');
+----
+t
+
+# a sequential build
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+REINDEX INDEX fs_v;
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 2000') AND fs_same('owner = ANY(''{2000,17,1000}'')')
+  AND fs_top('owner = ANY(''{3,17,42}'')') AND fs_top('owner = 1000');
+----
+t
+
+query T
+SELECT fs_buffers('owner = 123456') * 4 < fs_buffers('true');
+----
+t
+
+# lists too large for maintenance_work_mem are written in the order they are
+# read, with layouts as written: a single list of about 16,000 rows takes about
+# 2 MB to sort, twice the least maintenance_work_mem of every PostgreSQL version
+statement ok
+INSERT INTO fs SELECT id + 10000, owner, v FROM fs;
+
+statement ok
+DROP INDEX fs_v;
+
+statement ok
+SET maintenance_work_mem = '1MB';
+
+statement ok
+CREATE INDEX fs_v ON fs USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [1]
+$$);
+
+statement ok
+RESET maintenance_work_mem;
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k))) FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('owner = 2000') AND fs_same('owner = ANY(''{2000,17,1000}'')')
+  AND fs_top('owner = ANY(''{3,17,42}'')') AND fs_top('owner = 1000');
+----
+t
+
+# one list, which VACUUM leaves as it is when it has no deleted row and fewer
+# than 32 new rows: its layout stays, next to the new rows
+statement ok
+CREATE TABLE fs2 (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs2 SELECT id, id % 20, v FROM fs WHERE id <= 2000;
+
+statement ok
+CREATE INDEX ON fs2 USING vchordrq (v halfvec_l2_ops, owner) WITH (options = 'residual_quantization = true');
+
+statement ok
+CREATE FUNCTION fs2_buffers(cond text) RETURNS int LANGUAGE plpgsql AS $$
+DECLARE r json;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM fs2 WHERE %s '
+    'ORDER BY v <-> (SELECT v FROM fs_q) LIMIT 10', cond) INTO r;
+  RETURN (r->0->'Plan'->>'Shared Hit Blocks')::int + (r->0->'Plan'->>'Shared Read Blocks')::int;
+END
+$$;
+
+statement ok
+INSERT INTO fs2 SELECT id + 100000, 1000, v FROM fs WHERE id <= 5;
+
+statement ok
+VACUUM fs2;
+
+statement ok
+SET vchordrq.probes = '';
+
+query T
+SELECT a = b FROM
+  (SELECT array_agg(id ORDER BY id) a FROM (SELECT id FROM fs2 WHERE owner = ANY('{7,1000}')
+    ORDER BY v <-> (SELECT v FROM fs_q)) s) x,
+  (SELECT array_agg(id ORDER BY id) b FROM fs2 WHERE owner = ANY('{7,1000}')) y;
+----
+t
+
+query T
+SELECT fs2_buffers('owner = 123456') * 4 < fs2_buffers('true');
+----
+t
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+DROP TABLE fs2;
+
+statement ok
+DROP FUNCTION fs2_buffers;
+
+# a single key: every page holds it
+statement ok
+CREATE TABLE fs1 (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs1 SELECT id, 7, v FROM fs WHERE id <= 3000;
+
+statement ok
+CREATE INDEX ON fs1 USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [4]
+$$);
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fs1)
+FROM (SELECT id FROM fs1 WHERE owner = 7 ORDER BY v <-> (SELECT v FROM fs_q)) s;
+----
+t
+
+query I
+SELECT count(*) FROM (SELECT id FROM fs1 WHERE owner = 8 ORDER BY v <-> (SELECT v FROM fs_q)) s;
+----
+0
+
+query T
+SELECT a = b FROM
+  (SELECT array_agg(d) a FROM (SELECT v <-> (SELECT v FROM fs_q) d FROM fs1 WHERE owner = 7
+    ORDER BY v <-> (SELECT v FROM fs_q) LIMIT 10) s) x,
+  (SELECT array_agg(d) b FROM (SELECT v <-> (SELECT v FROM fs_q) d FROM fs1 WHERE owner = 7
+    ORDER BY (v <-> (SELECT v FROM fs_q)) + 0 LIMIT 10) s) y;
+----
+t
+
+# many keys, which the filter keeps as a bitmap (the blocks they skip:
+# `tests/vchordrq/pg17/filter_key_sorted.slt`)
+query T
+SELECT count(*) = (SELECT count(*) FROM fs1) FROM (SELECT id FROM fs1
+  WHERE owner = ANY(ARRAY(SELECT generate_series(1, 40))) ORDER BY v <-> (SELECT v FROM fs_q)) s;
+----
+t
+
+# 4096 dimensions: blocks of three pages
+statement ok
+CREATE TABLE fs4 (id int PRIMARY KEY, owner int8, v halfvec(4096));
+
+statement ok
+INSERT INTO fs4 SELECT i, i % 8,
+  ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 4096) j)::real[]::halfvec
+FROM generate_series(1, 640) i;
+
+statement ok
+CREATE INDEX ON fs4 USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [2]
+$$);
+
+statement ok
+CREATE TABLE fs4_q AS SELECT v FROM fs4 WHERE id = 77;
+
+query T
+SELECT bool_and(a IS NOT DISTINCT FROM b) FROM generate_series(0, 8) k,
+  LATERAL (SELECT array_agg(id ORDER BY id) a FROM (SELECT id FROM fs4 WHERE owner = k
+    ORDER BY v <-> (SELECT v FROM fs4_q)) s) x,
+  LATERAL (SELECT array_agg(id ORDER BY id) b FROM fs4 WHERE owner = k) y;
+----
+t
+
+query T
+SELECT a = b FROM
+  (SELECT array_agg(id ORDER BY id) a FROM (SELECT id FROM fs4 WHERE owner = ANY('{1,6}')
+    ORDER BY v <-> (SELECT v FROM fs4_q)) s) x,
+  (SELECT array_agg(id ORDER BY id) b FROM fs4 WHERE owner = ANY('{1,6}')) y;
+----
+t
+
+query T
+SELECT a = b FROM
+  (SELECT array_agg(d) a FROM (SELECT v <-> (SELECT v FROM fs4_q) d FROM fs4
+    WHERE owner = ANY('{2,5}') ORDER BY v <-> (SELECT v FROM fs4_q) LIMIT 10) s) x,
+  (SELECT array_agg(d) b FROM (SELECT v <-> (SELECT v FROM fs4_q) d FROM fs4
+    WHERE owner = ANY('{2,5}') ORDER BY (v <-> (SELECT v FROM fs4_q)) + 0 LIMIT 10) s) y;
+----
+t
+
+# several filter keys: the order and the ranges are the first key's, stored
+# whole in 8 bytes here and ranged by its folds; a later key is tested in the
+# blocks the first selects, and a scan on it alone reads every block
+statement ok
+DROP INDEX fs_v;
+
+statement ok
+ALTER TABLE fs ADD COLUMN grp int4;
+
+statement ok
+UPDATE fs SET grp = id % 5;
+
+statement ok
+CREATE INDEX fs_two ON fs USING vchordrq (v halfvec_l2_ops, owner int8_ops (bytes = 8), grp int4_ops (bytes = 4)) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [8]
+$$);
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k)) AND fs_same(format('owner = %s AND grp = %s', k, k % 5)))
+FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('grp = 3') AND fs_same('grp = ANY(''{1,4}'')') AND fs_same('owner = 1000 AND grp = ANY(''{0,2}'')')
+  AND fs_same('owner = ANY(''{3,17,1000}'') AND grp = 2') AND fs_same('owner = 2000 AND grp = 0');
+----
+t
+
+query T
+SELECT fs_top('owner = 17 AND grp = 2') AND fs_top('grp = 2') AND fs_top('owner = 1000');
+----
+t
+
+query T
+SELECT fs_buffers('owner = 123456') * 4 < fs_buffers('grp = 99');
+----
+t
+
+statement ok
+DROP TABLE fs, fs1, fs_q, fs4, fs4_q;
+
+statement ok
+DROP FUNCTION fs_same, fs_top, fs_buffers;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET vchordrq.epsilon;
