@@ -139,7 +139,7 @@ mod reduce_sum_of_xy {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_xy_v3(lhs: &[u8], rhs: &[u8]) -> u32 {
-        use crate::emulate::{emulate_mm256_reduce_add_epi32, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi32, partial};
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -162,7 +162,7 @@ mod reduce_sum_of_xy {
             (n, a, b) = unsafe { (n - 32, a.add(32), b.add(32)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(32, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 32>(a, n, 0), partial::<_, 32>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
@@ -208,7 +208,7 @@ mod reduce_sum_of_xy {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
     fn reduce_sum_of_xy_v2(lhs: &[u8], rhs: &[u8]) -> u32 {
-        use crate::emulate::{emulate_mm_reduce_add_epi32, partial_load};
+        use crate::emulate::{emulate_mm_reduce_add_epi32, partial};
         use core::arch::x86_64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -231,7 +231,7 @@ mod reduce_sum_of_xy {
             (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(16, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 16>(a, n, 0), partial::<_, 16>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm_loadu_si128(a.cast()) };
             let y = unsafe { _mm_loadu_si128(b.cast()) };
@@ -320,7 +320,7 @@ mod reduce_sum_of_xy {
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_xy_a2(lhs: &[u8], rhs: &[u8]) -> u32 {
-        use crate::emulate::partial_load;
+        use crate::emulate::partial;
         use core::arch::aarch64::*;
         assert_eq!(lhs.len(), rhs.len());
         let mut n = lhs.len();
@@ -338,7 +338,7 @@ mod reduce_sum_of_xy {
             (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(16, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 16>(a, n, 0), partial::<_, 16>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { vld1q_u8(a.cast()) };
             let y = unsafe { vld1q_u8(b.cast()) };
@@ -445,7 +445,7 @@ mod reduce_sum_of_x {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_x_v3(this: &[u8]) -> u32 {
-        use crate::emulate::{emulate_mm256_reduce_add_epi32, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi32, partial};
         use core::arch::x86_64::*;
         let i8_1 = _mm256_set1_epi8(1);
         let i16_1 = _mm256_set1_epi16(1);
@@ -458,8 +458,8 @@ mod reduce_sum_of_x {
             (n, a) = unsafe { (n - 32, a.add(32)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(32, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 32>(a, n, 0) };
+            a = _a.as_ptr();
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_maddubs_epi16(x, i8_1), i16_1));
         }
@@ -491,7 +491,7 @@ mod reduce_sum_of_x {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v2")]
     fn reduce_sum_of_x_v2(this: &[u8]) -> u32 {
-        use crate::emulate::{emulate_mm_reduce_add_epi32, partial_load};
+        use crate::emulate::{emulate_mm_reduce_add_epi32, partial};
         use core::arch::x86_64::*;
         let i8_1 = _mm_set1_epi8(1);
         let i16_1 = _mm_set1_epi16(1);
@@ -504,8 +504,8 @@ mod reduce_sum_of_x {
             (n, a) = unsafe { (n - 16, a.add(16)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(16, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 16>(a, n, 0) };
+            a = _a.as_ptr();
             let x = unsafe { _mm_loadu_si128(a.cast()) };
             sum = _mm_add_epi32(sum, _mm_madd_epi16(_mm_maddubs_epi16(x, i8_1), i16_1));
         }
@@ -537,7 +537,7 @@ mod reduce_sum_of_x {
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_x_a2(this: &[u8]) -> u32 {
-        use crate::emulate::partial_load;
+        use crate::emulate::partial;
         use core::arch::aarch64::*;
         let mut n = this.len();
         let mut a = this.as_ptr();
@@ -548,8 +548,8 @@ mod reduce_sum_of_x {
             (n, a) = unsafe { (n - 16, a.add(16)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(16, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 16>(a, n, 0) };
+            a = _a.as_ptr();
             let x = unsafe { vld1q_u8(a.cast()) };
             sum = vaddq_u32(sum, vpaddlq_u16(vpaddlq_u8(x)));
         }

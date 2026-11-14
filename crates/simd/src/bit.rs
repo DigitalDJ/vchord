@@ -117,7 +117,7 @@ mod reduce_sum_of_and {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_and_v3(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
-        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial};
         use core::arch::x86_64::*;
         static LUT: [[i8; 16]; 2] = [[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; 2];
         let lut = unsafe { _mm256_loadu_si256((&raw const LUT).cast()) };
@@ -140,7 +140,7 @@ mod reduce_sum_of_and {
             (n, a, b) = unsafe { (n - 4, a.add(4), b.add(4)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(4, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 4>(a, n, 0), partial::<_, 4>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
@@ -295,7 +295,7 @@ mod reduce_sum_of_or {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_or_v3(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
-        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial};
         use core::arch::x86_64::*;
         static LUT: [[i8; 16]; 2] = [[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; 2];
         let lut = unsafe { _mm256_loadu_si256((&raw const LUT).cast()) };
@@ -318,7 +318,7 @@ mod reduce_sum_of_or {
             (n, a, b) = unsafe { (n - 4, a.add(4), b.add(4)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(4, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 4>(a, n, 0), partial::<_, 4>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
@@ -473,7 +473,7 @@ mod reduce_sum_of_xor {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_xor_v3(lhs: &[u64], rhs: &[u64]) -> u32 {
         assert!(lhs.len() == rhs.len());
-        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial};
         use core::arch::x86_64::*;
         static LUT: [[i8; 16]; 2] = [[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; 2];
         let lut = unsafe { _mm256_loadu_si256((&raw const LUT).cast()) };
@@ -496,7 +496,7 @@ mod reduce_sum_of_xor {
             (n, a, b) = unsafe { (n - 4, a.add(4), b.add(4)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(4, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 4>(a, n, 0), partial::<_, 4>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
@@ -677,7 +677,7 @@ mod reduce_sum_of_and_or {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_and_or_v3(lhs: &[u64], rhs: &[u64]) -> (u32, u32) {
         assert!(lhs.len() == rhs.len());
-        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial};
         use core::arch::x86_64::*;
         static LUT: [[i8; 16]; 2] = [[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; 2];
         let lut = unsafe { _mm256_loadu_si256((&raw const LUT).cast()) };
@@ -709,7 +709,7 @@ mod reduce_sum_of_and_or {
             (n, a, b) = unsafe { (n - 4, a.add(4), b.add(4)) };
         }
         if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(4, n, a, b) };
+            let (_a, _b) = unsafe { (partial::<_, 4>(a, n, 0), partial::<_, 4>(b, n, 0)) };
             (a, b) = (_a.as_ptr(), _b.as_ptr());
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let y = unsafe { _mm256_loadu_si256(b.cast()) };
@@ -864,7 +864,7 @@ mod reduce_sum_of_x {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_x_v3(this: &[u64]) -> u32 {
-        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial_load};
+        use crate::emulate::{emulate_mm256_reduce_add_epi64, partial};
         use core::arch::x86_64::*;
         static LUT: [[i8; 16]; 2] = [[0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4]; 2];
         let lut = unsafe { _mm256_loadu_si256((&raw const LUT).cast()) };
@@ -884,8 +884,8 @@ mod reduce_sum_of_x {
             (n, a) = unsafe { (n - 4, a.add(4)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(4, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 4>(a, n, 0) };
+            a = _a.as_ptr();
             let x = unsafe { _mm256_loadu_si256(a.cast()) };
             let lo = _mm256_and_si256(x, mask_0);
             let hi = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask_0);

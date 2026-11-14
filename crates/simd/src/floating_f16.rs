@@ -176,74 +176,7 @@ mod reduce_or_of_is_zero_x {
     }
 }
 
-// All reductions below accumulate in f32 on every code path.
-//
-// Accumulating in binary16 (as the former `v4:avx512fp16`, `a2:fp16` and SVE
-// kernels did) overflows at 65504 and loses precision after a few thousand
-// additions, which made halfvec distances meaningless for large-magnitude data.
-// On aarch64 with FEAT_FHM, `FMLAL`/`FMLSL` widen each f16 product to f32
-// exactly and accumulate in f32, so they keep most of the speed of fp16
-// arithmetic without its range. Without FEAT_FHM, and on x86_64, every element
-// is converted to f32 before it is accumulated.
-
-#[cfg(target_arch = "aarch64")]
-mod aarch64 {
-    use core::arch::aarch64::*;
-
-    /// Sums all lanes of all accumulators.
-    #[inline]
-    #[crate::target_cpu(enable = "a2")]
-    pub(super) fn reduce_add<const N: usize>(mut sum: [float32x4_t; N]) -> f32 {
-        let mut n = N;
-        while n > 1 {
-            let h = n / 2;
-            for i in 0..h {
-                sum[i] = vaddq_f32(sum[i], sum[n - h + i]);
-            }
-            n -= h;
-        }
-        vaddvq_f32(sum[0])
-    }
-}
-
-#[cfg(test)]
-mod test_util {
-    use crate::{F16, f16};
-    use rand::RngExt;
-
-    /// Odd, short, around-the-unroll-boundary, and realistic lengths.
-    pub(super) fn lengths() -> impl Iterator<Item = usize> {
-        (1..=70).chain([127, 128, 129, 255, 783, 784, 785, 1023, 4095, 4097])
-    }
-
-    pub(super) fn random(n: usize, lo: f32, hi: f32) -> Vec<f16> {
-        let mut rng = rand::rng();
-        (0..n)
-            .map(|_| f16::_from_f32(rng.random_range(lo..=hi)))
-            .collect()
-    }
-
-    /// Integers in `[lo, hi]`; e.g. pixel intensities `0..=255`.
-    pub(super) fn integers(n: usize, lo: i32, hi: i32) -> Vec<f16> {
-        let mut rng = rand::rng();
-        (0..n)
-            .map(|_| f16::_from_f32(rng.random_range(lo..=hi) as f32))
-            .collect()
-    }
-
-    /// Asserts `got` is within the worst-case error of an f32 summation of `n`
-    /// terms, `(n + 1) * 2^-24 * sum_of_abs`, from the exact `(sum, sum_of_abs)`.
-    ///
-    /// Accumulating in f16 instead has an error of about `2^-11` per addition.
-    #[track_caller]
-    pub(super) fn assert_close(name: &str, n: usize, got: f32, (sum, sum_of_abs): (f64, f64)) {
-        let tolerance = (n + 1) as f64 * 2.0f64.powi(-24) * sum_of_abs + 1e-6;
-        assert!(
-            ((got as f64) - sum).abs() <= tolerance,
-            "{name}: n = {n}, got = {got}, expected = {sum}, tolerance = {tolerance}"
-        );
-    }
-}
+// Every kernel accumulates in f32: binary16 overflows at 65504. FHM's `FMLAL`/`FMLSL` widen exactly.
 
 #[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_x2 {
@@ -254,96 +187,15 @@ mod reduce_sum_of_x2 {
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_x2_v4(this: &[f16]) -> f32 {
         use core::arch::x86_64::*;
-        let mut n = this.len();
-        let mut a = this.as_ptr();
-        let mut sum = _mm512_setzero_ps();
-        while n >= 16 {
-            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
-            sum = _mm512_fmadd_ps(x, x, sum);
-            (n, a) = unsafe { (n - 16, a.add(16)) };
-        }
-        if n > 0 {
-            let mask = _bzhi_u32(0xffff, n as u32) as u16;
-            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
-            sum = _mm512_fmadd_ps(x, x, sum);
-        }
-        _mm512_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_x2_v4_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v4") {
-            println!("test {} ... skipped (v4)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let this = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let specialized = unsafe { reduce_sum_of_x2_v4(&this) };
-            let fallback = fallback(&this);
-            assert!(
-                (specialized - fallback).abs() < EPSILON,
-                "specialized = {specialized}, fallback = {fallback}."
-            );
-        }
+        crate::reduce::v4::sum::<1, 1, _>([this], |s, [x]| _mm512_fmadd_ps(x, x, s))
     }
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_x2_v3(this: &[f16]) -> f32 {
-        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
         use core::arch::x86_64::*;
-        let mut n = this.len();
-        let mut a = this.as_ptr();
-        let mut sum = _mm256_setzero_ps();
-        while n >= 8 {
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            sum = _mm256_fmadd_ps(x, x, sum);
-            (n, a) = unsafe { (n - 8, a.add(8)) };
-        }
-        if n > 0 {
-            let (_a,) = unsafe { partial_load!(8, n, a) };
-            (a,) = (_a.as_ptr(),);
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            sum = _mm256_fmadd_ps(x, x, sum);
-        }
-        emulate_mm256_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_x2_v3_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v3") {
-            println!("test {} ... skipped (v3)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let this = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let this = &this[..z];
-                let specialized = unsafe { reduce_sum_of_x2_v3(this) };
-                let fallback = fallback(this);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
+        crate::reduce::v3::sum::<1, 1, _>([this], |s, [x]| _mm256_fmadd_ps(x, x, s))
     }
 
     #[inline]
@@ -351,72 +203,20 @@ mod reduce_sum_of_x2 {
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fhm")]
     fn reduce_sum_of_x2_a2_fhm(this: &[f16]) -> f32 {
-        use crate::emulate::partial_load;
         use core::arch::aarch64::*;
-        let mut n = this.len();
-        let mut a = this.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 16];
-        while n >= 64 {
-            for i in 0..8 {
-                let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                sum[2 * i] = vfmlalq_low_f16(sum[2 * i], x, x);
-                sum[2 * i + 1] = vfmlalq_high_f16(sum[2 * i + 1], x, x);
-            }
-            (n, a) = unsafe { (n - 64, a.add(64)) };
-        }
-        while n >= 8 {
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            sum[0] = vfmlalq_low_f16(sum[0], x, x);
-            sum[1] = vfmlalq_high_f16(sum[1], x, x);
-            (n, a) = unsafe { (n - 8, a.add(8)) };
-        }
-        if n > 0 {
-            let (_a,) = unsafe { partial_load!(8, n, a) };
-            (a,) = (_a.as_ptr(),);
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            sum[2] = vfmlalq_low_f16(sum[2], x, x);
-            sum[3] = vfmlalq_high_f16(sum[3], x, x);
-        }
-        super::aarch64::reduce_add(sum)
+        crate::reduce::a2::sum_f16::<8, 1>([this], |s, [x]| {
+            [vfmlalq_low_f16(s[0], x, x), vfmlalq_high_f16(s[1], x, x)]
+        })
     }
 
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_x2_a2(this: &[f16]) -> f32 {
-        use crate::emulate::{emulate_vreinterpretq_f16_u16, partial_load};
         use core::arch::aarch64::*;
-        let mut n = this.len();
-        let mut a = this.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 8];
-        while n >= 32 {
-            for i in 0..4 {
-                let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let x_0 = vcvt_f32_f16(vget_low_f16(x));
-                let x_1 = vcvt_high_f32_f16(x);
-                sum[2 * i] = vfmaq_f32(sum[2 * i], x_0, x_0);
-                sum[2 * i + 1] = vfmaq_f32(sum[2 * i + 1], x_1, x_1);
-            }
-            (n, a) = unsafe { (n - 32, a.add(32)) };
-        }
-        while n >= 8 {
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let x_0 = vcvt_f32_f16(vget_low_f16(x));
-            let x_1 = vcvt_high_f32_f16(x);
-            sum[0] = vfmaq_f32(sum[0], x_0, x_0);
-            sum[1] = vfmaq_f32(sum[1], x_1, x_1);
-            (n, a) = unsafe { (n - 8, a.add(8)) };
-        }
-        if n > 0 {
-            let (_a,) = unsafe { partial_load!(8, n, a) };
-            (a,) = (_a.as_ptr(),);
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let x_0 = vcvt_f32_f16(vget_low_f16(x));
-            let x_1 = vcvt_high_f32_f16(x);
-            sum[2] = vfmaq_f32(sum[2], x_0, x_0);
-            sum[3] = vfmaq_f32(sum[3], x_1, x_1);
-        }
-        super::aarch64::reduce_add(sum)
+        crate::reduce::a2::sum::<4, 1, _>([this], |s, [x]| {
+            [vfmaq_f32(s[0], x[0], x[0]), vfmaq_f32(s[1], x[1], x[1])]
+        })
     }
 
     #[crate::multiversion(
@@ -433,32 +233,8 @@ mod reduce_sum_of_x2 {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_x2_accuracy_test() {
-        use super::test_util::*;
-        let exact = |x: &[f16]| {
-            let s = x
-                .iter()
-                .map(|x| (x._to_f32() as f64) * (x._to_f32() as f64))
-                .sum::<f64>();
-            (s, s)
-        };
-        // `255 * 255 * 784` overflows binary16 by a factor of more than 700.
-        for (lo, hi) in [(0, 255), (-255, 255), (-4096, 4096)] {
-            for n in lengths() {
-                let x = integers(n, lo, hi);
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x), exact(&x));
-                }
-            }
-        }
-        for n in lengths() {
-            for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3)] {
-                let x = random(n, lo, hi);
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x), exact(&x));
-                }
-            }
-        }
+    fn reduce_sum_of_x2_test() {
+        crate::test_util::check_unary(implementations(), |x| x * x);
     }
 }
 
@@ -488,112 +264,16 @@ mod reduce_sum_of_xy {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_xy_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = _mm512_setzero_ps();
-        while n >= 16 {
-            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
-            let y = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(b.cast())) };
-            sum = _mm512_fmadd_ps(x, y, sum);
-            (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
-        }
-        if n > 0 {
-            let mask = _bzhi_u32(0xffff, n as u32) as u16;
-            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
-            let y = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, b.cast())) };
-            sum = _mm512_fmadd_ps(x, y, sum);
-        }
-        _mm512_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_xy_v4_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v4") {
-            println!("test {} ... skipped (v4)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let specialized = unsafe { reduce_sum_of_xy_v4(&lhs, &rhs) };
-            let fallback = fallback(&lhs, &rhs);
-            assert!(
-                (specialized - fallback).abs() < EPSILON,
-                "specialized = {specialized}, fallback = {fallback}."
-            );
-        }
+        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm512_fmadd_ps(x, y, s))
     }
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_xy_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
         use core::arch::x86_64::*;
-        assert!(lhs.len() == rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = _mm256_setzero_ps();
-        while n >= 8 {
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
-            sum = _mm256_fmadd_ps(x, y, sum);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
-            sum = _mm256_fmadd_ps(x, y, sum);
-        }
-        emulate_mm256_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_xy_v3_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v3") {
-            println!("test {} ... skipped (v3)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let lhs = &lhs[..z];
-                let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_xy_v3(lhs, rhs) };
-                let fallback = fallback(lhs, rhs);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
+        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm256_fmadd_ps(x, y, s))
     }
 
     #[cfg_attr(feature = "internal", simd_macros::public)]
@@ -651,82 +331,20 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fhm")]
     fn reduce_sum_of_xy_a2_fhm(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::partial_load;
         use core::arch::aarch64::*;
-        assert!(lhs.len() == rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 16];
-        while n >= 64 {
-            for i in 0..8 {
-                let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
-                sum[2 * i] = vfmlalq_low_f16(sum[2 * i], x, y);
-                sum[2 * i + 1] = vfmlalq_high_f16(sum[2 * i + 1], x, y);
-            }
-            (n, a, b) = unsafe { (n - 64, a.add(64), b.add(64)) };
-        }
-        while n >= 8 {
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            sum[0] = vfmlalq_low_f16(sum[0], x, y);
-            sum[1] = vfmlalq_high_f16(sum[1], x, y);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            sum[2] = vfmlalq_low_f16(sum[2], x, y);
-            sum[3] = vfmlalq_high_f16(sum[3], x, y);
-        }
-        super::aarch64::reduce_add(sum)
+        crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
+            [vfmlalq_low_f16(s[0], x, y), vfmlalq_high_f16(s[1], x, y)]
+        })
     }
 
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_xy_a2(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::{emulate_vreinterpretq_f16_u16, partial_load};
         use core::arch::aarch64::*;
-        assert!(lhs.len() == rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 8];
-        while n >= 32 {
-            for i in 0..4 {
-                let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
-                let (x_0, x_1) = (vcvt_f32_f16(vget_low_f16(x)), vcvt_high_f32_f16(x));
-                let (y_0, y_1) = (vcvt_f32_f16(vget_low_f16(y)), vcvt_high_f32_f16(y));
-                sum[2 * i] = vfmaq_f32(sum[2 * i], x_0, y_0);
-                sum[2 * i + 1] = vfmaq_f32(sum[2 * i + 1], x_1, y_1);
-            }
-            (n, a, b) = unsafe { (n - 32, a.add(32), b.add(32)) };
-        }
-        while n >= 8 {
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            let (x_0, x_1) = (vcvt_f32_f16(vget_low_f16(x)), vcvt_high_f32_f16(x));
-            let (y_0, y_1) = (vcvt_f32_f16(vget_low_f16(y)), vcvt_high_f32_f16(y));
-            sum[0] = vfmaq_f32(sum[0], x_0, y_0);
-            sum[1] = vfmaq_f32(sum[1], x_1, y_1);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            let (x_0, x_1) = (vcvt_f32_f16(vget_low_f16(x)), vcvt_high_f32_f16(x));
-            let (y_0, y_1) = (vcvt_f32_f16(vget_low_f16(y)), vcvt_high_f32_f16(y));
-            sum[2] = vfmaq_f32(sum[2], x_0, y_0);
-            sum[3] = vfmaq_f32(sum[3], x_1, y_1);
-        }
-        super::aarch64::reduce_add(sum)
+        crate::reduce::a2::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| {
+            [vfmaq_f32(s[0], x[0], y[0]), vfmaq_f32(s[1], x[1], y[1])]
+        })
     }
 
     #[crate::multiversion(@"v4", @"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -742,31 +360,8 @@ mod reduce_sum_of_xy {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_xy_accuracy_test() {
-        use super::test_util::*;
-        let exact = |x: &[f16], y: &[f16]| {
-            let t =
-                || std::iter::zip(x, y).map(|(x, y)| (x._to_f32() as f64) * (y._to_f32() as f64));
-            (t().sum::<f64>(), t().map(f64::abs).sum::<f64>())
-        };
-        for (lo, hi) in [(0, 255), (-255, 255), (-4096, 4096)] {
-            for n in lengths() {
-                let (x, y) = (integers(n, lo, hi), integers(n, lo, hi));
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x, &y), exact(&x, &y));
-                    // A vector against itself: the norm of a large-magnitude vector.
-                    assert_close(name, n, f(&x, &x), exact(&x, &x));
-                }
-            }
-        }
-        for n in lengths() {
-            for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3)] {
-                let (x, y) = (random(n, lo, hi), random(n, lo, hi));
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x, &y), exact(&x, &y));
-                }
-            }
-        }
+    fn reduce_sum_of_xy_test() {
+        crate::test_util::check_binary(implementations(), |x, y| x * y);
     }
 }
 
@@ -778,121 +373,22 @@ mod reduce_sum_of_d2 {
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_d2_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
-        assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = _mm512_setzero_ps();
-        while n >= 16 {
-            let x = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(a.cast())) };
-            let y = unsafe { _mm512_cvtph_ps(_mm256_loadu_epi16(b.cast())) };
+        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
             let d = _mm512_sub_ps(x, y);
-            sum = _mm512_fmadd_ps(d, d, sum);
-            (n, a, b) = unsafe { (n - 16, a.add(16), b.add(16)) };
-        }
-        if n > 0 {
-            let mask = _bzhi_u32(0xffff, n as u32) as u16;
-            let x = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, a.cast())) };
-            let y = unsafe { _mm512_cvtph_ps(_mm256_maskz_loadu_epi16(mask, b.cast())) };
-            let d = _mm512_sub_ps(x, y);
-            sum = _mm512_fmadd_ps(d, d, sum);
-        }
-        _mm512_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_d2_v4_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v4") {
-            println!("test {} ... skipped (v4)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let lhs = &lhs[..z];
-                let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_d2_v4(lhs, rhs) };
-                let fallback = fallback(lhs, rhs);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
+            _mm512_fmadd_ps(d, d, s)
+        })
     }
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_d2_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::{emulate_mm256_reduce_add_ps, partial_load};
-        assert!(lhs.len() == rhs.len());
         use core::arch::x86_64::*;
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = _mm256_setzero_ps();
-        while n >= 8 {
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
+        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
             let d = _mm256_sub_ps(x, y);
-            sum = _mm256_fmadd_ps(d, d, sum);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-
-            let x = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(a.cast())) };
-            let y = unsafe { _mm256_cvtph_ps(_mm_loadu_si128(b.cast())) };
-            let d = _mm256_sub_ps(x, y);
-            sum = _mm256_fmadd_ps(d, d, sum);
-        }
-        emulate_mm256_reduce_add_ps(sum)
-    }
-
-    #[cfg(all(target_arch = "x86_64", test))]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_d2_v3_test() {
-        use rand::RngExt;
-        const EPSILON: f32 = 2.0;
-        if !crate::is_cpu_detected!("v3") {
-            println!("test {} ... skipped (v3)", module_path!());
-            return;
-        }
-        let mut rng = rand::rng();
-        for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
-            let n = 4016;
-            let lhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            let rhs = (0..n)
-                .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-                .collect::<Vec<_>>();
-            for z in 3984..4016 {
-                let lhs = &lhs[..z];
-                let rhs = &rhs[..z];
-                let specialized = unsafe { reduce_sum_of_d2_v3(lhs, rhs) };
-                let fallback = fallback(lhs, rhs);
-                assert!(
-                    (specialized - fallback).abs() < EPSILON,
-                    "specialized = {specialized}, fallback = {fallback}."
-                );
-            }
-        }
+            _mm256_fmadd_ps(d, d, s)
+        })
     }
 
     #[cfg_attr(feature = "internal", simd_macros::public)]
@@ -950,92 +446,27 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fhm")]
     fn reduce_sum_of_d2_a2_fhm(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::partial_load;
         use core::arch::aarch64::*;
         // `x - y` is computed in f32 (`FMLSL` with `y * 1.0`, which is exact),
         // never in f16: an f16 difference would be rounded, and it overflows
         // once `|x - y| > 65504`.
         let ones = vreinterpretq_f16_u16(vdupq_n_u16(0x3c00));
-        assert!(lhs.len() == rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 16];
-        while n >= 64 {
-            for i in 0..8 {
-                let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
-                let d_0 = vfmlslq_low_f16(vcvt_f32_f16(vget_low_f16(x)), y, ones);
-                let d_1 = vfmlslq_high_f16(vcvt_high_f32_f16(x), y, ones);
-                sum[2 * i] = vfmaq_f32(sum[2 * i], d_0, d_0);
-                sum[2 * i + 1] = vfmaq_f32(sum[2 * i + 1], d_1, d_1);
-            }
-            (n, a, b) = unsafe { (n - 64, a.add(64), b.add(64)) };
-        }
-        while n >= 8 {
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
+        crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
             let d_0 = vfmlslq_low_f16(vcvt_f32_f16(vget_low_f16(x)), y, ones);
             let d_1 = vfmlslq_high_f16(vcvt_high_f32_f16(x), y, ones);
-            sum[0] = vfmaq_f32(sum[0], d_0, d_0);
-            sum[1] = vfmaq_f32(sum[1], d_1, d_1);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            let d_0 = vfmlslq_low_f16(vcvt_f32_f16(vget_low_f16(x)), y, ones);
-            let d_1 = vfmlslq_high_f16(vcvt_high_f32_f16(x), y, ones);
-            sum[2] = vfmaq_f32(sum[2], d_0, d_0);
-            sum[3] = vfmaq_f32(sum[3], d_1, d_1);
-        }
-        super::aarch64::reduce_add(sum)
+            [vfmaq_f32(s[0], d_0, d_0), vfmaq_f32(s[1], d_1, d_1)]
+        })
     }
 
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_d2_a2(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::{emulate_vreinterpretq_f16_u16, partial_load};
         use core::arch::aarch64::*;
-        assert!(lhs.len() == rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 8];
-        while n >= 32 {
-            for i in 0..4 {
-                let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
-                let d_0 = vsubq_f32(vcvt_f32_f16(vget_low_f16(x)), vcvt_f32_f16(vget_low_f16(y)));
-                let d_1 = vsubq_f32(vcvt_high_f32_f16(x), vcvt_high_f32_f16(y));
-                sum[2 * i] = vfmaq_f32(sum[2 * i], d_0, d_0);
-                sum[2 * i + 1] = vfmaq_f32(sum[2 * i + 1], d_1, d_1);
-            }
-            (n, a, b) = unsafe { (n - 32, a.add(32), b.add(32)) };
-        }
-        while n >= 8 {
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            let d_0 = vsubq_f32(vcvt_f32_f16(vget_low_f16(x)), vcvt_f32_f16(vget_low_f16(y)));
-            let d_1 = vsubq_f32(vcvt_high_f32_f16(x), vcvt_high_f32_f16(y));
-            sum[0] = vfmaq_f32(sum[0], d_0, d_0);
-            sum[1] = vfmaq_f32(sum[1], d_1, d_1);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            (a, b) = (_a.as_ptr(), _b.as_ptr());
-            let x = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = emulate_vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
-            let d_0 = vsubq_f32(vcvt_f32_f16(vget_low_f16(x)), vcvt_f32_f16(vget_low_f16(y)));
-            let d_1 = vsubq_f32(vcvt_high_f32_f16(x), vcvt_high_f32_f16(y));
-            sum[2] = vfmaq_f32(sum[2], d_0, d_0);
-            sum[3] = vfmaq_f32(sum[3], d_1, d_1);
-        }
-        super::aarch64::reduce_add(sum)
+        crate::reduce::a2::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| {
+            let d = [vsubq_f32(x[0], y[0]), vsubq_f32(x[1], y[1])];
+            [vfmaq_f32(s[0], d[0], d[0]), vfmaq_f32(s[1], d[1], d[1])]
+        })
     }
 
     #[crate::multiversion(@"v4", @"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -1052,35 +483,8 @@ mod reduce_sum_of_d2 {
 
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn reduce_sum_of_d2_accuracy_test() {
-        use super::test_util::*;
-        let exact = |x: &[f16], y: &[f16]| {
-            let s = std::iter::zip(x, y)
-                .map(|(x, y)| (x._to_f32() as f64 - y._to_f32() as f64).powi(2))
-                .sum::<f64>();
-            (s, s)
-        };
-        // `x - y` reaches 131008 for the last range, beyond the f16 range.
-        for (lo, hi) in [(0, 255), (-255, 255), (-4096, 4096), (-65504, 65504)] {
-            for n in lengths() {
-                let (x, y) = (integers(n, lo, hi), integers(n, lo, hi));
-                let zero = vec![f16::_ZERO; n];
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x, &y), exact(&x, &y));
-                    assert_close(name, n, f(&x, &zero), exact(&x, &zero));
-                    assert_eq!(f(&x, &x), 0.0, "{name}: n = {n}");
-                }
-            }
-        }
-        for n in lengths() {
-            // The second range covers subnormal halves.
-            for (lo, hi) in [(-1.0, 1.0), (-1e-4, 1e-4)] {
-                let (x, y) = (random(n, lo, hi), random(n, lo, hi));
-                for (name, f) in implementations() {
-                    assert_close(name, n, f(&x, &y), exact(&x, &y));
-                }
-            }
-        }
+    fn reduce_sum_of_d2_test() {
+        crate::test_util::check_binary(implementations(), |x, y| (x - y).powi(2));
     }
 }
 
@@ -1096,55 +500,18 @@ mod reduce_sum_of_d2_approx {
             && crate::is_feature_detected!("fhm")
     }
 
+    // Only the difference is rounded (to f16), so each term is within a relative (1 + 2^-11)^2 - 1 of exact.
+
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
     #[target_feature(enable = "fp16,fhm")]
     fn reduce_sum_of_d2_approx_a2_fp16_fhm(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use crate::emulate::partial_load;
         use core::arch::aarch64::*;
-        assert_eq!(lhs.len(), rhs.len());
-        let mut n = lhs.len();
-        let mut a = lhs.as_ptr();
-        let mut b = rhs.as_ptr();
-        let mut sum = [vdupq_n_f32(0.0); 16];
-        // Only the difference is rounded to f16 (relative error <= 2^-11; a
-        // subnormal difference is exact, so a nonzero difference never becomes
-        // zero). FMLAL multiplies the f16 lanes exactly (22 significant bits
-        // fit in f32) and adds the product to an f32 accumulator with one
-        // rounding. Each squared term therefore has relative error at most
-        // (1 + 2^-11)^2 - 1 = 2^-10 + 2^-22, plus ordinary f32 summation error.
-        // This assumes the default FPCR (round to nearest, FZ16 = 0). The
-        // bound is relative to the true distance, so it is not an error budget
-        // that RaBitQ lower bounds account for: callers must not feed this
-        // value into bounds the reranker trusts.
-        while n >= 64 {
-            for i in 0..8 {
-                let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
-                let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
-                let d = vsubq_f16(x, y);
-                sum[2 * i] = vfmlalq_low_f16(sum[2 * i], d, d);
-                sum[2 * i + 1] = vfmlalq_high_f16(sum[2 * i + 1], d, d);
-            }
-            (n, a, b) = unsafe { (n - 64, a.add(64), b.add(64)) };
-        }
-        while n >= 8 {
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
+        let result = crate::reduce::a2::sum_f16::<8, 2>([lhs, rhs], |s, [x, y]| {
             let d = vsubq_f16(x, y);
-            sum[0] = vfmlalq_low_f16(sum[0], d, d);
-            sum[1] = vfmlalq_high_f16(sum[1], d, d);
-            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
-        }
-        if n > 0 {
-            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
-            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(_a.as_ptr().cast()) });
-            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(_b.as_ptr().cast()) });
-            let d = vsubq_f16(x, y);
-            sum[2] = vfmlalq_low_f16(sum[2], d, d);
-            sum[3] = vfmlalq_high_f16(sum[3], d, d);
-        }
-        let result = super::aarch64::reduce_add(sum);
+            [vfmlalq_low_f16(s[0], d, d), vfmlalq_high_f16(s[1], d, d)]
+        });
         if result.is_finite() {
             result
         } else {
@@ -1162,172 +529,25 @@ mod reduce_sum_of_d2_approx {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn bounded_error_and_overflow_fallback() {
-        use super::test_util::{integers, lengths, random};
-        use crate::F16;
-        for n in lengths().chain([1536, 16000]) {
-            for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3), (-60000.0, 60000.0)] {
-                let (x, y) = (random(n, lo, hi), random(n, lo, hi));
-                let exact = f16::reduce_sum_of_d2(&x, &y);
-                let approx = reduce_sum_of_d2_approx(&x, &y);
-                assert!(approx.is_finite());
-                assert!((approx - exact).abs() <= 0.0011 * exact + 1e-12);
-                assert_eq!(reduce_sum_of_d2_approx(&x, &x), 0.0);
-            }
-            // Pixel differences are exact in f16, but their squares/sums
-            // would overflow an f16 accumulator.
-            let (x, y) = (integers(n, 0, 255), integers(n, 0, 255));
-            let exact = f16::reduce_sum_of_d2(&x, &y);
-            let approx = reduce_sum_of_d2_approx(&x, &y);
-            assert!((approx - exact).abs() <= 1e-5 * exact);
-            let x = vec![f16::_from_f32(65504.0); n];
-            let y = vec![f16::_from_f32(-65504.0); n];
-            assert_eq!(
-                reduce_sum_of_d2_approx(&x, &y),
-                f16::reduce_sum_of_d2(&x, &y)
-            );
-        }
-        let x = [f16::from_bits(1), f16::from_bits(2), f16::from_bits(3)];
-        let zero = [f16::_ZERO; 3];
-        assert_eq!(
-            reduce_sum_of_d2_approx(&x, &zero),
-            f16::reduce_sum_of_d2(&x, &zero)
-        );
-    }
-
-    /// Scalar model of the FHM kernel: the same lanes, accumulators and
-    /// reduction order, with the difference rounded once to f16 and each exact
-    /// square added to an f32 lane with one rounding. `None` if a difference
-    /// overflows f16, where the kernel retries the exact path.
-    #[cfg(test)]
-    fn model(x: &[f16], y: &[f16]) -> Option<f32> {
-        let mut acc = [[0.0f32; 4]; 16];
-        let mut add = |k: usize, lanes: &[f16]| -> Option<()> {
-            for (j, (a, b)) in lanes.chunks(2).map(|p| (p[0], p[1])).enumerate() {
-                // f16 differences are exact in f64; round once to f16.
-                let d = f16::from_f64(a.to_f64() - b.to_f64());
-                if !d.is_finite() {
-                    return None;
-                }
-                let d = d.to_f32();
-                acc[k + j / 4][j % 4] += d * d; // `d * d` is exact in f32
-            }
-            Some(())
-        };
-        let pairs: Vec<f16> = x.iter().zip(y).flat_map(|(&a, &b)| [a, b]).collect();
-        let (mut off, mut n) = (0, x.len());
-        while n >= 64 {
-            for i in 0..8 {
-                add(2 * i, &pairs[2 * (off + 8 * i)..2 * (off + 8 * i + 8)])?;
-            }
-            (off, n) = (off + 64, n - 64);
-        }
-        while n >= 8 {
-            add(0, &pairs[2 * off..2 * (off + 8)])?;
-            (off, n) = (off + 8, n - 8);
-        }
-        if n > 0 {
-            let mut tail = pairs[2 * off..].to_vec();
-            tail.resize(16, f16::ZERO);
-            add(2, &tail)?;
-        }
-        let mut m = 16;
-        while m > 1 {
-            let h = m / 2;
-            for i in 0..h {
-                for l in 0..4 {
-                    acc[i][l] += acc[m - h + i][l];
-                }
-            }
-            m -= h;
-        }
-        Some((acc[0][0] + acc[0][1]) + (acc[0][2] + acc[0][3]))
-    }
-
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn matches_model_and_rigorous_bound() {
-        use rand::{Rng, RngExt, SeedableRng};
-        #[cfg(target_arch = "aarch64")]
-        let fast = is_fast_path_detected();
-        #[cfg(not(target_arch = "aarch64"))]
-        let fast = false;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(20261105);
-        let finite = |rng: &mut rand::rngs::StdRng| loop {
-            let v = f16::from_bits(rng.next_u32() as u16);
-            if v.is_finite() {
-                break v;
-            }
-        };
-        let dims = [1, 7, 8, 31, 32, 64, 768, 784, 1536, 4095, 16000, 65535];
-        for n in dims {
-            let gamma = |steps: f64| {
-                let nu = steps * 2f64.powi(-24);
-                nu / (1.0 - nu)
-            };
-            // FHM has 64 accumulators; the portable exact path may sum all
-            // n terms sequentially, with rounding in subtraction and square.
-            let fhm_gamma = gamma(n as f64 / 64.0 + 16.0);
-            let exact_gamma = gamma(n as f64 + 2.0);
-            let unit = 2f64.powi(-11);
-            let bound = (1.0 + unit).powi(2) * (1.0 + fhm_gamma) - 1.0;
-            for case in 0..8 {
-                let (x, y): (Vec<f16>, Vec<f16>) = (0..n)
-                    .map(|_| match case {
-                        0 => (
-                            f16::from_f32(rng.random_range(0..=255) as f32),
-                            f16::from_f32(rng.random_range(0..=255) as f32),
-                        ),
-                        1 => (
-                            f16::from_f32(rng.random_range(-1.0..=1.0)),
-                            f16::from_f32(rng.random_range(-1.0..=1.0)),
-                        ),
-                        2 => (
-                            f16::from_bits(rng.random_range(0..1024)),
-                            f16::from_bits(rng.random_range(0..1024) | 0x8000),
-                        ),
-                        3 => {
-                            let a = rng.random_range(1..0x7bff_u16);
-                            (f16::from_bits(a), f16::from_bits(a + 1))
-                        }
-                        4 => (finite(&mut rng), finite(&mut rng)),
-                        5 => (f16::MAX, f16::MIN),
-                        6 => {
-                            let a = f16::from_f32(rng.random_range(-1.0..=1.0));
-                            (a, a)
-                        }
-                        _ => (
-                            f16::from_f32(rng.random_range(-60000.0..=60000.0)),
-                            f16::from_f32(rng.random_range(-1e-3..=1e-3)),
-                        ),
-                    })
-                    .unzip();
-                let reference: f64 = std::iter::zip(&x, &y)
+        use crate::test_util::{lengths, random};
+        let gamma = |k: f64| k * 2f64.powi(-24) / (1.0 - k * 2f64.powi(-24));
+        for n in lengths() {
+            let bound = (1.0 + 2f64.powi(-11)).powi(2) * (1.0 + gamma(n as f64 + 2.0)) - 1.0;
+            let adjacent = (1..=n as u16)
+                .map(|a| (f16::from_bits(a), f16::from_bits(a + 1)))
+                .unzip();
+            for (x, y) in [
+                (random(n, -1.0, 1.0), random(n, -1.0, 1.0)),
+                (random(n, -60000.0, 60000.0), random(n, -1e-3, 1e-3)),
+                adjacent,
+                (vec![f16::MAX; n], vec![f16::MIN; n]),
+            ] {
+                let exact: f64 = std::iter::zip(&x, &y)
                     .map(|(a, b)| (a.to_f64() - b.to_f64()).powi(2))
                     .sum();
-                let exact = f16::reduce_sum_of_d2(&x, &y);
-                let approx = reduce_sum_of_d2_approx(&x, &y);
-                let label = format!("n = {n}, case = {case}");
-                assert!(exact.is_finite() && approx.is_finite(), "{label}");
-                assert_eq!(reduce_sum_of_d2_approx(&x, &x), 0.0, "{label}");
-                assert_eq!(reduce_sum_of_d2_approx(&y, &y), 0.0, "{label}");
-                if reference == 0.0 {
-                    assert_eq!(approx, 0.0, "{label}");
-                    continue;
-                }
-                assert!(approx > 0.0, "{label}: nonzero distance collapsed");
-                let error = (exact as f64 - reference).abs() / reference;
-                assert!(
-                    error <= exact_gamma,
-                    "{label}: exact {error} > {exact_gamma}"
-                );
-                let modeled = model(&x, &y);
-                if let Some(m) = modeled {
-                    let error = (m as f64 - reference).abs() / reference;
-                    assert!(error <= bound, "{label}: model {error} > {bound}");
-                }
-                match (fast, modeled) {
-                    (true, Some(m)) => assert_eq!(approx.to_bits(), m.to_bits(), "{label}"),
-                    (true, None) | (false, _) => assert_eq!(approx, exact, "{label}"),
+                for (name, f) in implementations() {
+                    let error = (f(&x, &y) as f64 - exact).abs();
+                    assert!(error <= bound * exact, "{name}: n = {n}");
                 }
             }
         }

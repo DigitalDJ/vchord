@@ -6,34 +6,27 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-#[allow(unused_macros)]
-macro_rules! partial_load {
-    (@internal_0) => {
-        ::core::mem::zeroed()
-    };
-    (@internal_0 $x:expr) => {
-        $x
-    };
-    ($N:literal, $n:ident, $($p:ident $(= $x:expr)?),+) => {
-        (
-            $(
-                {
-                    ::core::hint::assert_unchecked($n < $N);
-                    let mut result = [$crate::emulate::partial_load!(@internal_0 $($x)?); $N];
-                    // LLVM loves `memcpy`, which is much slower.
-                    // So we use an explicit loop here.
-                    for i in 0..$n {
-                        result[i] = $p.add(i).read();
-                    }
-                    result
-                },
-            )+
-        )
-    };
+/// `len < N` elements from `p`, then `fill`.
+#[inline(always)]
+pub unsafe fn partial<T: Copy, const N: usize>(p: *const T, len: usize, fill: T) -> [T; N] {
+    unsafe { core::hint::assert_unchecked(len < N) };
+    // Element by element for short arrays, where a copy loop becomes a `memcpy` call, and in a
+    // loop for wider ones, where unrolling every element costs more.
+    if N <= 8 {
+        return core::array::from_fn(|i| {
+            if i < len {
+                unsafe { p.add(i).read() }
+            } else {
+                fill
+            }
+        });
+    }
+    let mut r = [fill; N];
+    for (i, r) in r.iter_mut().enumerate().take(len) {
+        *r = unsafe { p.add(i).read() };
+    }
+    r
 }
-
-#[allow(unused_imports)]
-pub(crate) use partial_load;
 
 // VP2INTERSECT emulation.
 // Díez-Cañas, G. (2021). Faster-Than-Native Alternatives for x86 VP2INTERSECT
@@ -139,16 +132,9 @@ pub fn emulate_mm_reduce_add_epi32(mut x: core::arch::x86_64::__m128i) -> i32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 pub fn emulate_mm256_reduce_min_ps(x: core::arch::x86_64::__m256) -> f32 {
-    use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
-    let lo = _mm256_castps256_ps128(x);
-    let hi = _mm256_extractf128_ps(x, 1);
-    let min = _mm_min_ps(lo, hi);
-    let mut x = Aligned16([0.0f32; 4]);
-    unsafe {
-        _mm_store_ps(x.0.as_mut_ptr(), min);
-    }
-    f32::min(f32::min(x.0[0], x.0[1]), f32::min(x.0[2], x.0[3]))
+    let (lo, hi) = (_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    emulate_mm_reduce_min_ps(_mm_min_ps(lo, hi))
 }
 
 #[inline]
@@ -169,16 +155,9 @@ pub fn emulate_mm_reduce_min_ps(x: core::arch::x86_64::__m128) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 pub fn emulate_mm256_reduce_max_ps(x: core::arch::x86_64::__m256) -> f32 {
-    use crate::aligned::Aligned16;
     use core::arch::x86_64::*;
-    let lo = _mm256_castps256_ps128(x);
-    let hi = _mm256_extractf128_ps(x, 1);
-    let max = _mm_max_ps(lo, hi);
-    let mut x = Aligned16([0.0f32; 4]);
-    unsafe {
-        _mm_store_ps(x.0.as_mut_ptr(), max);
-    }
-    f32::max(f32::max(x.0[0], x.0[1]), f32::max(x.0[2], x.0[3]))
+    let (lo, hi) = (_mm256_castps256_ps128(x), _mm256_extractf128_ps(x, 1));
+    emulate_mm_reduce_max_ps(_mm_max_ps(lo, hi))
 }
 
 #[inline]

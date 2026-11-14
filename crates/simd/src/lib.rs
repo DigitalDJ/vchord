@@ -21,6 +21,7 @@
 
 mod aligned;
 mod emulate;
+mod reduce;
 
 #[cfg(not(feature = "internal"))]
 mod floating_f16;
@@ -33,6 +34,93 @@ mod floating_f32;
 
 #[cfg(feature = "internal")]
 pub mod floating_f32;
+
+#[cfg(test)]
+mod test_util {
+    use crate::Floating;
+    use rand::RngExt;
+
+    /// Lengths covering every tail and unroll boundary, then common widths.
+    pub(crate) fn lengths() -> impl Iterator<Item = usize> {
+        (0..=300).chain([
+            511, 512, 513, 767, 768, 769, 783, 784, 785, 1023, 1024, 1025, 1535, 1536, 1537, 4095,
+            4096, 4097,
+        ])
+    }
+
+    pub(crate) fn random<S: Floating>(n: usize, lo: f32, hi: f32) -> Vec<S> {
+        let mut rng = rand::rng();
+        S::vector_from_f32(
+            &(0..n)
+                .map(|_| rng.random_range(lo..=hi))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Non-zero integers in `[lo, hi]`; small ones sum exactly in any order, so a lost one shows.
+    pub(crate) fn integers<S: Floating>(n: usize, lo: i32, hi: i32) -> Vec<S> {
+        let mut rng = rand::rng();
+        S::vector_from_f32(
+            &(0..n)
+                .map(|_| match rng.random_range(lo..hi) {
+                    v if v >= 0 => v + 1,
+                    v => v,
+                } as f32)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Checks every implementation against the f64 sum of `term` over non-zero integers.
+    #[track_caller]
+    pub(crate) fn check_unary<S: Floating>(
+        implementations: Vec<(&str, fn(&[S]) -> f32)>,
+        term: impl Fn(f64) -> f64,
+    ) {
+        for n in lengths() {
+            for hi in [8, 65504] {
+                let x = integers::<S>(n, -hi, hi);
+                let terms = S::vector_to_f32(&x).into_iter().map(|x| term(x as f64));
+                for (name, f) in &implementations {
+                    assert_sum(name, n, f(&x), terms.clone());
+                }
+            }
+        }
+    }
+
+    /// Checks every implementation against the f64 sum of `term` over non-zero integers.
+    #[track_caller]
+    pub(crate) fn check_binary<S: Floating>(
+        implementations: Vec<(&str, fn(&[S], &[S]) -> f32)>,
+        term: impl Fn(f64, f64) -> f64,
+    ) {
+        for n in lengths() {
+            for hi in [8, 65504] {
+                let (x, y) = (integers::<S>(n, -hi, hi), integers::<S>(n, -hi, hi));
+                let terms = std::iter::zip(S::vector_to_f32(&x), S::vector_to_f32(&y))
+                    .map(|(x, y)| term(x as f64, y as f64));
+                for (name, f) in &implementations {
+                    assert_sum(name, n, f(&x, &y), terms.clone());
+                }
+            }
+        }
+    }
+
+    /// Asserts `got` is the sum of the integer `terms`: exactly below 2^24, where every partial sum
+    /// is exact, else within the worst-case f32 summation error (f16 accumulation exceeds it).
+    #[track_caller]
+    fn assert_sum(name: &str, n: usize, got: f32, terms: impl Iterator<Item = f64> + Clone) {
+        let (sum, sum_of_abs) = (terms.clone().sum::<f64>(), terms.map(f64::abs).sum::<f64>());
+        let tolerance = if sum_of_abs < 2f64.powi(24) {
+            0.0
+        } else {
+            (n + 1) as f64 * 2f64.powi(-24) * sum_of_abs
+        };
+        assert!(
+            ((got as f64) - sum).abs() <= tolerance,
+            "{name}: n = {n}, got = {got}, expected = {sum}, tolerance = {tolerance}"
+        );
+    }
+}
 
 pub mod bit;
 pub mod byte;

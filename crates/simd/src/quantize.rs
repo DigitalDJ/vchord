@@ -71,7 +71,7 @@ mod mul_add_round {
     #[crate::target_cpu(enable = "v3")]
     fn mul_add_round_v3(this: &[f32], k: f32, b: f32) -> Vec<u8> {
         let mut r = Vec::<u8>::with_capacity(this.len().next_multiple_of(8));
-        use crate::emulate::partial_load;
+        use crate::emulate::partial;
         use core::arch::x86_64::*;
         let cons = _mm256_setr_epi8(
             0, 4, 8, 12, -1, -1, -1, -1, // 0..8
@@ -96,8 +96,8 @@ mod mul_add_round {
             (n, a, p) = unsafe { (n - 8, a.add(8), p.add(8)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(8, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 8>(a, n, 0.0) };
+            a = _a.as_ptr();
             let x = unsafe { _mm256_loadu_ps(a) };
             let v = _mm256_fmadd_ps(x, lk, lb);
             let v = _mm256_cvtps_epi32(_mm256_round_ps(v, 0x00));
@@ -144,7 +144,7 @@ mod mul_add_round {
     #[target_feature(enable = "fma")]
     fn mul_add_round_v2_fma(this: &[f32], k: f32, b: f32) -> Vec<u8> {
         let mut r = Vec::<u8>::with_capacity(this.len().next_multiple_of(4));
-        use crate::emulate::partial_load;
+        use crate::emulate::partial;
         use core::arch::x86_64::*;
         let cons = _mm_setr_epi8(
             0, 4, 8, 12, -1, -1, -1, -1, // 0..8
@@ -165,8 +165,8 @@ mod mul_add_round {
             (n, a, p) = unsafe { (n - 4, a.add(4), p.add(4)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(4, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 4>(a, n, 0.0) };
+            a = _a.as_ptr();
             let x = unsafe { _mm_loadu_ps(a) };
             let v = _mm_fmadd_ps(x, lk, lb);
             let v = _mm_cvtps_epi32(_mm_round_ps(v, 0x00));
@@ -210,7 +210,7 @@ mod mul_add_round {
     #[crate::target_cpu(enable = "a2")]
     fn mul_add_round_a2(this: &[f32], k: f32, b: f32) -> Vec<u8> {
         let mut r = Vec::<u8>::with_capacity(this.len().next_multiple_of(4));
-        use crate::emulate::partial_load;
+        use crate::emulate::partial;
         use core::arch::aarch64::*;
         #[cfg(target_endian = "little")]
         const CONS: [u8; 16] = [
@@ -238,8 +238,8 @@ mod mul_add_round {
             (n, a, p) = unsafe { (n - 4, a.add(4), p.add(4)) };
         }
         if n > 0 {
-            let (_a,) = unsafe { partial_load!(4, n, a) };
-            (a,) = (_a.as_ptr(),);
+            let _a = unsafe { partial::<_, 4>(a, n, 0.0) };
+            a = _a.as_ptr();
             let x = unsafe { vld1q_f32(a) };
             let v = vfmaq_f32(lb, x, lk);
             let v = vcvtnq_u32_f32(v);
