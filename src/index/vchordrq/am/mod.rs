@@ -726,6 +726,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
                 filter,
+                max_probes: gucs::vchordrq_max_probes(),
             },
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),

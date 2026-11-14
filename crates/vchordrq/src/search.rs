@@ -26,7 +26,7 @@ use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::BlockLut;
 use std::borrow::Borrow;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::marker::PhantomData;
 use std::num::NonZero;
 use std::rc::Rc;
@@ -56,11 +56,15 @@ pub type MaxsimCandidate<'b> = (
     AlwaysEqual<PackedRefMut8<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
 );
 
+type Refill<'b> = Box<dyn FnMut() -> Option<Vec<Candidate<'b>>> + 'b>;
+
 #[derive(Debug)]
 pub struct SearchParams {
     pub probes: Vec<u32>,
     pub epsilon: f32,
     pub filter: Option<KeyFilter>,
+    /// The most lists a search with a filter reads ([`default_search`]).
+    pub max_probes: Option<u32>,
 }
 
 struct Searcher<'b, R, O, V, B, H1, H0> {
@@ -83,6 +87,7 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
 
 struct Route<'b, I> {
     lists: Vec<List<'b>>,
+    complete: bool,
     /// The other lists of the bottom level, nearest first, if `sorted`.
     rest: I,
 }
@@ -240,10 +245,12 @@ where
         let levels = probes.len();
         let mut lists = vec![root];
         let mut rest = None;
+        let mut complete = true;
         for (i, (&probes, &cells)) in
             std::iter::zip(probes, cells[..levels].iter().rev()).enumerate()
         {
             let partial_scan = probes < cells;
+            complete &= !partial_scan;
             if partial_scan || is_residual || (sorted && i + 1 == levels) {
                 lists = rest.insert(step(lists)).take(probes as _).collect();
             } else {
@@ -268,6 +275,7 @@ where
         }
         Route {
             lists,
+            complete,
             rest: rest.into_iter().flatten(),
         }
     }
@@ -393,18 +401,38 @@ where
     }
 }
 
+/// With a filter, an empty heap reads further lists, whose rows can be nearer than those returned.
 pub struct Candidates<'b> {
     heap: Heap<Candidate<'b>>,
+    bound: Option<Distance>,
+    refill: Option<Refill<'b>>,
 }
 
 impl<'b> Candidates<'b> {
-    fn new(mut results: Vec<Candidate<'b>>, bound: Option<Distance>) -> Self {
-        if let Some(bound) = bound {
+    fn new(
+        results: Vec<Candidate<'b>>,
+        bound: Option<Distance>,
+        refill: Option<Refill<'b>>,
+    ) -> Self {
+        let mut this = Self {
+            heap: Heap::new(),
+            bound,
+            refill,
+        };
+        this.take(results);
+        this
+    }
+
+    /// Drops the candidates past the bound; once one is, the lists read reach past it.
+    fn take(&mut self, mut results: Vec<Candidate<'b>>) {
+        if let Some(bound) = self.bound {
+            let n = results.len();
             results.retain(|((Reverse(lowerbound), _), _)| *lowerbound < bound);
+            if results.len() < n {
+                self.refill = None;
+            }
         }
-        Self {
-            heap: Heap::from(results),
-        }
+        self.heap = Heap::from(results);
     }
 }
 
@@ -425,17 +453,29 @@ impl<'b> Sequence for Candidates<'b> {
     fn into_inner(self) -> Self::Inner {
         self.heap.into_vec().into_iter()
     }
+
+    fn refill(&mut self) -> bool {
+        while self.heap.is_empty()
+            && let Some(refill) = self.refill.as_mut()
+        {
+            match refill() {
+                Some(results) => self.take(results),
+                None => self.refill = None,
+            }
+        }
+        !self.heap.is_empty()
+    }
 }
 
-/// Drops candidates whose lower bound reaches `bound`; a larger `epsilon` misses fewer rows.
+/// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: Rc<O::Vector>,
     bound: Option<Distance>,
     params: SearchParams,
     bump: &'b impl Bump,
-    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R> + 'b,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R> + 'b,
 ) -> Candidates<'b>
 where
     R::Page: Page<Opaque = Opaque>,
@@ -448,12 +488,49 @@ where
         prefetch_h1_vectors,
         prefetch_h0_tuples,
     );
-    let Route { lists, .. } = searcher.route(&params.probes, false);
-    let results = match &params.filter {
-        None => searcher.read(lists, ()),
-        Some(filter) => searcher.read(lists, filter),
+    let SearchParams {
+        mut probes,
+        filter,
+        max_probes,
+        ..
+    } = params;
+    let Route {
+        lists,
+        mut complete,
+        rest,
+    } = searcher.route(&probes, false);
+    let Some(filter) = filter else {
+        return Candidates::new(searcher.read(lists, ()), bound, None);
     };
-    Candidates::new(results, bound)
+    let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
+    let results = searcher.read(lists, &filter);
+    let max_probes = max_probes.map_or(usize::MAX, |x| x as usize);
+    // Below a root alone, routing's ranking of every list gives each round its further lists.
+    let mut rest = (probes.len() == 1).then_some(rest);
+    let refill = move || {
+        while !complete && read.len() < max_probes {
+            for x in probes.iter_mut() {
+                *x = x.saturating_mul(2).max(1);
+            }
+            let mut lists = if let Some(rest) = rest.as_mut() {
+                complete = probes[0] >= searcher.cells[0];
+                rest.take(probes[0] as usize - read.len()).collect()
+            } else {
+                let route = searcher.route(&probes, false);
+                complete = route.complete;
+                let mut lists = route.lists;
+                lists.retain(|list| !read.contains(&list.2.0));
+                lists
+            };
+            lists.truncate(max_probes - read.len());
+            read.extend(lists.iter().map(|list| list.2.0));
+            if !lists.is_empty() {
+                return Some(searcher.read(lists, &filter));
+            }
+        }
+        None
+    };
+    Candidates::new(results, bound, Some(Box::new(refill)))
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(

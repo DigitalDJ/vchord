@@ -61,6 +61,10 @@ where
                 .prefetcher
                 .next_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
             else {
+                // With the cache empty, every candidate was returned: the prefetcher may read more.
+                if self.cache.is_empty() && self.prefetcher.refill() {
+                    continue;
+                }
                 break;
             };
             let &mut (payload, head, ..) = w.get_mut();
