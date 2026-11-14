@@ -387,6 +387,40 @@ fn column_matches(c: &mut Criterion) {
     column_bench(c, "u128", rand::random::<[u64; 2]>);
 }
 
+fn column_meets(c: &mut Criterion) {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let ranges = std::array::from_fn::<u32, 32, _>(|_| {
+        let min = rng.random::<u16>();
+        min as u32 | (min.saturating_add(rng.random::<u8>() as u16) as u32) << 16
+    });
+    let keys = (0..32).map(|_| rng.random::<u16>()).collect::<Vec<_>>();
+    for n in [1, 4, 16, 32] {
+        let keys = &keys[..n];
+        #[cfg(target_arch = "x86_64")]
+        if simd::is_cpu_detected!("v4") {
+            c.bench_function(&format!("column::meets::v4/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::meets::meets_v4(&ranges, keys) })
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if simd::is_cpu_detected!("v3") {
+            c.bench_function(&format!("column::meets::v3/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::meets::meets_v3(&ranges, keys) })
+            });
+        }
+        #[cfg(target_arch = "aarch64")]
+        if simd::is_cpu_detected!("a2") {
+            c.bench_function(&format!("column::meets::a2/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::meets::meets_a2(&ranges, keys) })
+            });
+        }
+        c.bench_function(&format!("column::meets/{n}"), |b| {
+            b.iter(|| simd::column::meets(&ranges, keys))
+        });
+    }
+}
+
 criterion_group!(
     benches,
     floating_f32_reduce_sum_of_xy,
@@ -398,5 +432,6 @@ criterion_group!(
     byte_reduce_sum_of_x,
     halfbyte_reduce_sum_of_xy,
     column_matches,
+    column_meets,
 );
 criterion_main!(benches);
