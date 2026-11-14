@@ -116,7 +116,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
         {
             let (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) = state;
-            let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm));
+            let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm, false));
             tape::read_h1_tape::<R, _, _>(
                 tape::by_next(index, first),
                 || O::block_access(&lut.0, residual),

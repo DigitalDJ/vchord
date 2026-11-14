@@ -96,6 +96,8 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 
 static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+static VCHORDRQ_PROJECTED_CENTERING: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
@@ -177,6 +179,14 @@ pub fn init() {
         c"`prefilter` argument of vchordrq.",
         c"`prefilter` argument of vchordrq.",
         &VCHORDRQ_PREFILTER,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.projected_centering",
+        c"`projected_centering` argument of vchordrq.",
+        c"`projected_centering` argument of vchordrq.",
+        &VCHORDRQ_PROJECTED_CENTERING,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -545,6 +555,10 @@ pub fn vchordrq_maxsim_threshold(index: pgrx::pg_sys::Relation) -> u32 {
 
 pub fn vchordrq_prefilter() -> bool {
     VCHORDRQ_PREFILTER.get()
+}
+
+pub fn vchordrq_projected_centering() -> bool {
+    VCHORDRQ_PROJECTED_CENTERING.get()
 }
 
 pub fn vchordrq_io_search() -> Io {

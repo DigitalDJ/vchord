@@ -65,6 +65,9 @@ pub struct SearchParams {
     /// How many of the nearest lists to read at each level below the root.
     pub probes: Vec<u32>,
     pub epsilon: f32,
+    /// Center residual estimates on the query's projection on each list's
+    /// centroid ([`Operator::residual`]).
+    pub projected_centering: bool,
 }
 
 /// One search of an index for a vector `V` (an `O::Vector`, owned or shared):
@@ -80,6 +83,7 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
     root: List<'b>,
     lut: (BlockLut, BinaryLut),
     epsilon: f32,
+    projected_centering: bool,
     prefetch_h1_vectors: H1,
     prefetch_h0_tuples: H0,
     _operator: PhantomData<fn() -> O>,
@@ -169,6 +173,7 @@ where
             root,
             lut,
             epsilon: params.epsilon,
+            projected_centering: params.projected_centering,
             prefetch_h1_vectors,
             prefetch_h0_tuples,
             _operator: PhantomData,
@@ -198,7 +203,9 @@ where
         let mut step = |lists: Vec<List<'b>>| {
             let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
             for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in lists {
-                let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm));
+                // Routing keeps the query centered on the centroid.
+                let residual =
+                    is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm, false));
                 tape::read_h1_tape::<R, _, _>(
                     by_next(index, first),
                     || O::block_access(&lut.0, residual),
@@ -291,6 +298,7 @@ where
             dim,
             is_residual,
             ref lut,
+            projected_centering,
             ref mut prefetch_h0_tuples,
             ..
         } = *self;
@@ -316,7 +324,10 @@ where
             dis_f
         }
         .to_f32();
-        let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm));
+        // With `projected_centering`, the query is centered on its projection
+        // on this list's centroid. Routing keeps the centroid, so the same
+        // lists are probed either way.
+        let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm, projected_centering));
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);

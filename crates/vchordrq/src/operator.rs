@@ -438,8 +438,11 @@ pub trait Operator: 'static + Debug + Copy {
     fn routing_is_exact() -> bool;
 
     /// What `block_access` and `binary_access` need of a residual list, from
-    /// its centroid's `dis_f` and `norm`.
-    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual;
+    /// its centroid's `dis_f` and `norm`. With `centering`, the query is
+    /// centered on its projection on the centroid, `lambda c`, instead of the
+    /// centroid `c`; the L2 formula cannot use it, as it would need the exact
+    /// `<r, c>`, which is not stored.
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32, centering: bool) -> Residual;
 
     fn block_access(
         lut: &BlockLut,
@@ -479,7 +482,7 @@ impl Operator for Op<VectOwned<f32>, L2S> {
         true
     }
 
-    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
+    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32, _centering: bool) -> Residual {
         Residual::l2(dis_f)
     }
 
@@ -564,8 +567,13 @@ impl Operator for Op<VectOwned<f32>, Dot> {
         true
     }
 
-    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
-        Residual::dot(lut, dis_f, norm)
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32, centering: bool) -> Residual {
+        let lambda = if centering {
+            rabitq::bit::projection(dis_f, norm)
+        } else {
+            1.0
+        };
+        Residual::dot(lut, dis_f, norm, lambda)
     }
 
     fn block_access(
@@ -649,7 +657,7 @@ impl Operator for Op<VectOwned<f16>, L2S> {
         f16::reduce_sum_of_d2_approx_is_exact()
     }
 
-    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
+    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32, _centering: bool) -> Residual {
         Residual::l2(dis_f)
     }
 
@@ -735,8 +743,13 @@ impl Operator for Op<VectOwned<f16>, Dot> {
         true
     }
 
-    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
-        Residual::dot(lut, dis_f, norm)
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32, centering: bool) -> Residual {
+        let lambda = if centering {
+            rabitq::bit::projection(dis_f, norm)
+        } else {
+            1.0
+        };
+        Residual::dot(lut, dis_f, norm, lambda)
     }
 
     fn block_access(
@@ -821,7 +834,7 @@ impl Operator for Op<Rabitq8Owned, L2S> {
         true
     }
 
-    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+    fn residual(_: &BlockLut, _: f32, _: f32, _: bool) -> Residual {
         unreachable!("residual quantization is not supported for rabitq8")
     }
 
@@ -878,7 +891,7 @@ impl Operator for Op<Rabitq8Owned, Dot> {
         true
     }
 
-    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+    fn residual(_: &BlockLut, _: f32, _: f32, _: bool) -> Residual {
         unreachable!("residual quantization is not supported for rabitq8")
     }
 
@@ -935,7 +948,7 @@ impl Operator for Op<Rabitq4Owned, L2S> {
         true
     }
 
-    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+    fn residual(_: &BlockLut, _: f32, _: f32, _: bool) -> Residual {
         unreachable!("residual quantization is not supported for rabitq4")
     }
 
@@ -992,7 +1005,7 @@ impl Operator for Op<Rabitq4Owned, Dot> {
         true
     }
 
-    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+    fn residual(_: &BlockLut, _: f32, _: f32, _: bool) -> Residual {
         unreachable!("residual quantization is not supported for rabitq4")
     }
 
@@ -1127,6 +1140,160 @@ mod tests {
             assert_finite(<Rabitq8Owned as Vector>::code(v8.as_borrowed()).0, what);
             let v4 = rabitq4(&x);
             assert_finite(<Rabitq4Owned as Vector>::code(v4.as_borrowed()).0, what);
+        }
+    }
+
+    fn gaussian(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        let mut uniform = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f64 + 0.5) / (1u64 << 24) as f64
+        };
+        move || {
+            let (u, v) = (uniform(), uniform());
+            ((-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()) as f32
+        }
+    }
+
+    fn normalized(x: Vec<f32>) -> Vec<f32> {
+        let norm = f32::reduce_sum_of_x2(&x).sqrt();
+        x.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// Error statistics of `(rough, err)` against exact values.
+    #[derive(Debug, Default)]
+    struct Errors {
+        n: u32,
+        sum_of_e_2: f64,
+        failures: u32,
+    }
+
+    impl Errors {
+        fn push(&mut self, exact: f32, (rough, err): (f32, f32)) {
+            self.n += 1;
+            self.sum_of_e_2 += ((rough - exact) as f64).powi(2);
+            self.failures += u32::from(rough - 1.9 * err > exact);
+        }
+        fn rms(&self) -> f64 {
+            (self.sum_of_e_2 / self.n as f64).sqrt()
+        }
+        fn failure_rate(&self) -> f64 {
+            self.failures as f64 / self.n as f64
+        }
+    }
+
+    /// The residual dot product estimates of the block (frozen) and binary
+    /// (appendable) paths, with the query centered on the centroid and on its
+    /// projection on the centroid, against exact distances. The rows are unit
+    /// vectors around a spherical centroid in a cone, as from CLIP; residuals
+    /// are isotropic or skewed (decaying variances, rotated like the index
+    /// does). "Same" queries are drawn like the rows; "cross" queries are
+    /// nearly orthogonal to the cone, as text queries against images are.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn projected_centering() {
+        use super::{Op, Operator};
+        use index_accessor::{Accessor1, Dot};
+        use vector::vect::{VectBorrowed, VectOwned};
+        type O = Op<VectOwned<f32>, Dot>;
+        let d = 256;
+        let mut rng = gaussian(7);
+        let axis = normalized((0..d).map(|_| rng()).collect());
+        let direction = {
+            let u = normalized((0..d).map(|_| rng()).collect());
+            normalized((0..d).map(|i| 0.8 * axis[i] + 0.6 * u[i]).collect())
+        };
+        for skewed in [false, true] {
+            let scale = |i: usize| {
+                if skewed {
+                    (-(i as f32) / 16.0).exp()
+                } else {
+                    1.0
+                }
+            };
+            let mut sample = || {
+                let g = normalized((0..d).map(|i| scale(i) * rng()).collect());
+                let g = if skewed {
+                    rabitq::rotate::rotate(&g)
+                } else {
+                    g
+                };
+                normalized((0..d).map(|i| direction[i] + 0.9 * g[i]).collect())
+            };
+            let rows = (0..512).map(|_| sample()).collect::<Vec<_>>();
+            let same = (0..32).map(|_| sample()).collect::<Vec<_>>();
+            let c = normalized((0..d).map(|i| rows.iter().map(|x| x[i]).sum()).collect());
+            let cross = (0..32)
+                .map(|_| normalized((0..d).map(|i| 0.25 * axis[i] + rng() / 16.0).collect()))
+                .collect::<Vec<_>>();
+            let norm = f32::reduce_sum_of_x2(&c).sqrt();
+            let codes = rows
+                .iter()
+                .map(|x| O::build(VectBorrowed::new(x), Some(VectOwned::new(c.clone()))))
+                .collect::<Vec<_>>();
+            let blocks = codes
+                .chunks(32)
+                .map(|chunk| {
+                    let u4 = chunk
+                        .iter()
+                        .map(|((_, signs), _)| rabitq::packing::pack_to_u4(signs))
+                        .collect::<Vec<_>>();
+                    let elements = rabitq::packing::pack(std::array::from_fn(|i| &u4[i][..]));
+                    let metadata: [[f32; 32]; 4] = std::array::from_fn(|k| {
+                        std::array::from_fn(|i| chunk[i].0.0.into_array()[k])
+                    });
+                    let delta: [f32; 32] = std::array::from_fn(|i| chunk[i].1);
+                    (elements, metadata, delta)
+                })
+                .collect::<Vec<_>>();
+            for (queries, what) in [(&same, "same"), (&cross, "cross")] {
+                let mut errors: [[Errors; 2]; 2] = Default::default();
+                for q in queries {
+                    let lut = <VectOwned<f32> as Vector>::preprocess(VectBorrowed::new(q));
+                    let dis_f = -f32::reduce_sum_of_xy(q, &c);
+                    for (errors, centering) in errors.iter_mut().zip([false, true]) {
+                        let residual = Some(O::residual(&lut.0, dis_f, norm, centering));
+                        let exact = |i: usize| -f32::reduce_sum_of_xy(q, &rows[i]);
+                        for (b, (elements, metadata, delta)) in blocks.iter().enumerate() {
+                            let mut access = O::block_access(&lut.0, residual);
+                            access.push(elements);
+                            for (i, value) in
+                                access.finish((metadata, delta)).into_iter().enumerate()
+                            {
+                                errors[0].push(exact(32 * b + i), value);
+                            }
+                        }
+                        let mut access = O::binary_access(&lut.1, residual);
+                        for (i, ((metadata, signs), delta)) in codes.iter().enumerate() {
+                            let elements = rabitq::bit::binary::pack_code(signs);
+                            let value = access(metadata.into_array(), &elements, *delta);
+                            errors[1].push(exact(i), value);
+                        }
+                    }
+                    // `|q - lambda c|` is smallest at the projection.
+                    let bound = |centering: bool| {
+                        let residual = Some(O::residual(&lut.0, dis_f, norm, centering));
+                        let mut access = O::binary_access(&lut.1, residual);
+                        let ((metadata, signs), delta) = &codes[0];
+                        let elements = rabitq::bit::binary::pack_code(signs);
+                        access(metadata.into_array(), &elements, *delta).1
+                    };
+                    assert!(bound(true) <= bound(false) * (1.0 + 1e-6), "{what}");
+                }
+                // The bound was conservative and fails slightly more often:
+                // 2.0% to 2.6% of rows here at the centroid, 2.7% to 3.1% at
+                // the projection. The error shrinks by about 20% for cross
+                // queries and by about 6% for same queries.
+                let [centroid, projected] = errors;
+                for (centroid, projected) in centroid.iter().zip(&projected) {
+                    assert!(projected.failure_rate() <= 0.05, "{what}: {projected:?}");
+                    let ratio = projected.rms() / centroid.rms();
+                    let limit = if what == "cross" { 0.85 } else { 1.0 };
+                    assert!(ratio <= limit, "{what}: {ratio}");
+                }
+            }
         }
     }
 }

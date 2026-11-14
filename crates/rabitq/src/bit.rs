@@ -62,6 +62,9 @@ impl CodeMetadata {
 /// equals the centroid the radicand can come out slightly negative; clamp such
 /// finite roundoff to zero instead of producing a NaN lower bound (#35). NaN
 /// and negative infinity from invalid inputs are left alone.
+///
+/// With `lambda c` as the centroid (`norm = lambda |c|`, `dis_f = -lambda <q,
+/// c>`) it is `|q - lambda c|`.
 #[inline(always)]
 fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
     let r = dis_v_2 + norm * norm + 2.0 * dis_f;
@@ -72,6 +75,17 @@ fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
     }
 }
 
+/// `<q, c> / |c|^2` from `dis_f = -<q, c>` and `norm = |c|`: the `lambda`
+/// that minimizes `|q - lambda c|`, and with it the error bound of the
+/// residual dot product estimate (`block::half_process_dot_residual`). It is
+/// 1 (the centroid) if that is not finite, as for a zero centroid, where
+/// `lambda` makes no difference.
+#[inline]
+pub fn projection(dis_f: f32, norm: f32) -> f32 {
+    let lambda = -dis_f / (norm * norm);
+    if lambda.is_finite() { lambda } else { 1.0 }
+}
+
 /// What the residual estimates of one list's rows need, computed once per
 /// list from its centroid `c`.
 #[derive(Debug, Clone, Copy)]
@@ -79,6 +93,9 @@ pub struct Residual {
     /// The centroid's term of the distance: `|q - c|^2` for L2, `-<q, c>` for
     /// a dot product.
     pub dis_f: f32,
+    /// What the stored `delta` is scaled by: the query is centered on
+    /// `lambda c` (`lambda = 1`: on the centroid `c`).
+    pub lambda: f32,
     /// The norm of the query's residual, which bounds the error.
     pub norm: f32,
 }
@@ -88,6 +105,7 @@ impl Residual {
     pub fn l2(dis_f: f32) -> Self {
         Self {
             dis_f,
+            lambda: 1.0,
             norm: dis_f.sqrt(),
         }
     }
@@ -298,6 +316,7 @@ pub mod binary {
         (rough, err)
     }
 
+    /// See `block::half_process_dot_residual`.
     #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
@@ -317,7 +336,7 @@ pub mod binary {
         delta: f32,
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
-        let rough = -e * factor_ip + residual.dis_f + delta;
+        let rough = -e * factor_ip + residual.dis_f + residual.lambda * delta;
         let err = factor_err * residual.norm;
         (rough, err)
     }
@@ -353,11 +372,13 @@ pub mod block {
     pub type BlockLut = (BlockLutMetadata, Vec<[u8; 16]>);
 
     impl super::Residual {
-        /// For a dot product, from `dis_f = -<q, c>` and `norm = |c|`.
-        pub fn dot((metadata, _): &BlockLut, dis_f: f32, norm: f32) -> Self {
+        /// For a dot product, from `dis_f = -<q, c>` and `norm = |c|`, with
+        /// the query centered on `lambda c`.
+        pub fn dot((metadata, _): &BlockLut, dis_f: f32, norm: f32, lambda: f32) -> Self {
             Self {
                 dis_f,
-                norm: super::residual_norm(metadata.dis_v_2, norm, dis_f),
+                lambda,
+                norm: super::residual_norm(metadata.dis_v_2, lambda * norm, lambda * dis_f),
             }
         }
     }
@@ -493,6 +514,16 @@ pub mod block {
         (rough, err)
     }
 
+    /// `-<x, q>` for `x = c + r`, with `dis_f = -<q, c>` and `norm = |c|`,
+    /// the query centered on `lambda c`:
+    /// `-<x, q> = -<r, q - lambda c> - lambda <r, c> + dis_f`.
+    ///
+    /// The lookup table is built from `q`, so `<r, q - lambda c>` is estimated
+    /// as `e factor_ip - lambda est<r, c>`. The stored `delta` is
+    /// `est<r, c> - <r, c>`, so the estimate is `-e factor_ip + dis_f + lambda
+    /// delta`, and its error is bounded by `factor_err |q - lambda c|`.
+    /// `lambda = 1` centers the query on the centroid. `lambda` must not
+    /// depend on the row.
     #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
@@ -507,7 +538,7 @@ pub mod block {
         delta: f32,
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
-        let rough = -e * factor_ip + residual.dis_f + delta;
+        let rough = -e * factor_ip + residual.dis_f + residual.lambda * delta;
         let err = factor_err * residual.norm;
         (rough, err)
     }
@@ -704,6 +735,58 @@ mod tests {
             let (rough, err) =
                 binary::half_process_l2s_residual(sum, metadata, lut.0, Residual::l2(dis_f), 0.0);
             assert_eq!((rough, err), (dis_f, 0.0));
+        }
+    }
+
+    /// At `lambda = 1` the estimate is the centroid-centered one, bit for bit:
+    /// `-e factor_ip + dis_f + delta` and `factor_err |q - c|`.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn dot_residual_at_lambda_one_is_centroid_centering() {
+        let mut rng = lcg(4);
+        for n in [3, 64, 785] {
+            for _ in 0..20 {
+                let r = (0..n).map(|_| rng()).collect::<Vec<_>>();
+                let q = (0..n).map(|_| rng()).collect::<Vec<_>>();
+                let (dis_f, delta, norm) = (rng(), 0.1 * rng(), 0.5 + rng().abs());
+                let (metadata, elements) = code(&r);
+                let err =
+                    metadata.factor_err * residual_norm(f32::reduce_sum_of_x2(&q), norm, dis_f);
+                let (block_lut, binary_lut) = preprocess(&q);
+                let packed = crate::packing::padding_pack([crate::packing::pack_to_u4(&elements)]);
+                let sum = block::accumulate(&packed, &block_lut.1)[0];
+                let (rough, _) = block::half_process_dot(sum, metadata, block_lut.0);
+                let residual = Residual::dot(&block_lut, dis_f, norm, 1.0);
+                let got =
+                    block::half_process_dot_residual(sum, metadata, block_lut.0, residual, delta);
+                assert_eq!(got.0.to_bits(), (rough + dis_f + delta).to_bits());
+                assert_eq!(got.1.to_bits(), err.to_bits());
+                let sum = binary::accumulate(&binary::pack_code(&elements), &binary_lut.1);
+                let (rough, _) = binary::half_process_dot(sum, metadata, binary_lut.0);
+                let got =
+                    binary::half_process_dot_residual(sum, metadata, binary_lut.0, residual, delta);
+                assert_eq!(got.0.to_bits(), (rough + dis_f + delta).to_bits());
+                assert_eq!(got.1.to_bits(), err.to_bits());
+            }
+        }
+    }
+
+    /// `lambda = <q, c> / |c|^2` minimizes `|q - lambda c|`, so the error
+    /// bound never grows.
+    #[test]
+    fn projection_minimizes_residual_norm() {
+        assert_eq!(projection(-0.2, 0.5), 0.8);
+        // A zero centroid has no direction to project on.
+        assert_eq!(projection(0.0, 0.0), 1.0);
+        assert_eq!(projection(-0.3, 0.0), 1.0);
+        let mut rng = lcg(5);
+        for _ in 0..1000 {
+            let (dis_v_2, dis_f, norm) = (1.0 + rng().abs(), rng(), 0.5 + rng().abs());
+            let lambda = projection(dis_f, norm);
+            let at = |lambda: f32| residual_norm(dis_v_2, lambda * norm, lambda * dis_f);
+            for other in [1.0, 0.0, lambda - 0.01, lambda + 0.01] {
+                assert!(at(lambda) <= at(other) * (1.0 + 1e-6), "{lambda} {other}");
+            }
         }
     }
 }

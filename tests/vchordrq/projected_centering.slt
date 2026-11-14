@@ -1,0 +1,212 @@
+# With residual quantization, cosine and inner product scans center the query
+# on its projection on each probed centroid (`vchordrq.projected_centering`,
+# on by default). That changes the estimates and their bounds, not the
+# answers: with every list probed and a wide epsilon, both settings return the
+# exact neighbors, for vector and halfvec, from frozen and appendable rows.
+# The rows lie in a cone around [1, ..., 1] and the queries are nearly
+# orthogonal to it, where the projection differs most from the centroid.
+# Rows are pseudo-random (`hashint4`, the same on every PostgreSQL version).
+# Neighbors are compared as sets: two at nearly the same distance may come in
+# either order, as the index and the operators may round differently.
+
+query T
+SELECT boot_val FROM pg_settings WHERE name = 'vchordrq.projected_centering';
+----
+on
+
+statement ok
+CREATE TABLE projected_centering (id integer, v vector(32), h halfvec(32));
+
+statement ok
+INSERT INTO projected_centering
+SELECT i, a::vector, a::halfvec FROM (
+  SELECT i, ARRAY(SELECT 2 * (hashint4(32 * i + j) & 65535) / 65536.0
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(1, 2000) i
+) s;
+
+statement ok
+CREATE TABLE projected_centering_q (k integer, v vector(32), h halfvec(32));
+
+statement ok
+INSERT INTO projected_centering_q
+SELECT k, a::vector, a::halfvec FROM (
+  SELECT k, ARRAY(SELECT 2 * (hashint4(-32 * k - j) & 65535) / 65536.0 - 0.9
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(1, 20) k
+) s;
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (v vector_cosine_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (v vector_ip_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (h halfvec_cosine_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+CREATE INDEX ON projected_centering USING vchordrq (h halfvec_ip_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+# Appendable rows.
+statement ok
+INSERT INTO projected_centering
+SELECT i, a::vector, a::halfvec FROM (
+  SELECT i, ARRAY(SELECT 2 * (hashint4(32 * i + j) & 65535) / 65536.0
+    FROM generate_series(1, 32) j)::real[] AS a
+  FROM generate_series(2001, 2200) i
+) s;
+
+statement ok
+SET enable_indexscan = off;
+
+statement ok
+CREATE TABLE projected_centering_exact AS
+SELECT q.k,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <=> q.v, id LIMIT 10) n ORDER BY id) AS v_cos,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <#> q.v, id LIMIT 10) n ORDER BY id) AS v_ip,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <=> q.h, id LIMIT 10) n ORDER BY id) AS h_cos,
+  ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <#> q.h, id LIMIT 10) n ORDER BY id) AS h_ip
+FROM projected_centering_q q;
+
+statement ok
+RESET enable_indexscan;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+SET vchordrq.epsilon = 4.0;
+
+statement ok
+SET vchordrq.projected_centering = on;
+
+query TII
+SELECT c, count(*) FILTER (WHERE got = want), count(*) FROM (
+  SELECT current_setting('vchordrq.projected_centering') c, e.v_cos want,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <=> q.v LIMIT 10) n ORDER BY id) got
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.v_ip,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <#> q.v LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.h_cos,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <=> q.h LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.h_ip,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <#> q.h LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+) s GROUP BY c;
+----
+on 80 80
+
+statement ok
+SET vchordrq.projected_centering = off;
+
+query TII
+SELECT c, count(*) FILTER (WHERE got = want), count(*) FROM (
+  SELECT current_setting('vchordrq.projected_centering') c, e.v_cos want,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <=> q.v LIMIT 10) n ORDER BY id) got
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.v_ip,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.v <#> q.v LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.h_cos,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <=> q.h LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+  UNION ALL
+  SELECT current_setting('vchordrq.projected_centering'), e.h_ip,
+    ARRAY(SELECT id FROM (SELECT id FROM projected_centering t
+    ORDER BY t.h <#> q.h LIMIT 10) n ORDER BY id)
+  FROM projected_centering_q q JOIN projected_centering_exact e USING (k)
+) s GROUP BY c;
+----
+off 80 80
+
+# MaxSim: each query is identical to one document, which ranks first by far.
+statement ok
+CREATE TABLE projected_centering_m (id integer, val vector(32)[]);
+
+statement ok
+INSERT INTO projected_centering_m
+SELECT i, ARRAY(
+  SELECT ARRAY(SELECT (hashint4(1000000 + 128 * i + 32 * j + l) & 65535) / 65536.0 - 0.5
+    FROM generate_series(1, 32) l)::real[]::vector
+  FROM generate_series(1, 4) j
+) FROM generate_series(1, 500) i;
+
+statement ok
+CREATE INDEX ON projected_centering_m USING vchordrq (val vector_maxsim_ops)
+WITH (options = 'residual_quantization = true
+[build.internal]
+lists = [8]');
+
+statement ok
+SET vchordrq.projected_centering = on;
+
+query I
+SELECT count(*)
+FROM projected_centering_m q, LATERAL (
+  SELECT d.id FROM projected_centering_m d ORDER BY d.val @# q.val LIMIT 1
+) top
+WHERE q.id <= 20 AND top.id = q.id;
+----
+20
+
+statement ok
+SET vchordrq.projected_centering = off;
+
+query I
+SELECT count(*)
+FROM projected_centering_m q, LATERAL (
+  SELECT d.id FROM projected_centering_m d ORDER BY d.val @# q.val LIMIT 1
+) top
+WHERE q.id <= 20 AND top.id = q.id;
+----
+20
+
+statement ok
+RESET vchordrq.projected_centering;
+
+statement ok
+RESET vchordrq.epsilon;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE projected_centering, projected_centering_q, projected_centering_exact,
+  projected_centering_m;
