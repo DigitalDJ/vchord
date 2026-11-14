@@ -245,6 +245,7 @@ mod test_util {
     }
 }
 
+#[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_x2 {
     use crate::{F16, f16};
 
@@ -430,32 +431,6 @@ mod reduce_sum_of_x2 {
         x2
     }
 
-    #[cfg(test)]
-    #[allow(clippy::type_complexity, unused_mut)]
-    fn implementations() -> Vec<(&'static str, unsafe fn(&[f16]) -> f32)> {
-        let mut r: Vec<(&'static str, unsafe fn(&[f16]) -> f32)> = vec![
-            ("fallback", fallback),
-            ("dispatch", |x| reduce_sum_of_x2(x)),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v4") {
-            r.push(("v4", reduce_sum_of_x2_v4));
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v3") {
-            r.push(("v3", reduce_sum_of_x2_v3));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") && crate::is_feature_detected!("fhm") {
-            r.push(("a2:fhm", reduce_sum_of_x2_a2_fhm));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") {
-            r.push(("a2", reduce_sum_of_x2_a2));
-        }
-        r
-    }
-
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_x2_accuracy_test() {
@@ -472,7 +447,7 @@ mod reduce_sum_of_x2 {
             for n in lengths() {
                 let x = integers(n, lo, hi);
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x) }, exact(&x));
+                    assert_close(name, n, f(&x), exact(&x));
                 }
             }
         }
@@ -480,7 +455,7 @@ mod reduce_sum_of_x2 {
             for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3)] {
                 let x = random(n, lo, hi);
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x) }, exact(&x));
+                    assert_close(name, n, f(&x), exact(&x));
                 }
             }
         }
@@ -509,7 +484,6 @@ mod reduce_min_max_of_x {
 mod reduce_sum_of_xy {
     use crate::{F16, f16};
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -563,7 +537,6 @@ mod reduce_sum_of_xy {
         }
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -673,7 +646,6 @@ mod reduce_sum_of_xy {
         }
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -713,7 +685,6 @@ mod reduce_sum_of_xy {
         super::aarch64::reduce_add(sum)
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -769,36 +740,6 @@ mod reduce_sum_of_xy {
         sum
     }
 
-    #[cfg(test)]
-    #[allow(clippy::type_complexity, unused_mut)]
-    fn implementations() -> Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> {
-        let mut r: Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> = vec![
-            ("fallback", fallback),
-            ("dispatch", |x, y| reduce_sum_of_xy(x, y)),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v4") {
-            r.push(("v4", reduce_sum_of_xy_v4));
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v3") {
-            r.push(("v3", reduce_sum_of_xy_v3));
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        if crate::is_cpu_detected!("a3.512") {
-            r.push(("a3.512", reduce_sum_of_xy_a3_512));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") && crate::is_feature_detected!("fhm") {
-            r.push(("a2:fhm", reduce_sum_of_xy_a2_fhm));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") {
-            r.push(("a2", reduce_sum_of_xy_a2));
-        }
-        r
-    }
-
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_xy_accuracy_test() {
@@ -812,9 +753,9 @@ mod reduce_sum_of_xy {
             for n in lengths() {
                 let (x, y) = (integers(n, lo, hi), integers(n, lo, hi));
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x, &y) }, exact(&x, &y));
+                    assert_close(name, n, f(&x, &y), exact(&x, &y));
                     // A vector against itself: the norm of a large-magnitude vector.
-                    assert_close(name, n, unsafe { f(&x, &x) }, exact(&x, &x));
+                    assert_close(name, n, f(&x, &x), exact(&x, &x));
                 }
             }
         }
@@ -822,7 +763,7 @@ mod reduce_sum_of_xy {
             for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3)] {
                 let (x, y) = (random(n, lo, hi), random(n, lo, hi));
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x, &y) }, exact(&x, &y));
+                    assert_close(name, n, f(&x, &y), exact(&x, &y));
                 }
             }
         }
@@ -833,7 +774,6 @@ mod reduce_sum_of_xy {
 mod reduce_sum_of_d2 {
     use crate::{F16, f16};
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v4")]
@@ -893,7 +833,6 @@ mod reduce_sum_of_d2 {
         }
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
@@ -1006,7 +945,6 @@ mod reduce_sum_of_d2 {
         }
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -1056,7 +994,6 @@ mod reduce_sum_of_d2 {
         super::aarch64::reduce_add(sum)
     }
 
-    #[cfg_attr(feature = "internal", simd_macros::public)]
     #[inline]
     #[cfg(target_arch = "aarch64")]
     #[crate::target_cpu(enable = "a2")]
@@ -1113,36 +1050,6 @@ mod reduce_sum_of_d2 {
         sum
     }
 
-    #[cfg(test)]
-    #[allow(clippy::type_complexity, unused_mut)]
-    fn implementations() -> Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> {
-        let mut r: Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> = vec![
-            ("fallback", fallback),
-            ("dispatch", |x, y| reduce_sum_of_d2(x, y)),
-        ];
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v4") {
-            r.push(("v4", reduce_sum_of_d2_v4));
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v3") {
-            r.push(("v3", reduce_sum_of_d2_v3));
-        }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        if crate::is_cpu_detected!("a3.512") {
-            r.push(("a3.512", reduce_sum_of_d2_a3_512));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") && crate::is_feature_detected!("fhm") {
-            r.push(("a2:fhm", reduce_sum_of_d2_a2_fhm));
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") {
-            r.push(("a2", reduce_sum_of_d2_a2));
-        }
-        r
-    }
-
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_sum_of_d2_accuracy_test() {
@@ -1159,9 +1066,9 @@ mod reduce_sum_of_d2 {
                 let (x, y) = (integers(n, lo, hi), integers(n, lo, hi));
                 let zero = vec![f16::_ZERO; n];
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x, &y) }, exact(&x, &y));
-                    assert_close(name, n, unsafe { f(&x, &zero) }, exact(&x, &zero));
-                    assert_eq!(unsafe { f(&x, &x) }, 0.0, "{name}: n = {n}");
+                    assert_close(name, n, f(&x, &y), exact(&x, &y));
+                    assert_close(name, n, f(&x, &zero), exact(&x, &zero));
+                    assert_eq!(f(&x, &x), 0.0, "{name}: n = {n}");
                 }
             }
         }
@@ -1170,7 +1077,7 @@ mod reduce_sum_of_d2 {
             for (lo, hi) in [(-1.0, 1.0), (-1e-4, 1e-4)] {
                 let (x, y) = (random(n, lo, hi), random(n, lo, hi));
                 for (name, f) in implementations() {
-                    assert_close(name, n, unsafe { f(&x, &y) }, exact(&x, &y));
+                    assert_close(name, n, f(&x, &y), exact(&x, &y));
                 }
             }
         }

@@ -8,347 +8,152 @@
 
 #![allow(unsafe_code)]
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
-fn floating_f32_reduce_sum_of_xy(c: &mut Criterion) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let x = (0..4095)
-        .map(|_| rng.random_range(-1.0..=1.0f32))
-        .collect::<Vec<_>>();
-    let y = (0..4095)
-        .map(|_| rng.random_range(-1.0..=1.0f32))
-        .collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("floating_f32::reduce_sum_of_xy::v4", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_xy::reduce_sum_of_xy_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("floating_f32::reduce_sum_of_xy::v3", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_xy::reduce_sum_of_xy_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v2") && simd::is_feature_detected!("fma") {
-        c.bench_function("floating_f32::reduce_sum_of_xy::v2_fma", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f32::reduce_sum_of_xy::reduce_sum_of_xy_v2_fma(&x, &y)
-            })
-        });
-    }
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    if simd::is_cpu_detected!("a3.256") {
-        c.bench_function("floating_f32::reduce_sum_of_xy::a3_256", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f32::reduce_sum_of_xy::reduce_sum_of_xy_a3_256(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("floating_f32::reduce_sum_of_xy::a2", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_xy::reduce_sum_of_xy_a2(&x, &y) })
-        });
-    }
+use std::hint::black_box;
+
+/// Short inputs, common embedding widths and an odd length with a tail.
+const SIZES: [usize; 7] = [16, 64, 512, 768, 1024, 1536, 4095];
+
+/// Copies `x` to a cache-line boundary so timings do not depend on the allocator.
+fn cache_aligned<T: Copy + Default>(x: &[T]) -> &'static [T] {
+    let buffer = vec![T::default(); x.len() + 64].leak();
+    let offset = buffer.as_ptr().align_offset(64);
+    let r = &mut buffer[offset..offset + x.len()];
+    r.copy_from_slice(x);
+    r
 }
 
-fn floating_f32_reduce_sum_of_d2(c: &mut Criterion) {
+fn random_f32(n: usize) -> &'static [f32] {
     use rand::RngExt;
     let mut rng = rand::rng();
-    let x = (0..4095)
-        .map(|_| rng.random_range(-1.0..=1.0f32))
-        .collect::<Vec<_>>();
-    let y = (0..4095)
-        .map(|_| rng.random_range(-1.0..=1.0f32))
-        .collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("floating_f32::reduce_sum_of_d2::v4", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_d2::reduce_sum_of_d2_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("floating_f32::reduce_sum_of_d2::v3", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_d2::reduce_sum_of_d2_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v2") && simd::is_feature_detected!("fma") {
-        c.bench_function("floating_f32::reduce_sum_of_d2::v2_fma", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f32::reduce_sum_of_d2::reduce_sum_of_d2_v2_fma(&x, &y)
-            })
-        });
-    }
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    if simd::is_cpu_detected!("a3.256") {
-        c.bench_function("floating_f32::reduce_sum_of_d2::a3_256", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f32::reduce_sum_of_d2::reduce_sum_of_d2_a3_256(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("floating_f32::reduce_sum_of_d2::a2", |b| {
-            b.iter(|| unsafe { simd::floating_f32::reduce_sum_of_d2::reduce_sum_of_d2_a2(&x, &y) })
-        });
-    }
+    cache_aligned(
+        &(0..n)
+            .map(|_| rng.random_range(-1.0..=1.0f32))
+            .collect::<Vec<_>>(),
+    )
 }
 
-fn floating_f16_reduce_sum_of_xy(c: &mut Criterion) {
+fn random_u8(n: usize) -> &'static [u8] {
     use rand::RngExt;
-    use simd::{F16, f16};
     let mut rng = rand::rng();
-    let x = (0..4095)
-        .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-        .collect::<Vec<_>>();
-    let y = (0..4095)
-        .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-        .collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::v4", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::v3", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a3.512") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::a3_512", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a3_512(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fhm") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::a2_fhm", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a2_fhm(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::a2", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a2(&x, &y) })
-        });
-    }
+    cache_aligned(&(0..n).map(|_| rng.random::<u8>()).collect::<Vec<_>>())
 }
 
-fn floating_f16_reduce_sum_of_d2(c: &mut Criterion) {
-    use rand::RngExt;
-    use simd::{F16, f16};
-    let mut rng = rand::rng();
-    let x = (0..4095)
-        .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-        .collect::<Vec<_>>();
-    let y = (0..4095)
-        .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-        .collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::v4", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::v3", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a3.512") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::a3_512", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a3_512(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fhm") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::a2_fhm", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a2_fhm(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::a2", |b| {
-            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a2(&x, &y) })
-        });
-    }
+fn random_f16(n: usize) -> &'static [simd::f16] {
+    use simd::F16;
+    let x = random_f32(n).iter().map(|&x| simd::f16::_from_f32(x));
+    cache_aligned(&x.collect::<Vec<_>>())
 }
 
-// Benchmarks the runtime-dispatched f16 reductions, i.e. the code paths that
-// halfvec distance computations actually execute on the current machine.
-fn floating_f16_dispatch(c: &mut Criterion) {
-    use rand::RngExt;
-    use simd::{F16, Floating, f16};
-    use std::hint::black_box;
-    let mut rng = rand::rng();
-    for n in [784_usize, 4095] {
-        let x = (0..n)
-            .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-            .collect::<Vec<_>>();
-        let y = (0..n)
-            .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
-            .collect::<Vec<_>>();
-        c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_d2_approx::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_d2_approx(black_box(&x), black_box(&y))),
-        );
-        c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_abs_x::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_abs_x(black_box(&x))),
-        );
-        c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_x2::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_x2(black_box(&x))),
-        );
-        c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_xy::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_xy(black_box(&x), black_box(&y))),
-        );
-        c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_d2::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_d2(black_box(&x), black_box(&y))),
-        );
+fn unary<T: 'static, R>(
+    c: &mut Criterion,
+    name: &str,
+    data: fn(usize) -> &'static [T],
+    implementations: Vec<(&str, fn(&[T]) -> R)>,
+) {
+    let mut group = c.benchmark_group(name);
+    for n in SIZES {
+        let x = data(n);
+        for &(target, f) in &implementations {
+            group.bench_with_input(BenchmarkId::new(target, n), x, |b, x| {
+                b.iter(|| f(black_box(x)))
+            });
+        }
     }
+    group.finish();
 }
 
-fn byte_reduce_sum_of_xy(c: &mut Criterion) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let x = (0..4095).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
-    let y = (0..4095).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") && simd::is_feature_detected!("avx512vnni") {
-        c.bench_function("byte::reduce_sum_of_xy::v4_avx512vnni", |b| {
-            b.iter(|| unsafe {
-                simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_v4_avx512vnni(&x, &y)
-            })
-        });
+fn binary<T: 'static, R>(
+    c: &mut Criterion,
+    name: &str,
+    data: fn(usize) -> &'static [T],
+    implementations: Vec<(&str, fn(&[T], &[T]) -> R)>,
+) {
+    let mut group = c.benchmark_group(name);
+    for n in SIZES {
+        let (x, y) = (data(n), data(n));
+        for &(target, f) in &implementations {
+            group.bench_with_input(BenchmarkId::new(target, n), &(x, y), |b, (x, y)| {
+                b.iter(|| f(black_box(x), black_box(y)))
+            });
+        }
     }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("byte::reduce_sum_of_xy::v4", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("byte::reduce_sum_of_xy::v3", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v2") {
-        c.bench_function("byte::reduce_sum_of_xy::v2", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_v2(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("dotprod") {
-        c.bench_function("byte::reduce_sum_of_xy::a2_prod", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_a2_dotprod(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("byte::reduce_sum_of_xy::a2", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_xy::reduce_sum_of_xy_a2(&x, &y) })
-        });
-    }
+    group.finish();
 }
 
-fn byte_reduce_sum_of_x(c: &mut Criterion) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let this = (0..4095).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("byte::reduce_sum_of_x::v4", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_x::reduce_sum_of_x_v4(&this) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("byte::reduce_sum_of_x::v3", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_x::reduce_sum_of_x_v3(&this) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v2") {
-        c.bench_function("byte::reduce_sum_of_x::v2", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_x::reduce_sum_of_x_v2(&this) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("byte::reduce_sum_of_x::a2", |b| {
-            b.iter(|| unsafe { simd::byte::reduce_sum_of_x::reduce_sum_of_x_a2(&this) })
-        });
-    }
+fn floating(c: &mut Criterion) {
+    use simd::{floating_f16 as h, floating_f32 as s};
+    unary(
+        c,
+        "floating_f32::reduce_sum_of_abs_x",
+        random_f32,
+        s::reduce_sum_of_abs_x::implementations(),
+    );
+    unary(
+        c,
+        "floating_f32::reduce_sum_of_x2",
+        random_f32,
+        s::reduce_sum_of_x2::implementations(),
+    );
+    unary(
+        c,
+        "floating_f32::reduce_min_max_of_x",
+        random_f32,
+        s::reduce_min_max_of_x::implementations(),
+    );
+    binary(
+        c,
+        "floating_f32::reduce_sum_of_xy",
+        random_f32,
+        s::reduce_sum_of_xy::implementations(),
+    );
+    binary(
+        c,
+        "floating_f32::reduce_sum_of_d2",
+        random_f32,
+        s::reduce_sum_of_d2::implementations(),
+    );
+    unary(
+        c,
+        "floating_f16::reduce_sum_of_x2",
+        random_f16,
+        h::reduce_sum_of_x2::implementations(),
+    );
+    binary(
+        c,
+        "floating_f16::reduce_sum_of_xy",
+        random_f16,
+        h::reduce_sum_of_xy::implementations(),
+    );
+    binary(
+        c,
+        "floating_f16::reduce_sum_of_d2",
+        random_f16,
+        h::reduce_sum_of_d2::implementations(),
+    );
 }
 
-fn halfbyte_reduce_sum_of_xy(c: &mut Criterion) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let x = (0..2047).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
-    let y = (0..2047).map(|_| rng.random::<u8>()).collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") && simd::is_feature_detected!("avx512vnni") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::v4_avx512vnni", |b| {
-            b.iter(|| unsafe {
-                simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_v4_avx512vnni(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::v4", |b| {
-            b.iter(|| unsafe { simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_v4(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v3") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::v3", |b| {
-            b.iter(|| unsafe { simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_v3(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v2") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::v2", |b| {
-            b.iter(|| unsafe { simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_v2(&x, &y) })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("dotprod") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::a2_prod", |b| {
-            b.iter(|| unsafe {
-                simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_a2_dotprod(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") {
-        c.bench_function("halfbyte::reduce_sum_of_xy::a2", |b| {
-            b.iter(|| unsafe { simd::halfbyte::reduce_sum_of_xy::reduce_sum_of_xy_a2(&x, &y) })
-        });
-    }
+fn byte(c: &mut Criterion) {
+    use simd::{byte, halfbyte};
+    binary(
+        c,
+        "byte::reduce_sum_of_xy",
+        random_u8,
+        byte::reduce_sum_of_xy::implementations(),
+    );
+    unary(
+        c,
+        "byte::reduce_sum_of_x",
+        random_u8,
+        byte::reduce_sum_of_x::implementations(),
+    );
+    binary(
+        c,
+        "halfbyte::reduce_sum_of_xy",
+        random_u8,
+        halfbyte::reduce_sum_of_xy::implementations(),
+    );
 }
 
 fn column_bench<T: simd::column::Value>(c: &mut Criterion, name: &str, random: impl Fn() -> T) {
@@ -366,12 +171,12 @@ fn column_bench<T: simd::column::Value>(c: &mut Criterion, name: &str, random: i
         });
         if n <= 64 {
             c.bench_function(&format!("column::matches::{name}/{n}"), |b| {
-                b.iter(|| T::matches(std::hint::black_box(&column), std::hint::black_box(&keys)))
+                b.iter(|| T::matches(black_box(&column), black_box(&keys)))
             });
         }
         let set = Set::new(&keys);
         c.bench_function(&format!("column::set::{name}/{n}"), |b| {
-            b.iter(|| set.matches(std::hint::black_box(&column)))
+            b.iter(|| set.matches(black_box(&column)))
         });
     }
 }
@@ -417,17 +222,5 @@ fn column_meets(c: &mut Criterion) {
     }
 }
 
-criterion_group!(
-    benches,
-    floating_f32_reduce_sum_of_xy,
-    floating_f32_reduce_sum_of_d2,
-    floating_f16_reduce_sum_of_xy,
-    floating_f16_reduce_sum_of_d2,
-    floating_f16_dispatch,
-    byte_reduce_sum_of_xy,
-    byte_reduce_sum_of_x,
-    halfbyte_reduce_sum_of_xy,
-    column_matches,
-    column_meets,
-);
+criterion_group!(benches, floating, byte, column_matches, column_meets);
 criterion_main!(benches);
