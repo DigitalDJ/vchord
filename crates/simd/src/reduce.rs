@@ -75,9 +75,6 @@ pub fn fold<T, A: Copy, const K: usize, const W: usize, const U: usize, const P:
 /// Element types loaded as f32 lanes; a short load fills the rest with `fill`.
 pub trait Lanes: Copy + Default {
     #[cfg(target_arch = "x86_64")]
-    unsafe fn load_m512(p: *const Self, len: usize, fill: Self) -> core::arch::x86_64::__m512;
-
-    #[cfg(target_arch = "x86_64")]
     unsafe fn load_m256(p: *const Self, len: usize, fill: Self) -> core::arch::x86_64::__m256;
 
     #[cfg(target_arch = "aarch64")]
@@ -89,12 +86,6 @@ pub trait Lanes: Copy + Default {
 }
 
 impl Lanes for f32 {
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
-    unsafe fn load_m512(p: *const f32, len: usize, fill: f32) -> core::arch::x86_64::__m512 {
-        unsafe { v4::load(p, len, fill) }
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn load_m256(p: *const f32, len: usize, fill: f32) -> core::arch::x86_64::__m256 {
@@ -130,21 +121,6 @@ impl Lanes for f32 {
 impl Lanes for f16 {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn load_m512(p: *const f16, len: usize, fill: f16) -> core::arch::x86_64::__m512 {
-        use core::arch::x86_64::*;
-        unsafe {
-            if len == 16 {
-                _mm512_cvtph_ps(_mm256_loadu_si256(p.cast()))
-            } else {
-                let mask = _bzhi_u32(0xffff, len as u32) as u16;
-                let fill = _mm256_set1_epi16(fill.to_bits() as i16);
-                _mm512_cvtph_ps(_mm256_mask_loadu_epi16(fill, mask, p.cast()))
-            }
-        }
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[inline(always)]
     unsafe fn load_m256(p: *const f16, len: usize, fill: f16) -> core::arch::x86_64::__m256 {
         use core::arch::x86_64::*;
         unsafe {
@@ -174,7 +150,6 @@ impl Lanes for f16 {
 
 #[cfg(target_arch = "x86_64")]
 pub mod v4 {
-    use super::Lanes;
     use core::arch::x86_64::*;
 
     #[inline(always)]
@@ -202,13 +177,13 @@ pub mod v4 {
     /// Lane sum of `step` folded over equal-length `inputs`.
     #[inline]
     #[crate::target_cpu(enable = "v4")]
-    pub fn sum<const U: usize, const K: usize, T: Lanes>(
-        inputs: [&[T]; K],
+    pub fn sum<const U: usize, const K: usize>(
+        inputs: [&[f32]; K],
         step: impl Fn(__m512, [__m512; K]) -> __m512,
     ) -> f32 {
         let add = |x, y| _mm512_add_ps(x, y);
         let sum = fold::<_, _, K, U>(inputs, _mm512_setzero_ps(), add, |s, at, len| {
-            step(s, at.map(|p| unsafe { T::load_m512(p, len, T::default()) }))
+            step(s, at.map(|p| unsafe { load(p, len, 0.0) }))
         });
         _mm512_reduce_add_ps(sum)
     }

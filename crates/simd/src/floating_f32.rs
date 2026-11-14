@@ -149,6 +149,8 @@ mod reduce_or_of_is_zero_x {
     }
 }
 
+// Accumulator counts are the smallest that reach full throughput.
+
 #[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_abs_x {
     #[inline]
@@ -156,7 +158,7 @@ mod reduce_sum_of_abs_x {
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_abs_x_v4(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 1, _>([this], |s, [x]| _mm512_add_ps(_mm512_abs_ps(x), s))
+        crate::reduce::v4::sum::<4, 1>([this], |s, [x]| _mm512_add_ps(_mm512_abs_ps(x), s))
     }
 
     #[inline]
@@ -165,7 +167,7 @@ mod reduce_sum_of_abs_x {
     fn reduce_sum_of_abs_x_v3(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
         let abs = _mm256_castsi256_ps(_mm256_srli_epi32(_mm256_set1_epi32(-1), 1));
-        crate::reduce::v3::sum::<1, 1, _>([this], |s, [x]| _mm256_add_ps(_mm256_and_ps(abs, x), s))
+        crate::reduce::v3::sum::<8, 1, _>([this], |s, [x]| _mm256_add_ps(_mm256_and_ps(abs, x), s))
     }
 
     #[inline]
@@ -174,7 +176,7 @@ mod reduce_sum_of_abs_x {
     fn reduce_sum_of_abs_x_v2(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
         let abs = _mm_castsi128_ps(_mm_srli_epi32(_mm_set1_epi32(-1), 1));
-        crate::reduce::v2::sum::<1, 1>([this], |s, [x]| _mm_add_ps(_mm_and_ps(abs, x), s))
+        crate::reduce::v2::sum::<8, 1>([this], |s, [x]| _mm_add_ps(_mm_and_ps(abs, x), s))
     }
 
     #[inline]
@@ -182,7 +184,7 @@ mod reduce_sum_of_abs_x {
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_abs_x_a2(this: &[f32]) -> f32 {
         use core::arch::aarch64::*;
-        crate::reduce::a2::sum::<1, 1, _>([this], |s, [x]| {
+        crate::reduce::a2::sum::<4, 1, _>([this], |s, [x]| {
             [
                 vaddq_f32(s[0], vabsq_f32(x[0])),
                 vaddq_f32(s[1], vabsq_f32(x[1])),
@@ -214,7 +216,7 @@ mod reduce_sum_of_x2 {
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_x2_v4(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 1, _>([this], |s, [x]| _mm512_fmadd_ps(x, x, s))
+        crate::reduce::v4::sum::<4, 1>([this], |s, [x]| _mm512_fmadd_ps(x, x, s))
     }
 
     #[inline]
@@ -222,7 +224,7 @@ mod reduce_sum_of_x2 {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_x2_v3(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 1, _>([this], |s, [x]| _mm256_fmadd_ps(x, x, s))
+        crate::reduce::v3::sum::<8, 1, _>([this], |s, [x]| _mm256_fmadd_ps(x, x, s))
     }
 
     #[inline]
@@ -231,7 +233,7 @@ mod reduce_sum_of_x2 {
     #[target_feature(enable = "fma")]
     fn reduce_sum_of_x2_v2_fma(this: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v2::sum::<1, 1>([this], |s, [x]| _mm_fmadd_ps(x, x, s))
+        crate::reduce::v2::sum::<8, 1>([this], |s, [x]| _mm_fmadd_ps(x, x, s))
     }
 
     #[inline]
@@ -239,7 +241,7 @@ mod reduce_sum_of_x2 {
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_x2_a2(this: &[f32]) -> f32 {
         use core::arch::aarch64::*;
-        crate::reduce::a2::sum::<1, 1, _>([this], |s, [x]| {
+        crate::reduce::a2::sum::<4, 1, _>([this], |s, [x]| {
             [vfmaq_f32(s[0], x[0], x[0]), vfmaq_f32(s[1], x[1], x[1])]
         })
     }
@@ -275,7 +277,7 @@ mod reduce_min_max_of_x {
         );
         let merge = |(a, b), (c, d)| (_mm512_min_ps(a, c), _mm512_max_ps(b, d));
         // Repeating an element in the unused lanes leaves min and max unchanged.
-        let (min, max) = v4::fold::<_, _, 1, 1>([this], init, merge, |(min, max), [p], len| {
+        let (min, max) = v4::fold::<_, _, 1, 4>([this], init, merge, |(min, max), [p], len| {
             let x = unsafe { v4::load(p, len, p.read()) };
             (_mm512_min_ps(x, min), _mm512_max_ps(x, max))
         });
@@ -294,7 +296,7 @@ mod reduce_min_max_of_x {
             _mm256_set1_ps(f32::NEG_INFINITY),
         );
         let merge = |(a, b), (c, d)| (_mm256_min_ps(a, c), _mm256_max_ps(b, d));
-        let (min, max) = v3::fold::<_, _, 1, 1>([this], init, merge, |(min, max), [p], len| {
+        let (min, max) = v3::fold::<_, _, 1, 4>([this], init, merge, |(min, max), [p], len| {
             let x = unsafe { f32::load_m256(p, len, p.read()) };
             (_mm256_min_ps(x, min), _mm256_max_ps(x, max))
         });
@@ -313,7 +315,7 @@ mod reduce_min_max_of_x {
         use core::arch::x86_64::*;
         let init = (_mm_set1_ps(f32::INFINITY), _mm_set1_ps(f32::NEG_INFINITY));
         let merge = |(a, b), (c, d)| (_mm_min_ps(a, c), _mm_max_ps(b, d));
-        let (min, max) = v2::fold::<_, _, 1, 1>([this], init, merge, |(min, max), [p], len| {
+        let (min, max) = v2::fold::<_, _, 1, 4>([this], init, merge, |(min, max), [p], len| {
             let x = unsafe { v2::load(p, len, p.read()) };
             (_mm_min_ps(x, min), _mm_max_ps(x, max))
         });
@@ -333,7 +335,7 @@ mod reduce_min_max_of_x {
         let min = |x: a2::F32x8, y: a2::F32x8| [vminnmq_f32(x[0], y[0]), vminnmq_f32(x[1], y[1])];
         let max = |x: a2::F32x8, y: a2::F32x8| [vmaxnmq_f32(x[0], y[0]), vmaxnmq_f32(x[1], y[1])];
         let merge = |(a, b), (c, d)| (min(a, c), max(b, d));
-        let (lo, hi) = a2::fold::<_, _, 1, 1>([this], init, merge, |(lo, hi), [p], len| {
+        let (lo, hi) = a2::fold::<_, _, 1, 2>([this], init, merge, |(lo, hi), [p], len| {
             let x = unsafe { f32::load_f32x4x2(p, len, p.read()) };
             (min(x, lo), max(x, hi))
         });
@@ -377,7 +379,7 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_xy_v4(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm512_fmadd_ps(x, y, s))
+        crate::reduce::v4::sum::<4, 2>([lhs, rhs], |s, [x, y]| _mm512_fmadd_ps(x, y, s))
     }
 
     #[inline]
@@ -385,7 +387,7 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_xy_v3(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm256_fmadd_ps(x, y, s))
+        crate::reduce::v3::sum::<8, 2, _>([lhs, rhs], |s, [x, y]| _mm256_fmadd_ps(x, y, s))
     }
 
     #[inline]
@@ -394,7 +396,7 @@ mod reduce_sum_of_xy {
     #[target_feature(enable = "fma")]
     fn reduce_sum_of_xy_v2_fma(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v2::sum::<1, 2>([lhs, rhs], |s, [x, y]| _mm_fmadd_ps(x, y, s))
+        crate::reduce::v2::sum::<8, 2>([lhs, rhs], |s, [x, y]| _mm_fmadd_ps(x, y, s))
     }
 
     #[inline]
@@ -417,7 +419,7 @@ mod reduce_sum_of_xy {
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_xy_a2(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::aarch64::*;
-        crate::reduce::a2::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::a2::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| {
             [vfmaq_f32(s[0], x[0], y[0]), vfmaq_f32(s[1], x[1], y[1])]
         })
     }
@@ -447,7 +449,7 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "v4")]
     fn reduce_sum_of_d2_v4(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::v4::sum::<4, 2>([lhs, rhs], |s, [x, y]| {
             let d = _mm512_sub_ps(x, y);
             _mm512_fmadd_ps(d, d, s)
         })
@@ -458,7 +460,7 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_d2_v3(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::v3::sum::<8, 2, _>([lhs, rhs], |s, [x, y]| {
             let d = _mm256_sub_ps(x, y);
             _mm256_fmadd_ps(d, d, s)
         })
@@ -470,7 +472,7 @@ mod reduce_sum_of_d2 {
     #[target_feature(enable = "fma")]
     fn reduce_sum_of_d2_v2_fma(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v2::sum::<1, 2>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::v2::sum::<8, 2>([lhs, rhs], |s, [x, y]| {
             let d = _mm_sub_ps(x, y);
             _mm_fmadd_ps(d, d, s)
         })
@@ -496,7 +498,7 @@ mod reduce_sum_of_d2 {
     #[crate::target_cpu(enable = "a2")]
     fn reduce_sum_of_d2_a2(lhs: &[f32], rhs: &[f32]) -> f32 {
         use core::arch::aarch64::*;
-        crate::reduce::a2::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::a2::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| {
             let d = [vsubq_f32(x[0], y[0]), vsubq_f32(x[1], y[1])];
             [vfmaq_f32(s[0], d[0], d[0]), vfmaq_f32(s[1], d[1], d[1])]
         })

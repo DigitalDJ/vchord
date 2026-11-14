@@ -177,6 +177,7 @@ mod reduce_or_of_is_zero_x {
 }
 
 // Every kernel accumulates in f32: binary16 overflows at 65504. FHM's `FMLAL`/`FMLSL` widen exactly.
+// No AVX-512 x², xy or d² kernels: their 512-bit conversions are slower on some CPUs.
 
 #[cfg_attr(feature = "internal", simd_macros::public)]
 mod reduce_sum_of_x2 {
@@ -184,18 +185,10 @@ mod reduce_sum_of_x2 {
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
-    #[crate::target_cpu(enable = "v4")]
-    fn reduce_sum_of_x2_v4(this: &[f16]) -> f32 {
-        use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 1, _>([this], |s, [x]| _mm512_fmadd_ps(x, x, s))
-    }
-
-    #[inline]
-    #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_x2_v3(this: &[f16]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 1, _>([this], |s, [x]| _mm256_fmadd_ps(x, x, s))
+        crate::reduce::v3::sum::<8, 1, _>([this], |s, [x]| _mm256_fmadd_ps(x, x, s))
     }
 
     #[inline]
@@ -220,7 +213,7 @@ mod reduce_sum_of_x2 {
     }
 
     #[crate::multiversion(
-        @"v4", @"v3", "v2", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
+        @"v3", "v2", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
     )]
     pub fn reduce_sum_of_x2(this: &[f16]) -> f32 {
         let n = this.len();
@@ -262,18 +255,10 @@ mod reduce_sum_of_xy {
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
-    #[crate::target_cpu(enable = "v4")]
-    fn reduce_sum_of_xy_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm512_fmadd_ps(x, y, s))
-    }
-
-    #[inline]
-    #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_xy_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| _mm256_fmadd_ps(x, y, s))
+        crate::reduce::v3::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| _mm256_fmadd_ps(x, y, s))
     }
 
     #[cfg_attr(feature = "internal", simd_macros::public)]
@@ -347,7 +332,7 @@ mod reduce_sum_of_xy {
         })
     }
 
-    #[crate::multiversion(@"v4", @"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+    #[crate::multiversion(@"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn reduce_sum_of_xy(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         let n = lhs.len();
@@ -371,21 +356,10 @@ mod reduce_sum_of_d2 {
 
     #[inline]
     #[cfg(target_arch = "x86_64")]
-    #[crate::target_cpu(enable = "v4")]
-    fn reduce_sum_of_d2_v4(lhs: &[f16], rhs: &[f16]) -> f32 {
-        use core::arch::x86_64::*;
-        crate::reduce::v4::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
-            let d = _mm512_sub_ps(x, y);
-            _mm512_fmadd_ps(d, d, s)
-        })
-    }
-
-    #[inline]
-    #[cfg(target_arch = "x86_64")]
     #[crate::target_cpu(enable = "v3")]
     fn reduce_sum_of_d2_v3(lhs: &[f16], rhs: &[f16]) -> f32 {
         use core::arch::x86_64::*;
-        crate::reduce::v3::sum::<1, 2, _>([lhs, rhs], |s, [x, y]| {
+        crate::reduce::v3::sum::<4, 2, _>([lhs, rhs], |s, [x, y]| {
             let d = _mm256_sub_ps(x, y);
             _mm256_fmadd_ps(d, d, s)
         })
@@ -469,7 +443,7 @@ mod reduce_sum_of_d2 {
         })
     }
 
-    #[crate::multiversion(@"v4", @"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+    #[crate::multiversion(@"v3", @"a2:fhm", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn reduce_sum_of_d2(lhs: &[f16], rhs: &[f16]) -> f32 {
         assert!(lhs.len() == rhs.len());
         let n = lhs.len();
