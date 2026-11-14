@@ -1,0 +1,97 @@
+# A sphere around the searched vector on residual indexes with several lists,
+# cosine and inner product, in its ordered form (`ORDER BY` plus a sphere with
+# the same center) and its sphere-only form. Both stop at the sphere: no row
+# past the radius comes back, and both return the same rows. With every list
+# probed and the widest epsilon, both return exactly the rows inside the
+# sphere. Rows are pseudo-random (`hashint4`, the same on every PostgreSQL
+# version); each radius lies halfway between a query's 50th and 51st nearest
+# rows, far from either in float rounding.
+
+statement ok
+CREATE TABLE sr (id integer PRIMARY KEY, v vector(16));
+
+statement ok
+INSERT INTO sr SELECT i, ARRAY(SELECT (hashint4(16 * i + j) & 65535) / 65536.0 - 0.3
+  FROM generate_series(1, 16) j)::real[]::vector
+FROM generate_series(1, 4000) i;
+
+statement ok
+CREATE INDEX sr_cos ON sr USING vchordrq (v vector_cosine_ops) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+statement ok
+CREATE INDEX sr_ip ON sr USING vchordrq (v vector_ip_ops) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+# the queries and the radii
+statement ok
+CREATE TABLE sr_exact AS SELECT k,
+  (SELECT (min(d) + max(d)) / 2 FROM (SELECT v <=> q.v d FROM sr ORDER BY 1 OFFSET 49 LIMIT 2) t)::real
+    AS r_cos,
+  (SELECT (min(d) + max(d)) / 2 FROM (SELECT v <#> q.v d FROM sr ORDER BY 1 OFFSET 49 LIMIT 2) t)::real
+    AS r_ip
+FROM (SELECT id AS k, v FROM sr WHERE id % 400 = 7) q;
+
+statement ok
+CREATE FUNCTION sr_check(probes text, epsilon real) RETURNS TABLE (op text, past bigint, same bigint,
+  exact bigint, total bigint) LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM set_config('vchordrq.probes', probes, true);
+  PERFORM set_config('vchordrq.epsilon', epsilon::text, true);
+  PERFORM set_config('enable_seqscan', 'off', true);
+  RETURN QUERY
+  WITH q AS (SELECT q.v, e.r_cos, e.r_ip FROM sr q JOIN sr_exact e ON e.k = q.id),
+  got AS (
+    SELECT 'cos' AS op,
+      ARRAY(SELECT id FROM sr WHERE v <<=>> sphere(q.v, q.r_cos) ORDER BY v <=> q.v) AS ordered,
+      ARRAY(SELECT id FROM sr WHERE v <<=>> sphere(q.v, q.r_cos)) AS only,
+      ARRAY(SELECT id FROM sr WHERE CASE WHEN v <<=>> sphere(q.v, q.r_cos) THEN true END) AS want
+    FROM q
+    UNION ALL
+    SELECT 'ip',
+      ARRAY(SELECT id FROM sr WHERE v <<#>> sphere(q.v, q.r_ip) ORDER BY v <#> q.v),
+      ARRAY(SELECT id FROM sr WHERE v <<#>> sphere(q.v, q.r_ip)),
+      ARRAY(SELECT id FROM sr WHERE CASE WHEN v <<#>> sphere(q.v, q.r_ip) THEN true END)
+    FROM q
+  ),
+  sets AS (
+    SELECT g.op,
+      ARRAY(SELECT x FROM unnest(g.ordered) x ORDER BY x) AS ordered,
+      ARRAY(SELECT x FROM unnest(g.only) x ORDER BY x) AS only,
+      ARRAY(SELECT x FROM unnest(g.want) x ORDER BY x) AS want
+    FROM got g
+  )
+  SELECT s.op,
+    count(*) FILTER (WHERE NOT s.ordered <@ s.want OR NOT s.only <@ s.want),
+    count(*) FILTER (WHERE s.ordered = s.only),
+    count(*) FILTER (WHERE s.only = s.want),
+    count(*)
+  FROM sets s GROUP BY s.op ORDER BY s.op;
+END
+$$;
+
+# few probes, the default epsilon: within the sphere, and the two forms agree
+query TIII
+SELECT op, past, same, total FROM sr_check('4', 1.9);
+----
+cos 0 10 10
+ip 0 10 10
+
+# every list, the widest epsilon: exactly the rows inside the sphere
+query TIIII
+SELECT op, past, same, exact, total FROM sr_check('16', 4.0);
+----
+cos 0 10 10 10
+ip 0 10 10 10
+
+statement ok
+DROP FUNCTION sr_check;
+
+statement ok
+DROP TABLE sr, sr_exact;

@@ -1,0 +1,271 @@
+# An ORDER BY scan with a sphere around the ORDER BY vector ends at the
+# sphere's radius: it returns the rows of the ORDER BY ... LIMIT scan that are
+# inside the sphere, without reranking candidates past the radius.
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+CREATE TABLE rq_sphere_order (id int, v vector(3), h halfvec(3));
+
+statement ok
+INSERT INTO rq_sphere_order
+SELECT i, x, x::halfvec FROM (
+  SELECT i, ARRAY[sin(i), cos(1.3 * i), sin(0.7 * i)]::real[]::vector AS x
+  FROM generate_series(1, 1000) i
+) s;
+
+statement ok
+CREATE INDEX rq_sphere_order_l2 ON rq_sphere_order USING vchordrq (v vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE INDEX rq_sphere_order_ip ON rq_sphere_order USING vchordrq (v vector_ip_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE INDEX rq_sphere_order_cos ON rq_sphere_order USING vchordrq (v vector_cosine_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE INDEX rq_sphere_order_h_l2 ON rq_sphere_order USING vchordrq (h halfvec_l2_ops)
+WITH (options = $$
+rerank_in_table = true
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE INDEX rq_sphere_order_h_cos ON rq_sphere_order USING vchordrq (h halfvec_cosine_ops)
+WITH (options = $$
+rerank_in_table = true
+[build.internal]
+lists = []
+$$);
+
+statement ok
+SET vchordrq.probes = '';
+
+query T
+EXPLAIN (COSTS OFF)
+SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.2)
+ORDER BY v <-> '[0.5, 0.5, 0.5]' LIMIT 5;
+----
+Limit
+  ->  Index Scan using rq_sphere_order_l2 on rq_sphere_order
+        Index Cond: (v <<->> '("[0.5,0.5,0.5]",0.2)'::sphere_vector)
+        Order By: (v <-> '[0.5,0.5,0.5]'::vector)
+
+# fewer rows inside than the limit
+query T
+SELECT ARRAY(SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.2)
+ORDER BY v <-> '[0.5, 0.5, 0.5]' LIMIT 5);
+----
+{629,252}
+
+query T
+SELECT ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <-> '[0.5, 0.5, 0.5]' LIMIT 5) s
+WHERE v <-> '[0.5, 0.5, 0.5]' < 0.2);
+----
+{629,252}
+
+# The scan ends at the radius: no row past it reaches the recheck. Each
+# sphere holds fewer rows than the limit.
+statement ok
+CREATE FUNCTION rq_sphere_order_rechecked(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  r text;
+  result bigint := 0;
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    IF r LIKE '%Rows Removed by Index Recheck%' THEN
+      result := result + substring(r FROM '\d+')::bigint;
+    END IF;
+  END LOOP;
+  RETURN result;
+END
+$$;
+
+query IIIII
+SELECT
+  rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.2)
+    ORDER BY v <-> '[0.5, 0.5, 0.5]' LIMIT 5$q$),
+  rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE v <<#>> sphere('[0.5, 0.5, 0.5]'::vector, -1.35)
+    ORDER BY v <#> '[0.5, 0.5, 0.5]' LIMIT 5$q$),
+  rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE v <<=>> sphere('[0.5, 0.5, 0.5]'::vector, 0.001)
+    ORDER BY v <=> '[0.5, 0.5, 0.5]' LIMIT 5$q$),
+  rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE h <<->> sphere('[0.5, 0.5, 0.5]'::halfvec, 0.2)
+    ORDER BY h <-> '[0.5, 0.5, 0.5]' LIMIT 5$q$),
+  rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE h <<=>> sphere('[0.5, 0.5, 0.5]'::halfvec, 0.001)
+    ORDER BY h <=> '[0.5, 0.5, 0.5]' LIMIT 5$q$);
+----
+0 0 0 0 0
+
+# A sphere around another vector does not bound the scan.
+query I
+SELECT rq_sphere_order_rechecked($q$SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.2)
+  ORDER BY v <-> '[0, 0, 0]' LIMIT 5$q$) > 0;
+----
+t
+
+# The queries below run the sphere form for 40 query vectors and three radii
+# each: the smallest radius leaves many spheres empty, the largest holds more
+# rows than the limit. Each block reports its mismatches with the ORDER BY
+# scan filtered by distance and then limited (what the sphere form returned
+# before it stopped at the radius), its mismatches with the ORDER BY ... LIMIT
+# form filtered by distance, the spheres with no row and the spheres with more
+# rows than the limit.
+
+statement ok
+CREATE TABLE rq_sphere_order_q AS
+SELECT j, ARRAY[cos(j), sin(1.7 * j), cos(0.3 * j)]::real[]::vector AS q FROM generate_series(1, 40) j;
+
+statement ok
+CREATE VIEW rq_sphere_order_l2_cmp AS
+SELECT
+  ARRAY(SELECT id FROM rq_sphere_order WHERE v <<->> sphere(q, r)
+        ORDER BY v <-> q LIMIT 5) AS a,
+  ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <-> q) s
+        WHERE v <-> q < r LIMIT 5) AS b,
+  ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <-> q LIMIT 5) s
+        WHERE v <-> q < r) AS c,
+  (SELECT count(*) FROM (SELECT v FROM rq_sphere_order ORDER BY v <-> q LIMIT 6) s
+   WHERE v <-> q < r) AS n
+FROM rq_sphere_order_q, (VALUES (0.05::real), (0.2), (0.4)) r(r);
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM rq_sphere_order_l2_cmp;
+----
+0 0 39 60
+
+statement ok
+SET vchordrq.io_rerank = 'read_buffer';
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM rq_sphere_order_l2_cmp;
+----
+0 0 39 60
+
+statement ok
+SET vchordrq.io_rerank = 'prefetch_buffer';
+
+statement ok
+SET vchordrq.prefilter = on;
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM rq_sphere_order_l2_cmp;
+----
+0 0 39 60
+
+statement ok
+RESET vchordrq.io_rerank;
+
+statement ok
+RESET vchordrq.prefilter;
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM (
+  SELECT
+    ARRAY(SELECT id FROM rq_sphere_order WHERE v <<#>> sphere(q, r)
+          ORDER BY v <#> q LIMIT 5) AS a,
+    ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <#> q) s
+          WHERE v <#> q < r LIMIT 5) AS b,
+    ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <#> q LIMIT 5) s
+          WHERE v <#> q < r) AS c,
+    (SELECT count(*) FROM (SELECT v FROM rq_sphere_order ORDER BY v <#> q LIMIT 6) s
+     WHERE v <#> q < r) AS n
+  FROM rq_sphere_order_q, (VALUES (-1.6::real), (-1.2), (-0.8)) r(r)
+) s;
+----
+0 0 22 98
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM (
+  SELECT
+    ARRAY(SELECT id FROM rq_sphere_order WHERE v <<=>> sphere(q, r)
+          ORDER BY v <=> q LIMIT 5) AS a,
+    ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <=> q) s
+          WHERE v <=> q < r LIMIT 5) AS b,
+    ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <=> q LIMIT 5) s
+          WHERE v <=> q < r) AS c,
+    (SELECT count(*) FROM (SELECT v FROM rq_sphere_order ORDER BY v <=> q LIMIT 6) s
+     WHERE v <=> q < r) AS n
+  FROM rq_sphere_order_q, (VALUES (0.001::real), (0.01), (0.05)) r(r)
+) s;
+----
+0 0 27 65
+
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM (
+  SELECT
+    ARRAY(SELECT id FROM rq_sphere_order WHERE h <<->> sphere(q::halfvec, r)
+          ORDER BY h <-> q::halfvec LIMIT 5) AS a,
+    ARRAY(SELECT id FROM (SELECT id, h FROM rq_sphere_order ORDER BY h <-> q::halfvec) s
+          WHERE h <-> q::halfvec < r LIMIT 5) AS b,
+    ARRAY(SELECT id FROM (SELECT id, h FROM rq_sphere_order ORDER BY h <-> q::halfvec LIMIT 5) s
+          WHERE h <-> q::halfvec < r) AS c,
+    (SELECT count(*) FROM (SELECT h FROM rq_sphere_order ORDER BY h <-> q::halfvec LIMIT 6) s
+     WHERE h <-> q::halfvec < r) AS n
+  FROM rq_sphere_order_q, (VALUES (0.05::real), (0.2), (0.4)) r(r)
+) s;
+----
+0 0 39 60
+
+# Here the order of the halfvec cosine index differs from the operator's
+# distances at the smallest radius, so in one sphere a row past the radius
+# takes a slot of the ORDER BY ... LIMIT form; the sphere form returns one row
+# more.
+query IIII
+SELECT count(*) FILTER (WHERE a <> b), count(*) FILTER (WHERE a <> c), count(*) FILTER (WHERE n = 0), count(*) FILTER (WHERE n > 5)
+FROM (
+  SELECT
+    ARRAY(SELECT id FROM rq_sphere_order WHERE h <<=>> sphere(q::halfvec, r)
+          ORDER BY h <=> q::halfvec LIMIT 5) AS a,
+    ARRAY(SELECT id FROM (SELECT id, h FROM rq_sphere_order ORDER BY h <=> q::halfvec) s
+          WHERE h <=> q::halfvec < r LIMIT 5) AS b,
+    ARRAY(SELECT id FROM (SELECT id, h FROM rq_sphere_order ORDER BY h <=> q::halfvec LIMIT 5) s
+          WHERE h <=> q::halfvec < r) AS c,
+    (SELECT count(*) FROM (SELECT h FROM rq_sphere_order ORDER BY h <=> q::halfvec LIMIT 6) s
+     WHERE h <=> q::halfvec < r) AS n
+  FROM rq_sphere_order_q, (VALUES (0.001::real), (0.01), (0.05)) r(r)
+) s;
+----
+0 1 27 65
+
+# A sphere around another vector does not bound the scan: its rows come in the
+# order of the ORDER BY vector, past any radius around it.
+query T
+SELECT ARRAY(SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.3)
+ORDER BY v <-> '[0, 0, 0]' LIMIT 4);
+----
+{252,629,315,692}
+
+query T
+SELECT ARRAY(SELECT id FROM (SELECT id, v FROM rq_sphere_order ORDER BY v <-> '[0, 0, 0]') s
+WHERE v <-> '[0.5, 0.5, 0.5]' < 0.3 LIMIT 4);
+----
+{252,629,315,692}
+
+statement ok
+DROP TABLE rq_sphere_order_q CASCADE;
+
+statement ok
+DROP FUNCTION rq_sphere_order_rechecked;
+
+statement ok
+DROP TABLE rq_sphere_order;

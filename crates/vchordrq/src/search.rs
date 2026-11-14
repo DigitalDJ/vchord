@@ -384,6 +384,18 @@ pub struct Candidates<'b> {
     heap: Heap<Candidate<'b>>,
 }
 
+impl<'b> Candidates<'b> {
+    /// Candidates whose lower bound is at or past `bound` are dropped.
+    fn new(mut results: Vec<Candidate<'b>>, bound: Option<Distance>) -> Self {
+        if let Some(bound) = bound {
+            results.retain(|((Reverse(lowerbound), _), _)| *lowerbound < bound);
+        }
+        Self {
+            heap: Heap::from(results),
+        }
+    }
+}
+
 impl<'b> Sequence for Candidates<'b> {
     type Item = Candidate<'b>;
     type Inner = std::vec::IntoIter<Candidate<'b>>;
@@ -404,9 +416,15 @@ impl<'b> Sequence for Candidates<'b> {
 }
 
 /// The search keeps `vector`, which the caller may share with its reranker.
+///
+/// Candidates whose lower bound is at or past `bound` are dropped, so that a
+/// search bounded by a sphere ends at its radius. It can miss a row whose
+/// estimated lower bound is past the radius; a larger `epsilon`
+/// (`vchordrq.epsilon`) makes that rarer.
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: Rc<O::Vector>,
+    bound: Option<Distance>,
     params: SearchParams,
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
@@ -424,9 +442,7 @@ where
         prefetch_h0_tuples,
     );
     let Route { lists, .. } = searcher.route(&params.probes, false);
-    Candidates {
-        heap: Heap::from(searcher.read(lists)),
-    }
+    Candidates::new(searcher.read(lists), bound)
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
