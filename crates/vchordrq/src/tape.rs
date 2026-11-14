@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::keys::Columns;
 use crate::tuples::*;
 use crate::{Opaque, freepages};
 use index::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
@@ -269,10 +270,33 @@ pub fn read_h1_tape<'b, R, A, T>(
     }
 }
 
+/// Selects the rows a tape reader passes on; `()` selects every row.
+pub trait Filter: Copy {
+    /// The rows of a frozen block to pass on, given their payloads and the
+    /// block's filter key columns (`crate::keys`), as a bitmask: bit `i` is
+    /// row `i`.
+    fn block(self, payload: &[Option<NonZero<u64>>; 32], columns: &[u8]) -> u32;
+    /// Whether to pass on an appendable row.
+    fn row(self, payload: NonZero<u64>, columns: Columns<'_>) -> bool;
+}
+
+impl Filter for () {
+    #[inline(always)]
+    fn block(self, _: &[Option<NonZero<u64>>; 32], _: &[u8]) -> u32 {
+        u32::MAX
+    }
+
+    #[inline(always)]
+    fn row(self, _: NonZero<u64>, _: Columns<'_>) -> bool {
+        true
+    }
+}
+
 pub fn read_frozen_tape<'b, R, A, T>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
     accessor: impl Fn() -> A,
-    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
+    filter: impl Filter,
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32], Columns<'a>),
 ) where
     R: RelationRead + 'b,
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
@@ -284,6 +308,13 @@ pub fn read_frozen_tape<'b, R, A, T>(
             let tuple = FrozenTuple::deserialize_ref(bytes);
             match tuple {
                 FrozenTupleReader::_0(tuple) => {
+                    let mask = filter.block(tuple.payload(), tuple.columns());
+                    if mask == 0 {
+                        // Skip the block, with the parts of it pushed so far.
+                        x = None;
+                        continue;
+                    }
+                    let columns = tuple.columns();
                     let mut x = x.take().unwrap_or_else(&accessor);
                     x.push(tuple.elements());
                     let values = x.finish((tuple.metadata(), tuple.delta()));
@@ -291,12 +322,15 @@ pub fn read_frozen_tape<'b, R, A, T>(
                     let flattened = prefetch.as_flattened();
                     let step = prefetch.len();
                     for (j, value) in values.into_iter().enumerate() {
-                        if let Some(payload) = tuple.payload()[j] {
+                        if mask & (1 << j) != 0
+                            && let Some(payload) = tuple.payload()[j]
+                        {
                             callback(
                                 value,
                                 tuple.head()[j],
                                 payload,
                                 &flattened[j * step..][..step],
+                                Columns::block(columns, j),
                             );
                         }
                     }
@@ -312,7 +346,8 @@ pub fn read_frozen_tape<'b, R, A, T>(
 pub fn read_appendable_tape<'b, R, T>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
     mut access: impl for<'a> FnMut([f32; 4], &'a [u64], f32) -> T,
-    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32]),
+    filter: impl Filter,
+    mut callback: impl for<'a> FnMut(T, u16, NonZero<u64>, &'a [u32], Columns<'a>),
 ) where
     R: RelationRead + 'b,
 {
@@ -320,9 +355,12 @@ pub fn read_appendable_tape<'b, R, T>(
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
             let tuple = AppendableTuple::deserialize_ref(bytes);
-            if let Some(payload) = tuple.payload() {
+            let columns = Columns::row(tuple.columns());
+            if let Some(payload) = tuple.payload()
+                && filter.row(payload, columns)
+            {
                 let value = access(tuple.metadata(), tuple.elements(), tuple.delta());
-                callback(value, tuple.head(), payload, tuple.prefetch());
+                callback(value, tuple.head(), payload, tuple.prefetch(), columns);
             }
         }
     }

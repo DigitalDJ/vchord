@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::keys::Keys;
 use crate::tape::TapeWriter;
 use crate::tuples::*;
 use crate::{Branch, Opaque};
@@ -145,6 +146,9 @@ where
     tape: TapeWriter<'a, R, FrozenTuple>,
     branches: Vec<Branch<NonZero<u64>>>,
     prefetch: usize,
+    keys: &'a Keys,
+    /// The filter key columns of the branches, a row's after another's.
+    columns: Vec<u8>,
 }
 
 impl<'a, R> FrozenTapeWriter<'a, R>
@@ -152,23 +156,31 @@ where
     R: RelationWrite + 'a,
     R::Page: Page<Opaque = Opaque>,
 {
-    pub fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
+    /// `keys`: the filter keys of the index (`crate::keys`).
+    pub fn create(index: &'a R, prefetch: usize, keys: &'a Keys, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
             prefetch,
+            keys,
+            columns: Vec::new(),
         }
     }
-    pub fn push(&mut self, branch: Branch<NonZero<u64>>) {
+    /// `columns`: the branch's filter key columns, as an appendable tuple
+    /// stores them.
+    pub fn push(&mut self, branch: Branch<NonZero<u64>>, columns: &[u8]) {
         self.branches.push(branch);
+        self.columns
+            .extend_from_slice(&columns[..self.keys.columns()]);
         if let Ok(chunk) = <&[_; 32]>::try_from(self.branches.as_slice()) {
             let elements =
                 padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)));
-            let prefetch = self.prefetch;
+            let columns = self.keys.block(&self.columns);
+            let (prefetch, width) = (self.prefetch, columns.len());
             put(
                 &mut self.tape,
                 &elements,
-                |n| FrozenTuple::estimate_size_0(prefetch, n),
+                |n| FrozenTuple::estimate_size_0(prefetch, n, width),
                 |freespace| FrozenTuple::fit_1(prefetch, freespace),
                 |elements| FrozenTuple::_0 {
                     metadata: [
@@ -182,16 +194,26 @@ where
                     head: chunk.each_ref().map(|x| x.head),
                     payload: chunk.each_ref().map(|x| Some(x.extra)),
                     elements: elements.to_vec(),
+                    columns,
                 },
                 |elements| FrozenTuple::_1 {
                     elements: elements.to_vec(),
                 },
             );
             self.branches.clear();
+            self.columns.clear();
         }
     }
-    pub fn into_inner(self) -> (TapeWriter<'a, R, FrozenTuple>, Vec<Branch<NonZero<u64>>>) {
-        (self.tape, self.branches)
+    /// The tape, and the branches of a block not filled, with their filter
+    /// key columns, a row's after another's.
+    pub fn into_inner(
+        self,
+    ) -> (
+        TapeWriter<'a, R, FrozenTuple>,
+        Vec<Branch<NonZero<u64>>>,
+        Vec<u8>,
+    ) {
+        (self.tape, self.branches, self.columns)
     }
 }
 
@@ -432,10 +454,11 @@ mod tests {
     fn frozen_parts() {
         for dim in [64, 768, 1000, 1536, 3000] {
             let relation = MemoryRelation::default();
-            let mut tape = FrozenTapeWriter::create(&relation, 1, false);
+            let keys = Keys::new([]);
+            let mut tape = FrozenTapeWriter::create(&relation, 1, &keys, false);
             let n = 32 * 40;
             for i in 0..n {
-                tape.push(branch(i, dim, NonZero::new(1 + i as u64).unwrap()));
+                tape.push(branch(i, dim, NonZero::new(1 + i as u64).unwrap()), &[]);
             }
             let first = tape.into_inner().0.first();
             let mut rows = 0;

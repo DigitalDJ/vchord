@@ -27,6 +27,7 @@ mod tuples;
 mod vectors;
 
 pub mod build_memory;
+pub mod keys;
 pub mod operator;
 pub mod types;
 

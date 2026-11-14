@@ -14,6 +14,7 @@ use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::traverse::{HeapTraverser, Traverser};
 use crate::index::vchordrq::am::Reloption;
 use crate::index::vchordrq::build::{Normalize, Normalized};
+use crate::index::vchordrq::filter_key::FilterKeys;
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::types::*;
 use index::relation::{
@@ -293,9 +294,11 @@ pub unsafe extern "C-unwind" fn ambuild(
     }
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Build));
     let index = unsafe { PostgresRelation::new(index_relation) };
+    let keys = unsafe { FilterKeys::of_options(index_relation) };
     crate::index::vchordrq::dispatch::build(
         vector_options,
         vchordrq_options.index,
+        &keys.map(|keys| keys.keys).unwrap_or_default(),
         &index,
         structures,
     );
@@ -990,6 +993,7 @@ unsafe fn parallel_build(
         )
     };
     let opfamily = unsafe { opfamily(index_relation) };
+    let keys = unsafe { FilterKeys::of_options(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
     struct IdChooser(u32);
@@ -1024,18 +1028,23 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let (in_payload, columns) = keys
+                    .as_ref()
+                    .map(|keys| unsafe { keys.row(values, is_nulls) })
+                    .unwrap_or_default();
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
+                    let payload = kv_to_pointer((key, in_payload.unwrap_or(extra)));
                     let mut chooser = IdChooser(order);
                     let bump = bumpalo::Bump::new();
                     crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1065,18 +1074,23 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let (in_payload, columns) = keys
+                    .as_ref()
+                    .map(|keys| unsafe { keys.row(values, is_nulls) })
+                    .unwrap_or_default();
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
+                    let payload = kv_to_pointer((key, in_payload.unwrap_or(extra)));
                     let mut chooser = IdChooser(order);
                     let bump = bumpalo::Bump::new();
                     crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1140,6 +1154,7 @@ unsafe fn sequential_build(
     let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
 
     let opfamily = unsafe { opfamily(index_relation) };
+    let keys = unsafe { FilterKeys::of_options(index_relation) };
     let traverser = unsafe {
         HeapTraverser::new(
             heap_relation,
@@ -1179,18 +1194,23 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let (in_payload, columns) = keys
+                    .as_ref()
+                    .map(|keys| unsafe { keys.row(values, is_nulls) })
+                    .unwrap_or_default();
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
+                    let payload = kv_to_pointer((key, in_payload.unwrap_or(extra)));
                     let mut chooser = ChooseZero;
                     let bump = bumpalo::Bump::new();
                     crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1212,18 +1232,23 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let (in_payload, columns) = keys
+                    .as_ref()
+                    .map(|keys| unsafe { keys.row(values, is_nulls) })
+                    .unwrap_or_default();
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
+                    let payload = kv_to_pointer((key, in_payload.unwrap_or(extra)));
                     let mut chooser = ChooseZero;
                     let bump = bumpalo::Bump::new();
                     crate::index::vchordrq::dispatch::insert(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1279,9 +1304,7 @@ unsafe fn options(
     if atts.is_empty() {
         pgrx::error!("indexing on no columns is not supported");
     }
-    if atts.len() != 1 {
-        pgrx::error!("multicolumn index is not supported");
-    }
+    // The key columns after the first are filter key columns.
     // get dim
     let typmod = Typmod::new(atts[0].atttypmod).unwrap();
     let dim = if let Some(dim) = typmod.dim() {
@@ -1293,11 +1316,44 @@ unsafe fn options(
     };
     // get v, d
     let opfamily = unsafe { opfamily(index_relation) };
+    // MaxSim payloads keep the index of a vector in its array where a filter
+    // key goes.
+    if unsafe { (*(*index_relation).rd_index).indnkeyatts } > 1
+        && matches!(
+            opfamily,
+            Opfamily::VectorMaxsim
+                | Opfamily::HalfvecMaxsim
+                | Opfamily::Rabitq8Maxsim
+                | Opfamily::Rabitq4Maxsim
+        )
+    {
+        pgrx::error!("filter key column with a maxsim operator class is not supported");
+    }
     let vector = VectorOptions {
         dim,
         v: opfamily.vector_kind(),
         d: opfamily.distance_kind(),
     };
+    // A block's last part carries the filter keys of its 32 rows, and must
+    // fit a page, and so must an appendable tuple.
+    if let Some(keys) = unsafe { FilterKeys::of_options(index_relation) } {
+        use pgrx::pg_sys::{BLCKSZ, ItemIdData, PageHeaderData};
+        let freespace = BLCKSZ as usize
+            - std::mem::offset_of!(PageHeaderData, pd_linp)
+            - size_of::<vchordrq::Opaque>()
+            - size_of::<ItemIdData>();
+        let prefetch = crate::index::vchordrq::dispatch::prefetch(vector.v, dim);
+        let words = (dim as usize).div_ceil(64);
+        let most = vchordrq::keys::Keys::most_columns(words, prefetch, freespace);
+        if keys.keys.columns() > most {
+            pgrx::error!(
+                "filter keys of {} bytes per row do not fit: an index of {} dimensions holds at most {} bytes per row, as a block keeps the keys of its 32 rows on one page",
+                keys.keys.columns(),
+                dim,
+                most
+            );
+        }
+    }
     // get indexing options
     let indexing_options = {
         let reloption = unsafe { (*index_relation).rd_options as *const Reloption };

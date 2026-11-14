@@ -91,6 +91,11 @@ impl SearchBuilder for MaxsimBuilder {
         if let Some(_max_scan_tuples) = options.max_scan_tuples {
             pgrx::error!("maxsim search with max_scan_tuples is not supported");
         }
+        // `CREATE INDEX` rejects a filter key column with a maxsim operator
+        // class, and maxsim operator classes have no sphere operator.
+        if options.search.filter.is_some() {
+            pgrx::error!("filter key column with a maxsim operator class is not supported");
+        }
         let maxsim_refine = options.maxsim_refine;
         let maxsim_threshold = options.maxsim_threshold;
         let opfamily = self.opfamily;

@@ -88,7 +88,8 @@ where
                 tape::read_frozen_tape::<R, _, _>(
                     by_directory(&mut prefetch_h0_tuples, directory).inspect(|_| counter += 1),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                    id_2(|_, _, _, _| {
+                    (),
+                    id_2(|_, _, _, _, _| {
                         results.push(());
                     }),
                 );
@@ -96,7 +97,8 @@ where
                 tape::read_frozen_tape::<R, _, _>(
                     by_next(index, jump_tuple.frozen_first()).inspect(|_| counter += 1),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                    id_2(|_, _, _, _| {
+                    (),
+                    id_2(|_, _, _, _, _| {
                         results.push(());
                     }),
                 );
@@ -104,7 +106,8 @@ where
             tape::read_appendable_tape::<R, _>(
                 by_next(index, jump_tuple.appendable_first()).inspect(|_| counter += 1),
                 |_, _, _| (),
-                id_2(|_, _, _, _| {
+                (),
+                id_2(|_, _, _, _, _| {
                     results.push(());
                 }),
             );

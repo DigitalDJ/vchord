@@ -385,10 +385,12 @@ impl Opfamily {
     }
 }
 
-pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
+/// The name support function 1 of key column `attno` returns, which
+/// identifies its operator class.
+pub unsafe fn support_name(index_relation: pgrx::pg_sys::Relation, attno: i16) -> String {
     use pgrx::pg_sys::Oid;
 
-    let proc = unsafe { pgrx::pg_sys::index_getprocid(index_relation, 1, 1) };
+    let proc = unsafe { pgrx::pg_sys::index_getprocid(index_relation, attno, 1) };
 
     if proc == Oid::INVALID {
         pgrx::error!("support function 1 is not found");
@@ -419,7 +421,17 @@ pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
 
     let result_string = result_option.expect("null return value");
 
-    let result = match result_string.as_str() {
+    unsafe {
+        pgrx::pg_sys::pfree(result_datum.cast_mut_ptr());
+    }
+
+    result_string
+}
+
+pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
+    let result_string = unsafe { support_name(index_relation, 1) };
+
+    match result_string.as_str() {
         "vchordrq_vector_l2_ops" => Opfamily::VectorL2,
         "vchordrq_vector_ip_ops" => Opfamily::VectorIp,
         "vchordrq_vector_cosine_ops" => Opfamily::VectorCosine,
@@ -437,11 +449,5 @@ pub unsafe fn opfamily(index_relation: pgrx::pg_sys::Relation) -> Opfamily {
         "vchordrq_rabitq8_maxsim_ops" => Opfamily::Rabitq8Maxsim,
         "vchordrq_rabitq4_maxsim_ops" => Opfamily::Rabitq4Maxsim,
         _ => pgrx::error!("unknown operator class"),
-    };
-
-    unsafe {
-        pgrx::pg_sys::pfree(result_datum.cast_mut_ptr());
     }
-
-    result
 }

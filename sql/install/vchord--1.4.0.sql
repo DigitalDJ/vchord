@@ -558,8 +558,41 @@ AS 'MODULE_PATHNAME', '_vchordg_support_vector_l2_ops_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- src/index/vchordrq/am/mod.rs:207
+-- src/index/vchordrq/am/mod.rs:208
 -- vchord::index::vchordrq::am::_vchordrq_amhandler
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:175
+-- vchord::index::opclass::_vchordrq_int2_options
+CREATE  FUNCTION "_vchordrq_int2_options"(
+    "relopts" internal /* pgrx :: Internal */
+) RETURNS void
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_int2_options_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:181
+-- vchord::index::opclass::_vchordrq_int4_options
+CREATE  FUNCTION "_vchordrq_int4_options"(
+    "relopts" internal /* pgrx :: Internal */
+) RETURNS void
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_int4_options_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:187
+-- vchord::index::opclass::_vchordrq_int8_options
+CREATE  FUNCTION "_vchordrq_int8_options"(
+    "relopts" internal /* pgrx :: Internal */
+) RETURNS void
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_int8_options_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -606,6 +639,33 @@ CREATE  FUNCTION "_vchordrq_support_halfvec_maxsim_ops"() RETURNS TEXT /* String
 IMMUTABLE STRICT PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', '_vchordrq_support_halfvec_maxsim_ops_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:154
+-- vchord::index::opclass::_vchordrq_support_int2_ops
+CREATE  FUNCTION "_vchordrq_support_int2_ops"() RETURNS TEXT /* String */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_support_int2_ops_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:159
+-- vchord::index::opclass::_vchordrq_support_int4_ops
+CREATE  FUNCTION "_vchordrq_support_int4_ops"() RETURNS TEXT /* String */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_support_int4_ops_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:164
+-- vchord::index::opclass::_vchordrq_support_int8_ops
+CREATE  FUNCTION "_vchordrq_support_int8_ops"() RETURNS TEXT /* String */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_support_int8_ops_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -681,6 +741,15 @@ AS 'MODULE_PATHNAME', '_vchordrq_support_rabitq8_maxsim_ops_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- src/index/opclass.rs:149
+-- vchord::index::opclass::_vchordrq_support_uuid_ops
+CREATE  FUNCTION "_vchordrq_support_uuid_ops"() RETURNS TEXT /* String */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_support_uuid_ops_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- src/index/opclass.rs:79
 -- vchord::index::opclass::_vchordrq_support_vector_cosine_ops
 CREATE  FUNCTION "_vchordrq_support_vector_cosine_ops"() RETURNS TEXT /* String */
@@ -714,6 +783,17 @@ CREATE  FUNCTION "_vchordrq_support_vector_maxsim_ops"() RETURNS TEXT /* String 
 IMMUTABLE STRICT PARALLEL SAFE
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', '_vchordrq_support_vector_maxsim_ops_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
+-- src/index/opclass.rs:169
+-- vchord::index::opclass::_vchordrq_uuid_options
+CREATE  FUNCTION "_vchordrq_uuid_options"(
+    "relopts" internal /* pgrx :: Internal */
+) RETURNS void
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', '_vchordrq_uuid_options_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -1007,7 +1087,6 @@ BEGIN
                 A.amname = 'vchordrq'
                 AND AO.amopstrategy = 1
                 AND C.relkind = 'r'
-                AND X.indnatts = 1
                 AND X.indexrelid = %1$s
         )
         SELECT
@@ -1217,6 +1296,8 @@ CREATE OPERATOR FAMILY vector_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY halfvec_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY rabitq8_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY rabitq4_maxsim_ops USING vchordrq;
+CREATE OPERATOR FAMILY uuid_ops USING vchordrq;
+CREATE OPERATOR FAMILY integer_ops USING vchordrq;
 CREATE OPERATOR FAMILY vector_l2_ops USING vchordg;
 CREATE OPERATOR FAMILY vector_ip_ops USING vchordg;
 CREATE OPERATOR FAMILY vector_cosine_ops USING vchordg;
@@ -1324,6 +1405,41 @@ CREATE OPERATOR CLASS rabitq4_maxsim_ops
     OPERATOR 3 @# (rabitq4[], rabitq4[]) FOR ORDER BY float_ops,
     FUNCTION 1 _vchordrq_support_rabitq4_maxsim_ops();
 
+-- Filter key columns: USING vchordrq (embedding ..., key [, key ...]), each with the
+-- parameter `bytes` (support function 2): `key uuid_ops (bytes = 16)`
+
+CREATE OPERATOR CLASS uuid_ops
+    DEFAULT FOR TYPE uuid USING vchordrq FAMILY uuid_ops AS
+    OPERATOR 1 = (uuid, uuid),
+    FUNCTION 1 _vchordrq_support_uuid_ops(),
+    FUNCTION 2 _vchordrq_uuid_options(internal);
+
+CREATE OPERATOR CLASS int2_ops
+    DEFAULT FOR TYPE int2 USING vchordrq FAMILY integer_ops AS
+    OPERATOR 1 = (int2, int2),
+    FUNCTION 1 _vchordrq_support_int2_ops(),
+    FUNCTION 2 _vchordrq_int2_options(internal);
+
+CREATE OPERATOR CLASS int4_ops
+    DEFAULT FOR TYPE int4 USING vchordrq FAMILY integer_ops AS
+    OPERATOR 1 = (int4, int4),
+    FUNCTION 1 _vchordrq_support_int4_ops(),
+    FUNCTION 2 _vchordrq_int4_options(internal);
+
+CREATE OPERATOR CLASS int8_ops
+    DEFAULT FOR TYPE int8 USING vchordrq FAMILY integer_ops AS
+    OPERATOR 1 = (int8, int8),
+    FUNCTION 1 _vchordrq_support_int8_ops(),
+    FUNCTION 2 _vchordrq_int8_options(internal);
+
+ALTER OPERATOR FAMILY integer_ops USING vchordrq ADD
+    OPERATOR 1 = (int2, int4),
+    OPERATOR 1 = (int2, int8),
+    OPERATOR 1 = (int4, int2),
+    OPERATOR 1 = (int4, int8),
+    OPERATOR 1 = (int8, int2),
+    OPERATOR 1 = (int8, int4);
+
 CREATE OPERATOR CLASS vector_l2_ops
     FOR TYPE vector USING vchordg FAMILY vector_l2_ops AS
     OPERATOR 1 <-> (vector, vector) FOR ORDER BY float_ops,
@@ -1419,3 +1535,4 @@ FROM
     ) AS index_oids
 CROSS JOIN LATERAL vchordrq_sampled_queries(index_oids.oid::regclass) AS record;
 /* </end connected objects> */
+

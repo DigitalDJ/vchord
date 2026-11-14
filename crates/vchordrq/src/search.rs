@@ -7,9 +7,10 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2};
+use crate::keys::{Columns, KeyFilter};
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::tape::{by_directory, by_next};
+use crate::tape::{Filter, by_directory, by_next};
 use crate::tuples::*;
 use crate::{Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
@@ -68,6 +69,8 @@ pub struct SearchParams {
     /// Center residual estimates on the query's projection on each list's
     /// centroid ([`Operator::residual`]).
     pub projected_centering: bool,
+    /// Read only the rows whose filter keys it selects (`crate::keys`).
+    pub filter: Option<KeyFilter>,
 }
 
 /// One search of an index for a vector `V` (an `O::Vector`, owned or shared):
@@ -285,12 +288,15 @@ where
         }
     }
 
-    /// Reads the rows of `list`: its frozen tape, then its appendable tape.
-    /// Returns how many rows the list holds.
+    /// Reads the rows of `list` that `filter` selects: its frozen tape, then
+    /// its appendable tape. Returns how many rows the list holds. Inlined, so
+    /// that the callback is too: its per-row work is most of a scan's.
+    #[inline(always)]
     fn read_list(
         &mut self,
         (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location)): List<'b>,
-        mut callback: impl for<'a> FnMut((f32, f32), u16, NonZero<u64>, &'a [u32]),
+        filter: impl Filter,
+        mut callback: impl for<'a> FnMut((f32, f32), u16, NonZero<u64>, &'a [u32], Columns<'a>),
     ) -> u64 {
         let Self {
             index,
@@ -338,31 +344,35 @@ where
             tape::read_frozen_tape::<R, _, _>(
                 by_directory(prefetch_h0_tuples, directory),
                 block_access,
+                filter,
                 &mut callback,
             );
         } else {
             tape::read_frozen_tape::<R, _, _>(
                 by_next(index, jump_tuple.frozen_first()),
                 block_access,
+                filter,
                 &mut callback,
             );
         }
         tape::read_appendable_tape::<R, _>(
             by_next(index, jump_tuple.appendable_first()),
             O::binary_access(&lut.1, residual),
+            filter,
             &mut callback,
         );
         jump_tuple.tuples()
     }
 
-    /// The candidates in `lists`.
-    fn read(&mut self, lists: Vec<List<'b>>) -> Vec<Candidate<'b>> {
+    /// The candidates in `lists` that `filter` selects.
+    fn read(&mut self, lists: Vec<List<'b>>, filter: impl Filter) -> Vec<Candidate<'b>> {
         let (bump, epsilon) = (self.bump, self.epsilon);
         let mut results = LinkedVec::new();
         for list in lists {
             self.read_list(
                 list,
-                id_2(|(rough, err), head, payload, prefetch| {
+                filter,
+                id_2(|(rough, err), head, payload, prefetch, _| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
                         (Reverse(lowerbound), AlwaysEqual(())),
@@ -442,7 +452,11 @@ where
         prefetch_h0_tuples,
     );
     let Route { lists, .. } = searcher.route(&params.probes, false);
-    Candidates::new(searcher.read(lists), bound)
+    let results = match &params.filter {
+        None => searcher.read(lists, ()),
+        Some(filter) => searcher.read(lists, filter),
+    };
+    Candidates::new(results, bound)
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
@@ -471,7 +485,8 @@ where
     for list in lists {
         let tuples = searcher.read_list(
             list,
-            id_2(|(rough, err), head, payload, prefetch| {
+            (),
+            id_2(|(rough, err), head, payload, prefetch, _| {
                 let lowerbound = Distance::from_f32(rough - err * epsilon);
                 let rough = Distance::from_f32(rough);
                 results.push((

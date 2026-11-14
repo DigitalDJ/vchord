@@ -1,0 +1,353 @@
+# Filter key columns: every key column after the vector, each stored in the
+# bytes its operator class's `bytes` parameter asks for, 2 by default: the key
+# itself when its type has that size, a hash of it in fewer bytes. Every check
+# compares the index scan's full stream (all lists probed, no LIMIT) as a set
+# with the heap rows that satisfy the condition. On PostgreSQL 14-16 the
+# planner keeps `= ANY` on a later index column out of ordered scans, so there
+# it stays a Filter: correct, not filtered.
+
+statement ok
+CREATE TABLE fc (id int PRIMARY KEY, u uuid NOT NULL, un uuid, i2 int2, i4 int4 NOT NULL, i8 int8, v vector(3));
+
+statement ok
+INSERT INTO fc SELECT i,
+  ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid,
+  CASE WHEN i % 100 = 0 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad((i % 7)::text, 12, '0'))::uuid END,
+  CASE WHEN i % 100 = 1 THEN NULL ELSE (i % 301 - 150)::int2 END,
+  i % 1000,
+  CASE WHEN i % 100 = 2 THEN NULL ELSE (i % 37)::int8 * 1000000000000 END,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector
+FROM generate_series(1, 20000) i;
+
+# parameters: 2, 4, 8 or 16 bytes, at most the type's size
+statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+
+statement error value 4 out of bounds for option "bytes"
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops, i2 int2_ops (bytes = 4));
+
+statement error value 8 out of bounds for option "bytes"
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops, i4 int4_ops (bytes = 8));
+
+statement error value 32 out of bounds for option "bytes"
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 32));
+
+statement error unrecognized parameter "width"
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops, u uuid_ops (width = 4));
+
+statement error vector_l2_ops has no options
+CREATE INDEX ON fc USING vchordrq (v vector_l2_ops (bytes = 4), u);
+
+# the parameters are checked as they are parsed, before anything is created
+statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
+CREATE INDEX CONCURRENTLY fc_bad ON fc USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+
+query I
+SELECT count(*) FROM pg_class WHERE relname = 'fc_bad';
+----
+0
+
+# A block keeps the keys of its 32 rows on one page: at 3 dimensions, a row
+# may have 220 bytes of keys, 13 uuids stored whole but not 14
+statement ok
+CREATE TABLE fw (id int, v vector(3), k1 uuid, k2 uuid, k3 uuid, k4 uuid, k5 uuid, k6 uuid, k7 uuid,
+  k8 uuid, k9 uuid, k10 uuid, k11 uuid, k12 uuid, k13 uuid, k14 uuid);
+
+statement ok
+INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
+FROM generate_series(1, 20) i;
+
+statement error filter keys of 224 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
+CREATE INDEX ON fw USING vchordrq (v vector_l2_ops, k1 uuid_ops (bytes = 16), k2 uuid_ops (bytes = 16),
+  k3 uuid_ops (bytes = 16), k4 uuid_ops (bytes = 16), k5 uuid_ops (bytes = 16), k6 uuid_ops (bytes = 16),
+  k7 uuid_ops (bytes = 16), k8 uuid_ops (bytes = 16), k9 uuid_ops (bytes = 16), k10 uuid_ops (bytes = 16),
+  k11 uuid_ops (bytes = 16), k12 uuid_ops (bytes = 16), k13 uuid_ops (bytes = 16), k14 uuid_ops (bytes = 16));
+
+statement ok
+CREATE INDEX fw_13 ON fw USING vchordrq (v vector_l2_ops, k13 uuid_ops (bytes = 16), k2 uuid_ops (bytes = 16),
+  k3 uuid_ops (bytes = 16), k4 uuid_ops (bytes = 16), k5 uuid_ops (bytes = 16), k6 uuid_ops (bytes = 16),
+  k7 uuid_ops (bytes = 16), k8 uuid_ops (bytes = 16), k9 uuid_ops (bytes = 16), k10 uuid_ops (bytes = 16),
+  k11 uuid_ops (bytes = 16), k12 uuid_ops (bytes = 16), k1 uuid_ops (bytes = 16));
+
+# grown past a block a list, and VACUUM writes blocks with the keys
+statement ok
+INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
+FROM generate_series(21, 2000) i;
+
+statement ok
+VACUUM fw;
+
+statement ok
+SET enable_seqscan = off;
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fw WHERE k13 = '00000000-0000-0000-0000-000000000004')
+FROM (SELECT id FROM fw WHERE k13 = '00000000-0000-0000-0000-000000000004' ORDER BY v <-> '[1,2,3]') s;
+----
+t
+
+statement ok
+DROP TABLE fw;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '16';
+
+statement ok
+CREATE FUNCTION fc_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[];
+BEGIN
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fc WHERE %s '
+    'ORDER BY v <-> ''[0.5,0.5,0.5]'') s', cond) INTO a;
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM fc WHERE (%s) IS TRUE', cond) INTO b;
+  RETURN a IS NOT DISTINCT FROM b;
+END
+$$;
+
+# The rows that the index returns and that its recheck removes, for an
+# ordered scan with `cond`; the index must be used.
+statement ok
+CREATE FUNCTION fc_recheck(cond text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json; node json;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, FORMAT JSON) SELECT id FROM fc '
+    'WHERE %s ORDER BY v <-> ''[0.5,0.5,0.5]''', cond) INTO plan;
+  node := plan -> 0 -> 'Plan';
+  WHILE node ->> 'Node Type' <> 'Index Scan' LOOP
+    node := node -> 'Plans' -> 0;
+  END LOOP;
+  RETURN (node ->> 'Actual Rows')::numeric::int || ' returned, '
+    || coalesce((node ->> 'Rows Removed by Index Recheck')::int, 0) || ' removed by the recheck';
+END
+$$;
+
+statement ok
+CREATE FUNCTION fc_subsets(conds text[]) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE n int := array_length(conds, 1); m int; cond text; bad text := '';
+BEGIN
+  FOR m IN 1..(1 << n) - 1 LOOP
+    SELECT string_agg(conds[i], ' AND ') INTO cond FROM generate_series(1, n) i WHERE m >> (i - 1) & 1 = 1;
+    IF NOT fc_same(cond) THEN
+      bad := bad || cond || E'\n';
+    END IF;
+  END LOOP;
+  RETURN coalesce(nullif(bad, ''), 'all equal');
+END
+$$;
+
+# three keys stored whole (16, 4 and 2 bytes): exact
+statement ok
+CREATE INDEX fc_whole ON fc USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 16), i4 int4_ops (bytes = 4), i2) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+query T
+SELECT pg_get_indexdef('fc_whole'::regclass) LIKE '%(v vector_l2_ops, u uuid_ops (bytes=''16''), i4 int4_ops (bytes=''4''), i2)%';
+----
+t
+
+query T
+SELECT fc_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = 207', 'i2 = 57']);
+----
+all equal
+
+query T
+SELECT fc_subsets(ARRAY['u = ANY(''{00000000-0000-0000-0000-000000000007,00000000-0000-0000-0000-000000000008}'')', 'i4 = ANY(''{207,208,1207}'')', 'i2 = ANY(''{57,-93,58}'')']);
+----
+all equal
+
+# Keys stored whole need no recheck: a stored key is the key, except that a
+# NULL is stored as zeros, the form of the least integer and of the nil uuid,
+# which alone the scan rechecks; whatever the column's NOT NULL
+query T
+SELECT fc_recheck('u = ''00000000-0000-0000-0000-000000000007'' AND i4 = 207');
+----
+20 returned, 0 removed by the recheck
+
+# i2 has NULLs
+query T
+SELECT fc_recheck('i2 = 57') || ', ' || fc_same('i2 = 57');
+----
+66 returned, 0 removed by the recheck, true
+
+query T
+SELECT fc_same('i2 = -32768');
+----
+t
+
+query T
+SELECT fc_recheck('i2 = -32768');
+----
+0 returned, 200 removed by the recheck
+
+# an int8 constant out of the range of an int4 key stored whole matches nothing
+query T
+SELECT fc_same('i4 = 4294967503::int8');
+----
+t
+
+query T
+SELECT fc_recheck('i4 = 4294967503::int8');
+----
+0 returned, 0 removed by the recheck
+
+query T
+SELECT fc_same('i4 = 207::int8 AND i2 = 57::int4');
+----
+t
+
+query T
+SELECT fc_same('i2 = 70000');
+----
+t
+
+# a NULL constant matches nothing
+query T
+SELECT fc_same('i4 = NULL');
+----
+t
+
+# sets of every size, on a key of 4 bytes and on one of 16
+query T
+SELECT string_agg(n::text, ',' ORDER BY n) FROM unnest(ARRAY[1, 10, 33, 200, 5000]) n
+WHERE fc_same(format('i4 = ANY(ARRAY(SELECT x FROM generate_series(0, %s, 2) x))', 2 * n - 2))
+  AND fc_same(format('u = ANY(ARRAY(SELECT (''00000000-0000-0000-0000-'' || lpad((x * 3)::text, 12, ''0''))::uuid FROM generate_series(0, %s) x))', n - 1));
+----
+1,10,33,200,5000
+
+# rows inserted, updated and deleted after the build, before and after VACUUM
+statement ok
+INSERT INTO fc SELECT i, ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid, NULL, NULL, i % 1000, NULL,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector FROM generate_series(20001, 21000) i;
+
+statement ok
+UPDATE fc SET i4 = 5000, i2 = 5 WHERE id % 1000 = 207;
+
+statement ok
+DELETE FROM fc WHERE id % 1000 = 208;
+
+query T
+SELECT fc_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = ANY(''{207,208,5000}'')', 'i2 = 5']);
+----
+all equal
+
+query T
+SELECT fc_recheck('i4 = 5000');
+----
+21 returned, 0 removed by the recheck
+
+statement ok
+VACUUM fc;
+
+query T
+SELECT fc_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = ANY(''{207,208,5000}'')', 'i2 = 5']);
+----
+all equal
+
+# a key that has NULLs since the build: only the zero form is rechecked
+statement ok
+ALTER TABLE fc ALTER COLUMN i4 DROP NOT NULL;
+
+statement ok
+INSERT INTO fc SELECT i, ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid, NULL, NULL, NULL, NULL,
+  ARRAY[0.5, 0.5, 0.5]::real[]::vector FROM generate_series(21001, 21010) i;
+
+query T
+SELECT fc_recheck('i4 = -2147483648');
+----
+0 returned, 10 removed by the recheck
+
+query T
+SELECT fc_recheck('i4 = 5000') || ', ' || fc_same('i4 = 5000') || ', ' || fc_same('i4 = ANY(''{-2147483648,5000}'')');
+----
+21 returned, 0 removed by the recheck, true, true
+
+query T
+SELECT fc_same('u = ''00000000-0000-0000-0000-000000000000''') AND fc_same('i2 = ANY(''{-32768,57}'')');
+----
+t
+
+statement ok
+UPDATE fc SET i4 = id % 1000 WHERE i4 IS NULL;
+
+statement ok
+ALTER TABLE fc ALTER COLUMN i4 SET NOT NULL;
+
+query T
+SELECT fc_recheck('i4 = 5000');
+----
+21 returned, 0 removed by the recheck
+
+statement ok
+REINDEX INDEX fc_whole;
+
+query T
+SELECT fc_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = ANY(''{207,208,5000}'')', 'i2 = 5']);
+----
+all equal
+
+statement ok
+DROP INDEX fc_whole;
+
+# hashed keys of every width, and two 2-byte keys: the first in the payload,
+# the second in the blocks; a recheck removes their collisions
+statement ok
+CREATE INDEX fc_hashed ON fc USING vchordrq (v vector_l2_ops, i8 int8_ops (bytes = 4), un uuid_ops (bytes = 8), i4, u) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+query T
+SELECT fc_subsets(ARRAY['i8 = 7000000000000', 'un = ''00000000-0000-0000-0000-000000000003''', 'i4 = 207', 'u = ''00000000-0000-0000-0000-000000000007''']);
+----
+all equal
+
+query T
+SELECT fc_subsets(ARRAY['i8 = ANY(''{7000000000000,8000000000000}'')', 'un = ANY(''{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000005}'')', 'i4 = ANY(''{207,1}'')']);
+----
+all equal
+
+query T
+SELECT vchordrq_prewarm('fc_hashed') IS NOT NULL;
+----
+t
+
+# 1 and 52973 share a 16-bit hash
+statement ok
+UPDATE fc SET i4 = 52973 WHERE id % 1000 = 1;
+
+query T
+SELECT fc_recheck('i4 = 1');
+----
+0 returned, 22 removed by the recheck
+
+query T
+SELECT fc_same('i4 = 52973 AND i8 IS NULL');
+----
+t
+
+# a NULL key is stored as zeros, and rechecked
+query T
+SELECT fc_same('un = ''00000000-0000-0000-0000-000000000000''');
+----
+t
+
+statement ok
+DROP TABLE fc;
+
+statement ok
+DROP FUNCTION fc_same, fc_recheck, fc_subsets;

@@ -98,8 +98,10 @@ impl SearchBuilder for DefaultBuilder {
         // vchordg does. Only the first non-null sphere around the searched
         // vector (the ORDER BY vector, or the sphere's center when there is
         // none) bounds the search; other spheres, including null ones, are
-        // filtered entirely by the recheck.
-        let recheck = !self.spheres.is_empty();
+        // filtered entirely by the recheck. So are the filter keys that are
+        // hashed, or whose wanted keys include the stored form of a NULL
+        // (`vchordrq::keys::Key::exact`).
+        let recheck = !self.spheres.is_empty() || options.recheck_keys;
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);

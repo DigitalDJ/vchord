@@ -7,6 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
+use crate::keys::Keys;
 use crate::operator::{Operator, Vector};
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
@@ -52,6 +53,7 @@ where
     let dim = meta_tuple.dim();
     let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
+    let keys = Keys::of_meta(meta_tuple);
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -134,24 +136,31 @@ where
             })
         });
 
-        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dim) as _, false);
+        let prefetch = O::Vector::count(dim) as _;
+        let mut tape = FrozenTapeWriter::create(&hooked_index, prefetch, &keys, false);
 
         let mut trace_directory = Vec::new();
         let mut trace_forzen = Vec::new();
         let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
-        let mut callback = id_2(|(code, delta): (_, _), head, payload, prefetch: &[_]| {
-            tape.push(Branch {
-                code,
-                delta,
-                prefetch: prefetch.to_vec(),
-                head,
-                norm: 0.0,
-                extra: payload,
-            });
-            tuples += 1;
-        });
+        let mut row = Vec::new();
+        let mut callback = id_2(
+            |(code, delta): (_, _), head, payload, prefetch: &[_], columns| {
+                let branch = Branch {
+                    code,
+                    delta,
+                    prefetch: prefetch.to_vec(),
+                    head,
+                    norm: 0.0,
+                    extra: payload,
+                };
+                row.clear();
+                columns.extend(&keys, &mut row);
+                tape.push(branch, &row);
+                tuples += 1;
+            },
+        );
         let directory = tape::read_directory_tape::<R>(
             tape::by_next(index, *jump_tuple.directory_first())
                 .inspect(|guard| trace_directory.push(guard.id())),
@@ -186,6 +195,7 @@ where
                     ),
                 )
             },
+            (),
             &mut callback,
         );
         tape::read_appendable_tape::<R, _>(
@@ -210,14 +220,16 @@ where
                     delta,
                 )
             },
+            (),
             &mut callback,
         );
 
-        let (frozen_tape, branches) = tape.into_inner();
+        let (frozen_tape, branches, columns) = tape.into_inner();
 
         let mut appendable_tape = tape::TapeWriter::create(&hooked_index, false);
 
-        for branch in branches {
+        let width = keys.columns();
+        for (i, branch) in branches.into_iter().enumerate() {
             appendable_tape.push(AppendableTuple {
                 metadata: [
                     branch.code.0.dis_u_2,
@@ -230,6 +242,7 @@ where
                 prefetch: branch.prefetch,
                 head: branch.head,
                 payload: Some(branch.extra),
+                columns: columns[i * width..][..width].to_vec(),
             });
         }
 

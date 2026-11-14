@@ -42,4 +42,8 @@ pub struct SearchOptions {
     pub io_search: Io,
     pub io_rerank: Io,
     pub prefilter: bool,
+    /// Whether the rows the filter keys select need a recheck: a key is
+    /// hashed, or its wanted keys include the stored form of a NULL
+    /// (`vchordrq::keys::Key::exact`).
+    pub recheck_keys: bool,
 }

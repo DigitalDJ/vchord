@@ -1,0 +1,696 @@
+# A filter key column: `USING vchordrq (v ..., owner)`. Equality and `= ANY`
+# quals on the second key column are scan keys answered by a 16-bit tag in
+# every index row; the executor rechecks them, so a tag collision costs work,
+# never a row. Most checks compare the index scan's full stream (all lists
+# probed, no LIMIT, so ties cannot move rows across a cut) as a set against the
+# heap; the others compare the distances of a top 10 with an exact search. On PostgreSQL 14-16 the planner keeps `= ANY` on a second index column
+# out of ordered scans, so there it stays a Filter: correct, not filtered.
+
+statement ok
+CREATE TABLE fk (id int PRIMARY KEY, owner uuid, grp int4, note text, v vector(3));
+
+statement ok
+INSERT INTO fk SELECT i,
+  CASE WHEN i % 100 = 0 THEN NULL
+       ELSE ('00000000-0000-0000-0000-' || lpad((i % 10)::text, 12, '0'))::uuid END,
+  i % 7, NULL,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector
+FROM generate_series(1, 30000) i;
+
+# more filter key columns (`filter_keys.slt`)
+statement ok
+CREATE INDEX fk_two ON fk USING vchordrq (v vector_l2_ops, owner, grp);
+
+statement ok
+DROP INDEX fk_two;
+
+# the vector column comes first
+statement error Dimensions type modifier of a vector column is needed
+CREATE INDEX ON fk USING vchordrq (owner, v vector_l2_ops);
+
+statement error has no default operator class for access method
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, note);
+
+statement ok
+CREATE TABLE fk_maxsim (owner uuid, v vector(3)[]);
+
+statement error filter key column with a maxsim operator class is not supported
+CREATE INDEX ON fk_maxsim USING vchordrq (v vector_maxsim_ops, owner);
+
+statement ok
+DROP TABLE fk_maxsim;
+
+statement error does not support included columns
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops) INCLUDE (owner);
+
+statement error unknown operator class of a filter key column
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, v vector_ip_ops);
+
+# a parallel build
+statement ok
+SET max_parallel_maintenance_workers = 2;
+
+statement ok
+ALTER TABLE fk SET (parallel_workers = 2);
+
+statement ok
+CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+ALTER TABLE fk RESET (parallel_workers);
+
+query T
+SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner)%';
+----
+t
+
+# the index depends on both key columns' operator classes
+query I
+SELECT count(*) FROM pg_depend WHERE classid = 'pg_class'::regclass AND objid = 'fk_v'::regclass
+  AND refclassid = 'pg_opclass'::regclass;
+----
+2
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '32';
+
+# filtered stream (index) == heap rows satisfying the condition
+statement ok
+CREATE FUNCTION fk_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[];
+BEGIN
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fk WHERE %s '
+    'ORDER BY v <-> ''[0.5,0.5,0.5]'') s', cond) INTO a;
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM fk WHERE (%s) IS TRUE', cond) INTO b;
+  RETURN a IS NOT DISTINCT FROM b;
+END
+$$;
+
+statement ok
+CREATE FUNCTION fk_plan(q text, with_analyze boolean DEFAULT false) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text; result text := '';
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (COSTS OFF' ||
+    CASE WHEN with_analyze THEN ', ANALYZE, TIMING OFF, SUMMARY OFF' ELSE '' END || ') ' || q LOOP
+    result := result || r || E'\n';
+  END LOOP;
+  RETURN result;
+END
+$$;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000001''');
+----
+t
+
+query T
+SELECT fk_same('''00000000-0000-0000-0000-000000000001'' = owner');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'')');
+----
+t
+
+query T
+SELECT fk_same('owner IN (''00000000-0000-0000-0000-000000000003'', ''00000000-0000-0000-0000-000000000004'')');
+----
+t
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000001'' OR owner = ''00000000-0000-0000-0000-000000000005''');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,NULL}'')');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'')
+  AND owner = ANY(''{00000000-0000-0000-0000-000000000002,00000000-0000-0000-0000-000000000003}'')');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'') AND grp = 3');
+----
+t
+
+query T
+SELECT fk_same('owner <> ALL(''{00000000-0000-0000-0000-000000000001}'')');
+----
+t
+
+# the top 10 at full probes: the same distances as an exact search
+statement ok
+CREATE FUNCTION fk_top(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a real[]; b real[];
+BEGIN
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT v <-> ''[0.3,0.6,0.2]'' AS d FROM fk WHERE %s '
+    'ORDER BY v <-> ''[0.3,0.6,0.2]'' LIMIT 10) s', cond) INTO a;
+  -- no index can produce this order
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT v <-> ''[0.3,0.6,0.2]'' AS d FROM fk WHERE %s '
+    'ORDER BY (v <-> ''[0.3,0.6,0.2]'') + 0 LIMIT 10) s', cond) INTO b;
+  RETURN a = b;
+END
+$$;
+
+query T
+SELECT fk_top('true');
+----
+t
+
+# and the same as filtering above an unfiltered scan of the same index
+statement ok
+CREATE FUNCTION fk_above(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a real[]; b real[];
+BEGIN
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT v <-> ''[0.3,0.6,0.2]'' AS d FROM fk WHERE %s '
+    'ORDER BY v <-> ''[0.3,0.6,0.2]'' LIMIT 10) s', cond) INTO a;
+  EXECUTE format('SELECT array_agg(d) FROM (SELECT d FROM (SELECT fk.*, v <-> ''[0.3,0.6,0.2]'' AS d FROM fk '
+    'ORDER BY v <-> ''[0.3,0.6,0.2]'' OFFSET 0) u WHERE %s LIMIT 10) s', cond) INTO b;
+  RETURN a = b;
+END
+$$;
+
+query T
+SELECT fk_above('owner = ''00000000-0000-0000-0000-000000000004''');
+----
+t
+
+query T
+SELECT fk_above('owner = ANY(''{00000000-0000-0000-0000-000000000004,00000000-0000-0000-0000-000000000008}'')');
+----
+t
+
+query T
+SELECT fk_top('owner = ''00000000-0000-0000-0000-000000000004''');
+----
+t
+
+query T
+SELECT fk_top('owner = ANY(''{00000000-0000-0000-0000-000000000004,00000000-0000-0000-0000-000000000008}'')');
+----
+t
+
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner = ANY('{}') ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner = ANY(NULL::uuid[]) ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+0
+
+# NULL owners are indexed (tag 0) but never match a key; IS NULL is a Filter
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner IS NULL ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+300
+
+query I
+SELECT count(*) FROM (SELECT id, owner FROM fk WHERE owner = ANY(ARRAY(SELECT DISTINCT owner FROM fk WHERE owner IS NOT NULL))
+  ORDER BY v <-> '[0.5,0.5,0.5]') s WHERE owner IS NULL;
+----
+0
+
+# plans: a scalar key is an Index Cond on every version
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001'' ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (owner = %Order By:%';
+----
+t
+
+skipif pg14
+skipif pg15
+skipif pg16
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ANY(''{00000000-0000-0000-0000-000000000001}'') ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (owner = ANY %Order By:%';
+----
+t
+
+onlyif pg14
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ANY(''{00000000-0000-0000-0000-000000000001}'') ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Order By:%Filter: (owner = ANY %';
+----
+t
+
+onlyif pg15
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ANY(''{00000000-0000-0000-0000-000000000001}'') ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Order By:%Filter: (owner = ANY %';
+----
+t
+
+onlyif pg16
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ANY(''{00000000-0000-0000-0000-000000000001}'') ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Order By:%Filter: (owner = ANY %';
+----
+t
+
+# PostgreSQL 18 turns an OR of equalities into = ANY during index matching
+skipif pg14
+skipif pg15
+skipif pg16
+skipif pg17
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001'' OR owner = ''00000000-0000-0000-0000-000000000002'' ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (owner = ANY %';
+----
+t
+
+# <> ALL is never handed to the index
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner <> ALL(''{00000000-0000-0000-0000-000000000001}'') ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Filter: (owner <> ALL %';
+----
+t
+
+# a filter key alone cannot drive a vector search: never a vchordrq path
+query T
+SELECT fk_plan('SELECT count(*) FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001''') LIKE '%fk_v%';
+----
+f
+
+query I
+SELECT count(*) FROM fk WHERE owner = '00000000-0000-0000-0000-000000000001';
+----
+3000
+
+# generic plan: the key is a run-time key
+statement ok
+PREPARE fkp(uuid[]) AS SELECT
+  (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fk WHERE owner = ANY($1) ORDER BY v <-> '[0.5,0.5,0.5]') s)
+  = (SELECT array_agg(id ORDER BY id) FROM fk WHERE owner = ANY($1));
+
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+query T
+EXECUTE fkp('{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000004}');
+----
+t
+
+query T
+EXECUTE fkp('{00000000-0000-0000-0000-000000000006}');
+----
+t
+
+skipif pg14
+skipif pg15
+skipif pg16
+query T
+SELECT fk_plan('EXECUTE fkp(''{00000000-0000-0000-0000-000000000006}'')') LIKE '%Index Cond: (owner = ANY ($1))%';
+----
+t
+
+statement ok
+RESET plan_cache_mode;
+
+statement ok
+DEALLOCATE fkp;
+
+# nested loop: the inner scan is rescanned with each outer owner
+query T
+SELECT fk_plan('SELECT s.id FROM (VALUES (''00000000-0000-0000-0000-000000000001''::uuid), (''00000000-0000-0000-0000-000000000002''::uuid)) o(owner)
+  CROSS JOIN LATERAL (SELECT id FROM fk WHERE fk.owner = o.owner ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 20) s') LIKE '%Nested Loop%Index Scan using fk_v%Index Cond: (owner = %';
+----
+t
+
+query T
+SELECT (SELECT array_agg(id ORDER BY id) FROM (VALUES ('00000000-0000-0000-0000-000000000001'::uuid), ('00000000-0000-0000-0000-000000000002'::uuid)) o(owner)
+  CROSS JOIN LATERAL (SELECT id FROM fk WHERE fk.owner = o.owner ORDER BY v <-> '[0.5,0.5,0.5]') s)
+  = (SELECT array_agg(id ORDER BY id) FROM fk WHERE owner IN ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002'));
+----
+t
+
+# a collision: 00000000-0000-0000-0000-0000000145ce has the same tag as ...0001
+# (crates/vchordrq/src/keys.rs, `collision`); its rows pass the tag test and
+# the executor's recheck removes them
+statement ok
+INSERT INTO fk SELECT 100000 + id, '00000000-0000-0000-0000-0000000145ce', grp, NULL, v FROM fk WHERE id <= 300;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000001''');
+----
+t
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-0000000145ce''');
+----
+t
+
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001'' ORDER BY v <-> ''[0.5,0.5,0.5]''', true)
+  LIKE '%Rows Removed by Index Recheck: 300%';
+----
+t
+
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000002'' ORDER BY v <-> ''[0.5,0.5,0.5]''', true)
+  LIKE '%Rows Removed by Index Recheck%';
+----
+f
+
+# inserts (appendable tape), deletes and vacuum
+statement ok
+INSERT INTO fk SELECT 200000 + i, CASE WHEN i % 2 = 0 THEN '00000000-0000-0000-0000-0000000000aa'::uuid ELSE NULL END, i % 7, NULL,
+  ARRAY[(i % 13) / 13.0, (i % 11) / 11.0, (i % 7) / 7.0]::real[]::vector FROM generate_series(1, 2000) i;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-0000000000aa''');
+----
+t
+
+statement ok
+DELETE FROM fk WHERE id % 10 = 3;
+
+statement ok
+VACUUM fk;
+
+statement ok
+INSERT INTO fk SELECT 300000 + id, '00000000-0000-0000-0000-0000000000aa', grp, NULL, v FROM fk WHERE id < 500;
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-000000000007}'')');
+----
+t
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000007''');
+----
+t
+
+# arrays of spheres on the vector column are scan keys too, rechecked
+query T
+SELECT fk_same('v <<->> ANY(ARRAY[sphere(''[0,0,0]''::vector, 0.5), sphere(''[1,1,1]''::vector, 0.5)])');
+----
+t
+
+query T
+SELECT fk_same('v <<->> sphere(''[0,0,0]''::vector, 0.5) OR v <<->> sphere(''[1,1,1]''::vector, 0.5)');
+----
+t
+
+query T
+SELECT fk_plan('SELECT count(*) FROM fk WHERE v <<->> ANY(ARRAY[sphere(''[0,0,0]''::vector, 0.5)])') LIKE '%fk_v%';
+----
+f
+
+# with an ORDER BY, an array of spheres is an Index Cond and rechecked, so the
+# prefilter (which evaluates the Filter) no longer sees it
+skipif pg14
+skipif pg15
+skipif pg16
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE v <<->> ANY(ARRAY[sphere(''[0,0,0]''::vector, 0.5)]) ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (v <<->> ANY %';
+----
+t
+
+# more than 32 tags (8 on aarch64) take the bitmap; a run-time array
+query T
+SELECT fk_same('owner = ANY(ARRAY(SELECT (''00000000-0000-0000-0000-'' || lpad(i::text, 12, ''0''))::uuid FROM generate_series(1, 80) i WHERE i % 3 <> 0))');
+----
+t
+
+query T
+SELECT fk_top('owner = ANY(ARRAY(SELECT (''00000000-0000-0000-0000-'' || lpad(i::text, 12, ''0''))::uuid FROM generate_series(4, 60) i))');
+----
+t
+
+# the prefilter evaluates the other quals before the rerank
+statement ok
+SET vchordrq.prefilter = on;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000003'' AND grp = 3');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-0000000000aa}'') AND id % 2 = 0');
+----
+t
+
+query T
+SELECT fk_same('v <<->> ANY(ARRAY[sphere(''[0,0,0]''::vector, 0.5), sphere(''[1,1,1]''::vector, 0.5)]) AND owner = ''00000000-0000-0000-0000-000000000001''');
+----
+t
+
+query T
+SELECT fk_top('owner = ''00000000-0000-0000-0000-000000000004'' AND grp <> 2');
+----
+t
+
+statement ok
+RESET vchordrq.prefilter;
+
+# max_scan_tuples caps the rows the scan returns; all of them match
+statement ok
+SET vchordrq.max_scan_tuples = 50;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE owner = '00000000-0000-0000-0000-000000000004')
+FROM (SELECT owner FROM fk WHERE owner = '00000000-0000-0000-0000-000000000004' ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+50 50
+
+statement ok
+RESET vchordrq.max_scan_tuples;
+
+# vectors reranked from the table
+statement ok
+CREATE INDEX fk_rt ON fk USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+rerank_in_table = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'')');
+----
+t
+
+query T
+SELECT fk_top('owner = ''00000000-0000-0000-0000-000000000004''');
+----
+t
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP INDEX fk_rt;
+
+# default planner settings: for a selective owner the planner prefers the
+# filtered vector scan to a btree on the owner and a sort
+statement ok
+CREATE INDEX fk_owner ON fk (owner);
+
+statement ok
+ANALYZE fk;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000004'' ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Scan using fk_v on fk%Index Cond: (owner = %';
+----
+t
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+DROP INDEX fk_owner;
+
+# integer key columns: int2, int4 and int8 share one family with cross-type
+# equality; a sequential build
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+CREATE INDEX fk_g ON fk USING vchordrq (v vector_l2_ops, grp) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('grp = ANY(''{1,2}''::int8[])');
+----
+t
+
+query T
+SELECT fk_same('grp = 3::int2');
+----
+t
+
+# negative keys, across widths
+statement ok
+INSERT INTO fk SELECT 500000 + id, owner, CASE WHEN id % 2 = 0 THEN -5 ELSE -32768 END, NULL, v FROM fk WHERE id <= 200;
+
+query T
+SELECT fk_same('grp = -5::int2');
+----
+t
+
+query T
+SELECT fk_same('grp = -32768');
+----
+t
+
+query T
+SELECT fk_same('grp = ANY(''{-32768,-5,4}''::int8[])');
+----
+t
+
+query T
+SELECT fk_same('grp = -5::int8 AND grp = ANY(''{-5,-32768}''::int2[])');
+----
+t
+
+# 52973 has the same tag as 1 (crates/vchordrq/src/keys.rs, `collision`)
+statement ok
+INSERT INTO fk SELECT 400000 + id, owner, 52973, NULL, v FROM fk WHERE id <= 100;
+
+query T
+SELECT fk_same('grp = 1');
+----
+t
+
+query T
+SELECT fk_same('grp = 52973::int8');
+----
+t
+
+query T
+SELECT fk_top('grp = 1');
+----
+t
+
+skipif pg14
+skipif pg15
+skipif pg16
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE grp = ANY(''{1,2}''::int8[]) ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (grp = ANY %';
+----
+t
+
+statement ok
+ROLLBACK;
+
+# a type change that changes the operator class rebuilds the index
+statement ok
+ALTER TABLE fk ALTER COLUMN grp TYPE int8;
+
+query T
+SELECT o.opcname FROM pg_index i JOIN pg_opclass o ON o.oid = i.indclass[1] WHERE i.indexrelid = 'fk_g'::regclass;
+----
+int8_ops
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('grp = ANY(''{1,2}''::int4[])');
+----
+t
+
+statement ok
+ROLLBACK;
+
+statement error has no default operator class for access method
+ALTER TABLE fk ALTER COLUMN owner TYPE text USING owner::text;
+
+statement ok
+DROP TABLE fk;
+
+# a block of 4096-dimensional codes spans several tuples; a block without a
+# selected row is skipped with the parts of it read so far
+statement ok
+CREATE TABLE fk_wide (id int, owner int8, v vector(4096));
+
+statement ok
+INSERT INTO fk_wide SELECT i, i / 100,
+  (SELECT array_agg(sin(i * 0.1 + j))::real[]::vector FROM generate_series(1, 4096) j)
+FROM generate_series(0, 299) i;
+
+statement ok
+CREATE INDEX ON fk_wide USING vchordrq (v vector_l2_ops, owner);
+
+statement ok
+SET vchordrq.probes = '';
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fk_wide WHERE owner = 1)
+FROM (SELECT id FROM fk_wide WHERE owner = 1 ORDER BY v <-> (SELECT v FROM fk_wide WHERE id = 150)) s;
+----
+t
+
+query I
+SELECT id FROM fk_wide WHERE owner = 2 ORDER BY v <-> (SELECT v FROM fk_wide WHERE id = 250) LIMIT 1;
+----
+250
+
+statement ok
+DROP TABLE fk_wide;
+
+statement ok
+DROP FUNCTION fk_same, fk_plan, fk_top, fk_above;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET vchordrq.probes;

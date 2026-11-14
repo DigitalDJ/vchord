@@ -25,10 +25,11 @@ where
     f
 }
 
+/// A callback of a tape reader (`crate::tape`).
 #[inline(always)]
 pub fn id_2<F, A: ?Sized, B: ?Sized, C: ?Sized, D: ?Sized, R: ?Sized>(f: F) -> F
 where
-    F: for<'a> FnMut(A, B, C, &'a D) -> R,
+    F: for<'a> FnMut(A, B, C, &'a D, crate::keys::Columns<'a>) -> R,
 {
     f
 }
