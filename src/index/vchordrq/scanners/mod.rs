@@ -6,6 +6,25 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+/// Calls `$search` with `$args` and then the prefetchers of vectors and of
+/// tuples that `$io` asks for.
+macro_rules! prefetched {
+    ($index:expr, $io:expr, $search:path, ($($args:expr),* $(,)?)) => {{
+        use $crate::index::scanners::Io;
+        use $crate::index::vchordrq::dispatch::*;
+        let index = $index;
+        let vectors = MakeH1PlainPrefetcher { index };
+        match $io {
+            Io::Plain => $search($($args,)* vectors, MakeH0PlainPrefetcher { index }),
+            Io::Simple => $search($($args,)* vectors, MakeH0SimplePrefetcher { index }),
+            Io::Stream => {
+                let hints = ::index::relation::Hints::default().full(true);
+                $search($($args,)* vectors, MakeH0StreamPrefetcher { index, hints })
+            }
+        }
+    }};
+}
+
 mod default;
 mod maxsim;
 
@@ -16,8 +35,7 @@ pub use maxsim::MaxsimBuilder;
 
 #[derive(Debug)]
 pub struct SearchOptions {
-    pub epsilon: f32,
-    pub probes: Vec<u32>,
+    pub search: vchordrq::SearchParams,
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,

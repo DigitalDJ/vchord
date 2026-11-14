@@ -102,15 +102,7 @@ impl SearchBuilder for MaxsimBuilder {
             pgrx::error!("maxsim search with rerank_in_table is not supported");
         }
         assert!(matches!(opfamily.distance_kind(), DistanceKind::Dot));
-        let search_hints = Hints::default().full(true);
         let rerank_hints = Hints::default().full(false);
-        let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
-        let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-        let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
-        let make_h0_stream_prefetcher = MakeH0StreamPrefetcher {
-            index,
-            hints: search_hints,
-        };
         let n = vectors.len();
         let accu_map = |(Reverse(distance), AlwaysEqual(payload))| (distance, payload);
         let rough_map =
@@ -136,38 +128,18 @@ impl SearchBuilder for MaxsimBuilder {
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
-                    let (results, estimation_by_threshold) = match options.io_search {
-                        Io::Plain => maxsim_search::<_, Op>(
+                    let (results, estimation_by_threshold) = prefetched!(
+                        index,
+                        options.io_search,
+                        maxsim_search::<_, Op>,
+                        (
                             index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
+                            &projected[i],
+                            &options.search,
                             maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_plain_prefetcher.clone(),
-                        ),
-                        Io::Simple => maxsim_search::<_, Op>(
-                            index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_simple_prefetcher.clone(),
-                        ),
-                        Io::Stream => maxsim_search::<_, Op>(
-                            index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_stream_prefetcher.clone(),
-                        ),
-                    };
+                            bump
+                        )
+                    );
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                     if maxsim_refine != 0 && !results.is_empty() {
                         let sequence = Heap::from(results);
@@ -280,38 +252,18 @@ impl SearchBuilder for MaxsimBuilder {
                     .map(|vector| RandomProject::project(vector.as_borrowed()))
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
-                    let (results, estimation_by_threshold) = match options.io_search {
-                        Io::Plain => maxsim_search::<_, Op>(
+                    let (results, estimation_by_threshold) = prefetched!(
+                        index,
+                        options.io_search,
+                        maxsim_search::<_, Op>,
+                        (
                             index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
+                            &projected[i],
+                            &options.search,
                             maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_plain_prefetcher.clone(),
-                        ),
-                        Io::Simple => maxsim_search::<_, Op>(
-                            index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_simple_prefetcher.clone(),
-                        ),
-                        Io::Stream => maxsim_search::<_, Op>(
-                            index,
-                            projected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_stream_prefetcher.clone(),
-                        ),
-                    };
+                            bump
+                        )
+                    );
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                     if maxsim_refine != 0 && !results.is_empty() {
                         let sequence = Heap::from(results);
@@ -420,38 +372,18 @@ impl SearchBuilder for MaxsimBuilder {
                     })
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
-                    let (results, estimation_by_threshold) = match options.io_search {
-                        Io::Plain => maxsim_search::<_, Op>(
+                    let (results, estimation_by_threshold) = prefetched!(
+                        index,
+                        options.io_search,
+                        maxsim_search::<_, Op>,
+                        (
                             index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
+                            &unprojected[i],
+                            &options.search,
                             maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_plain_prefetcher.clone(),
-                        ),
-                        Io::Simple => maxsim_search::<_, Op>(
-                            index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_simple_prefetcher.clone(),
-                        ),
-                        Io::Stream => maxsim_search::<_, Op>(
-                            index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_stream_prefetcher.clone(),
-                        ),
-                    };
+                            bump
+                        )
+                    );
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                     if maxsim_refine != 0 && !results.is_empty() {
                         let sequence = Heap::from(results);
@@ -560,38 +492,18 @@ impl SearchBuilder for MaxsimBuilder {
                     })
                     .collect::<Vec<_>>();
                 Box::new((0..n).map(move |i| {
-                    let (results, estimation_by_threshold) = match options.io_search {
-                        Io::Plain => maxsim_search::<_, Op>(
+                    let (results, estimation_by_threshold) = prefetched!(
+                        index,
+                        options.io_search,
+                        maxsim_search::<_, Op>,
+                        (
                             index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
+                            &unprojected[i],
+                            &options.search,
                             maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_plain_prefetcher.clone(),
-                        ),
-                        Io::Simple => maxsim_search::<_, Op>(
-                            index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_simple_prefetcher.clone(),
-                        ),
-                        Io::Stream => maxsim_search::<_, Op>(
-                            index,
-                            unprojected[i].as_borrowed(),
-                            options.probes.clone(),
-                            options.epsilon,
-                            maxsim_threshold,
-                            bump,
-                            make_h1_plain_prefetcher.clone(),
-                            make_h0_stream_prefetcher.clone(),
-                        ),
-                    };
+                            bump
+                        )
+                    );
                     let (mut accu_set, mut rough_set) = (Vec::new(), Vec::new());
                     if maxsim_refine != 0 && !results.is_empty() {
                         let sequence = Heap::from(results);

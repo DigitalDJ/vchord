@@ -25,7 +25,7 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use vchordrq::InsertChooser;
+use vchordrq::{InsertChooser, SearchParams};
 
 #[repr(C)]
 pub struct Reloption {
@@ -629,8 +629,10 @@ pub unsafe extern "C-unwind" fn amrescan(
             }
         }
         let options = SearchOptions {
-            epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
-            probes,
+            search: SearchParams {
+                probes,
+                epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
+            },
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),

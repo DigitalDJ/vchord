@@ -72,6 +72,27 @@ fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
     }
 }
 
+/// What the residual estimates of one list's rows need, computed once per
+/// list from its centroid `c`.
+#[derive(Debug, Clone, Copy)]
+pub struct Residual {
+    /// The centroid's term of the distance: `|q - c|^2` for L2, `-<q, c>` for
+    /// a dot product.
+    pub dis_f: f32,
+    /// The norm of the query's residual, which bounds the error.
+    pub norm: f32,
+}
+
+impl Residual {
+    /// For L2, from `dis_f = |q - c|^2`.
+    pub fn l2(dis_f: f32) -> Self {
+        Self {
+            dis_f,
+            norm: dis_f.sqrt(),
+        }
+    }
+}
+
 pub type Code = (CodeMetadata, Vec<bool>);
 
 /// Computes the RaBitQ factors of a vector.
@@ -246,12 +267,12 @@ pub mod binary {
             k,
             qvector_sum,
         }: BinaryLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
-        let rough = dis_u_2 + dis_f - 2.0 * e * factor_ip + delta;
-        let err = 2.0 * factor_err * dis_f.sqrt();
+        let rough = dis_u_2 + residual.dis_f - 2.0 * e * factor_ip + delta;
+        let err = 2.0 * factor_err * residual.norm;
         (rough, err)
     }
 
@@ -287,18 +308,17 @@ pub mod binary {
             factor_err,
         }: CodeMetadata,
         BinaryLutMetadata {
-            dis_v_2,
+            dis_v_2: _,
             b,
             k,
             qvector_sum,
         }: BinaryLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
-        norm: f32,
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
-        let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
+        let rough = -e * factor_ip + residual.dis_f + delta;
+        let err = factor_err * residual.norm;
         (rough, err)
     }
 
@@ -331,6 +351,16 @@ pub mod block {
     }
 
     pub type BlockLut = (BlockLutMetadata, Vec<[u8; 16]>);
+
+    impl super::Residual {
+        /// For a dot product, from `dis_f = -<q, c>` and `norm = |c|`.
+        pub fn dot((metadata, _): &BlockLut, dis_f: f32, norm: f32) -> Self {
+            Self {
+                dis_f,
+                norm: super::residual_norm(metadata.dis_v_2, norm, dis_f),
+            }
+        }
+    }
     pub type BlockCode<'a> = (
         &'a [f32; 32],
         &'a [f32; 32],
@@ -437,12 +467,12 @@ pub mod block {
             factor_err,
         }: CodeMetadata,
         BlockLutMetadata { dis_v_2: _, k, c }: BlockLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
-        let rough = dis_u_2 + dis_f - 2.0 * e * factor_ip + delta;
-        let err = 2.0 * factor_err * dis_f.sqrt();
+        let rough = dis_u_2 + residual.dis_f - 2.0 * e * factor_ip + delta;
+        let err = 2.0 * factor_err * residual.norm;
         (rough, err)
     }
 
@@ -472,14 +502,13 @@ pub mod block {
             factor_ip,
             factor_err,
         }: CodeMetadata,
-        BlockLutMetadata { dis_v_2, k, c }: BlockLutMetadata,
-        dis_f: f32,
+        BlockLutMetadata { dis_v_2: _, k, c }: BlockLutMetadata,
+        residual: super::Residual,
         delta: f32,
-        norm: f32,
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
-        let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
+        let rough = -e * factor_ip + residual.dis_f + delta;
+        let err = factor_err * residual.norm;
         (rough, err)
     }
 
@@ -672,7 +701,8 @@ mod tests {
             let (metadata, elements) = code(&residual);
             let lut = binary::preprocess(&query);
             let sum = binary::accumulate(&binary::pack_code(&elements), &lut.1);
-            let (rough, err) = binary::half_process_l2s_residual(sum, metadata, lut.0, dis_f, 0.0);
+            let (rough, err) =
+                binary::half_process_l2s_residual(sum, metadata, lut.0, Residual::l2(dis_f), 0.0);
             assert_eq!((rough, err), (dis_f, 0.0));
         }
     }
