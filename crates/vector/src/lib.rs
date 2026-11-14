@@ -6,7 +6,6 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-pub mod bvect;
 pub mod rabitq4;
 pub mod rabitq8;
 pub mod vect;
