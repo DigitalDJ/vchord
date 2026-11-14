@@ -354,6 +354,17 @@ pub struct Candidates<'b> {
     heap: Heap<Candidate<'b>>,
 }
 
+impl<'b> Candidates<'b> {
+    fn new(mut results: Vec<Candidate<'b>>, bound: Option<Distance>) -> Self {
+        if let Some(bound) = bound {
+            results.retain(|((Reverse(lowerbound), _), _)| *lowerbound < bound);
+        }
+        Self {
+            heap: Heap::from(results),
+        }
+    }
+}
+
 impl<'b> Sequence for Candidates<'b> {
     type Item = Candidate<'b>;
     type Inner = std::vec::IntoIter<Candidate<'b>>;
@@ -373,9 +384,11 @@ impl<'b> Sequence for Candidates<'b> {
     }
 }
 
+/// Drops candidates whose lower bound reaches `bound`; a larger `epsilon` misses fewer rows.
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: Rc<O::Vector>,
+    bound: Option<Distance>,
     params: SearchParams,
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
@@ -393,9 +406,7 @@ where
         prefetch_h0_tuples,
     );
     let Route { lists, .. } = searcher.route(&params.probes, false);
-    Candidates {
-        heap: Heap::from(searcher.read(lists)),
-    }
+    Candidates::new(searcher.read(lists), bound)
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(

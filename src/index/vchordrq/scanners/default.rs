@@ -95,9 +95,9 @@ impl SearchBuilder for DefaultBuilder {
         let mut vector = None;
         let mut threshold = None;
         // Let PostgreSQL recheck every sphere qual against the heap tuple, as
-        // vchordg does. Only the first non-null sphere (when there is no ORDER
-        // BY vector) bounds the search; other spheres, including null ones,
-        // are filtered entirely by the recheck.
+        // vchordg does. Only the first non-null sphere around the searched
+        // vector bounds the search; other spheres, including null ones, are
+        // filtered entirely by the recheck.
         let recheck = !self.spheres.is_empty();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
@@ -109,9 +109,12 @@ impl SearchBuilder for DefaultBuilder {
         for Sphere { center, radius } in self.spheres.into_iter().flatten() {
             if vector.is_none() {
                 (vector, threshold) = (Some(center), Some(radius));
+            } else if threshold.is_none() && vector.as_ref() == Some(&center) {
+                threshold = Some(radius);
             }
         }
         let opfamily = self.opfamily;
+        let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
@@ -136,7 +139,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), options.search, bump)
+                        (index, Rc::new(projected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -250,7 +253,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), options.search, bump)
+                        (index, Rc::new(projected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -364,7 +367,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), options.search, bump)
+                        (index, Rc::new(projected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -478,7 +481,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), options.search, bump)
+                        (index, Rc::new(projected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -592,7 +595,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), options.search, bump)
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -706,7 +709,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), options.search, bump)
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -820,7 +823,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), options.search, bump)
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -934,7 +937,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), options.search, bump)
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
                     let method = how(index);
                     match (method, options.io_rerank, options.prefilter) {
@@ -1037,8 +1040,9 @@ impl SearchBuilder for DefaultBuilder {
                     }
                 }
             };
+        // `<=`: the index's distance may round up to the radius where the operator's is under it.
         let iter = if let Some(threshold) = threshold {
-            Box::new(iter.take_while(move |(x, _)| *x < threshold))
+            Box::new(iter.take_while(move |(x, _)| *x <= threshold))
         } else {
             iter
         };

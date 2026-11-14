@@ -323,6 +323,30 @@ impl Opfamily {
             | Self::Rabitq4Maxsim => x.to_f32(),
         }
     }
+    /// The inverse of [`Self::output`] at a sphere's radius, rounded up.
+    pub fn bound(self, radius: f32) -> Distance {
+        match self {
+            Self::VectorCosine
+            | Self::HalfvecCosine
+            | Self::Rabitq8Cosine
+            | Self::Rabitq4Cosine => Distance::from_f32((radius - 1.0f32).next_up()),
+            Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 | Self::Rabitq4L2 => {
+                if radius > 0.0 {
+                    Distance::from_f32((radius * radius).next_up())
+                } else {
+                    Distance::NEG_INFINITY
+                }
+            }
+            Self::VectorIp
+            | Self::HalfvecIp
+            | Self::Rabitq8Ip
+            | Self::Rabitq4Ip
+            | Self::VectorMaxsim
+            | Self::HalfvecMaxsim
+            | Self::Rabitq8Maxsim
+            | Self::Rabitq4Maxsim => Distance::from_f32(radius),
+        }
+    }
     pub const fn distance_kind(self) -> DistanceKind {
         match self {
             Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 | Self::Rabitq4L2 => {
