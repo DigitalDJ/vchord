@@ -134,6 +134,18 @@ fn floating(c: &mut Criterion) {
     );
 }
 
+// RaBitQ's binary and block query LUTs.
+fn quantize(c: &mut Criterion) {
+    let mut group = c.benchmark_group("quantize");
+    for (len, n) in [(768, 63.0), (3072, 255.0)] {
+        let lut = random_f32(len);
+        group.bench_with_input(BenchmarkId::from_parameter(len), lut, |b, lut| {
+            b.iter(|| simd::quantize::quantize(black_box(lut), n))
+        });
+    }
+    group.finish();
+}
+
 fn byte(c: &mut Criterion) {
     use simd::{byte, halfbyte};
     binary(
@@ -222,5 +234,12 @@ fn column_meets(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, floating, byte, column_matches, column_meets);
+criterion_group!(
+    benches,
+    floating,
+    quantize,
+    byte,
+    column_matches,
+    column_meets
+);
 criterion_main!(benches);
