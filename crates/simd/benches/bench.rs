@@ -355,6 +355,38 @@ fn halfbyte_reduce_sum_of_xy(c: &mut Criterion) {
     }
 }
 
+fn column_bench<T: simd::column::Value>(c: &mut Criterion, name: &str, random: impl Fn() -> T) {
+    use simd::column::Set;
+    for n in [1, 4, 10, 16, 32, 33, 64, 200, 5000] {
+        let mut keys = (0..n).map(|_| random()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        let column = std::array::from_fn::<T, 32, _>(|i| {
+            if i % 4 == 0 {
+                keys[i % keys.len()]
+            } else {
+                random()
+            }
+        });
+        if n <= 64 {
+            c.bench_function(&format!("column::matches::{name}/{n}"), |b| {
+                b.iter(|| T::matches(std::hint::black_box(&column), std::hint::black_box(&keys)))
+            });
+        }
+        let set = Set::new(&keys);
+        c.bench_function(&format!("column::set::{name}/{n}"), |b| {
+            b.iter(|| set.matches(std::hint::black_box(&column)))
+        });
+    }
+}
+
+fn column_matches(c: &mut Criterion) {
+    column_bench(c, "u16", rand::random::<u16>);
+    column_bench(c, "u32", rand::random::<u32>);
+    column_bench(c, "u64", rand::random::<u64>);
+    column_bench(c, "u128", rand::random::<[u64; 2]>);
+}
+
 criterion_group!(
     benches,
     floating_f32_reduce_sum_of_xy,
@@ -365,5 +397,6 @@ criterion_group!(
     byte_reduce_sum_of_xy,
     byte_reduce_sum_of_x,
     halfbyte_reduce_sum_of_xy,
+    column_matches,
 );
 criterion_main!(benches);
