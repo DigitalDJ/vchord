@@ -35,11 +35,6 @@ impl Floating for f32 {
     }
 
     #[inline(always)]
-    fn vector_add(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
-        vector_add::vector_add(lhs, rhs)
-    }
-
-    #[inline(always)]
     fn vector_add_inplace(lhs: &mut [f32], rhs: &[f32]) {
         vector_add_inplace::vector_add_inplace(lhs, rhs)
     }
@@ -47,11 +42,6 @@ impl Floating for f32 {
     #[inline(always)]
     fn vector_sub(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
         vector_sub::vector_sub(lhs, rhs)
-    }
-
-    #[inline(always)]
-    fn vector_mul(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
-        vector_mul::vector_mul(lhs, rhs)
     }
 
     #[inline(always)]
@@ -459,26 +449,6 @@ mod reduce_sum_of_d2 {
     }
 }
 
-mod vector_add {
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn vector_add(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
-        assert_eq!(lhs.len(), rhs.len());
-        let n = lhs.len();
-        let mut r = Vec::<f32>::with_capacity(n);
-        for i in 0..n {
-            unsafe {
-                r.as_mut_ptr().add(i).write(lhs[i] + rhs[i]);
-            }
-        }
-        unsafe {
-            r.set_len(n);
-        }
-        r
-    }
-}
-
 mod vector_add_inplace {
     #[crate::multiversion(
         "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
@@ -503,26 +473,6 @@ mod vector_sub {
         for i in 0..n {
             unsafe {
                 r.as_mut_ptr().add(i).write(lhs[i] - rhs[i]);
-            }
-        }
-        unsafe {
-            r.set_len(n);
-        }
-        r
-    }
-}
-
-mod vector_mul {
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn vector_mul(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
-        assert_eq!(lhs.len(), rhs.len());
-        let n = lhs.len();
-        let mut r = Vec::<f32>::with_capacity(n);
-        for i in 0..n {
-            unsafe {
-                r.as_mut_ptr().add(i).write(lhs[i] * rhs[i]);
             }
         }
         unsafe {

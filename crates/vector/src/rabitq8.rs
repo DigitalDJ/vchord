@@ -333,16 +333,6 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
     }
 
     #[inline(always)]
-    fn operator_hamming(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
-    #[inline(always)]
-    fn operator_jaccard(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
-    #[inline(always)]
     fn function_normalize(&self) -> Rabitq8Owned {
         // See `VectBorrowed::function_normalize`: a zero vector stays zero
         // instead of pretending to be the unit vector its middle code encodes.
@@ -357,30 +347,6 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
             sum_of_abs_x: self.sum_of_abs_x / self.sum_of_x2.sqrt(),
             packed_code: self.packed_code.to_owned(),
         }
-    }
-
-    fn operator_add(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_sub(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_mul(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_and(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_or(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_xor(&self, _: Self) -> Self::Owned {
-        unimplemented!()
     }
 }
 

@@ -214,10 +214,8 @@ pub trait Floating:
     fn vector_from_f32(this: &[f32]) -> Vec<Self>;
     fn vector_to_f32(this: &[Self]) -> Vec<f32>;
     fn vector_to_f32_borrowed(this: &[Self]) -> impl AsRef<[f32]>;
-    fn vector_add(lhs: &[Self], rhs: &[Self]) -> Vec<Self>;
     fn vector_add_inplace(lhs: &mut [Self], rhs: &[Self]);
     fn vector_sub(lhs: &[Self], rhs: &[Self]) -> Vec<Self>;
-    fn vector_mul(lhs: &[Self], rhs: &[Self]) -> Vec<Self>;
     fn vector_mul_scalar(lhs: &[Self], rhs: f32) -> Vec<Self>;
     fn vector_mul_scalar_inplace(lhs: &mut [Self], rhs: f32);
     fn vector_abs_inplace(this: &mut [Self]);

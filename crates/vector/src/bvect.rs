@@ -169,49 +169,8 @@ impl VectorBorrowed for BVectBorrowed<'_> {
     }
 
     #[inline(always)]
-    fn operator_hamming(self, rhs: Self) -> Distance {
-        Distance::from(simd::bit::reduce_sum_of_xor(self.data, rhs.data) as f32)
-    }
-
-    #[inline(always)]
-    fn operator_jaccard(self, rhs: Self) -> Distance {
-        let (and, or) = simd::bit::reduce_sum_of_and_or(self.data, rhs.data);
-        Distance::from(1.0 - (and as f32 / or as f32))
-    }
-
-    #[inline(always)]
     fn function_normalize(&self) -> BVectOwned {
         unimplemented!()
-    }
-
-    fn operator_add(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_sub(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_mul(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_and(&self, rhs: Self) -> Self::Owned {
-        assert_eq!(self.dim, rhs.dim);
-        let data = simd::bit::vector_and(self.data, rhs.data);
-        BVectOwned::new(self.dim, data)
-    }
-
-    fn operator_or(&self, rhs: Self) -> Self::Owned {
-        assert_eq!(self.dim, rhs.dim);
-        let data = simd::bit::vector_or(self.data, rhs.data);
-        BVectOwned::new(self.dim, data)
-    }
-
-    fn operator_xor(&self, rhs: Self) -> Self::Owned {
-        assert_eq!(self.dim, rhs.dim);
-        let data = simd::bit::vector_xor(self.data, rhs.data);
-        BVectOwned::new(self.dim, data)
     }
 }
 

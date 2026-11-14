@@ -59,11 +59,6 @@ impl Floating for f16 {
     }
 
     #[inline(always)]
-    fn vector_add(lhs: &[Self], rhs: &[Self]) -> Vec<Self> {
-        vector_add::vector_add(lhs, rhs)
-    }
-
-    #[inline(always)]
     fn vector_add_inplace(lhs: &mut [Self], rhs: &[Self]) {
         vector_add_inplace::vector_add_inplace(lhs, rhs)
     }
@@ -71,11 +66,6 @@ impl Floating for f16 {
     #[inline(always)]
     fn vector_sub(lhs: &[Self], rhs: &[Self]) -> Vec<Self> {
         vector_sub::vector_sub(lhs, rhs)
-    }
-
-    #[inline(always)]
-    fn vector_mul(lhs: &[Self], rhs: &[Self]) -> Vec<Self> {
-        vector_mul::vector_mul(lhs, rhs)
     }
 
     #[inline(always)]
@@ -511,28 +501,6 @@ mod reduce_sum_of_d2_approx {
     }
 }
 
-mod vector_add {
-    use crate::f16;
-
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn vector_add(lhs: &[f16], rhs: &[f16]) -> Vec<f16> {
-        assert_eq!(lhs.len(), rhs.len());
-        let n = lhs.len();
-        let mut r = Vec::<f16>::with_capacity(n);
-        for i in 0..n {
-            unsafe {
-                r.as_mut_ptr().add(i).write(lhs[i] + rhs[i]);
-            }
-        }
-        unsafe {
-            r.set_len(n);
-        }
-        r
-    }
-}
-
 mod vector_add_inplace {
     use crate::f16;
 
@@ -561,28 +529,6 @@ mod vector_sub {
         for i in 0..n {
             unsafe {
                 r.as_mut_ptr().add(i).write(lhs[i] - rhs[i]);
-            }
-        }
-        unsafe {
-            r.set_len(n);
-        }
-        r
-    }
-}
-
-mod vector_mul {
-    use crate::f16;
-
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn vector_mul(lhs: &[f16], rhs: &[f16]) -> Vec<f16> {
-        assert_eq!(lhs.len(), rhs.len());
-        let n = lhs.len();
-        let mut r = Vec::<f16>::with_capacity(n);
-        for i in 0..n {
-            unsafe {
-                r.as_mut_ptr().add(i).write(lhs[i] * rhs[i]);
             }
         }
         unsafe {

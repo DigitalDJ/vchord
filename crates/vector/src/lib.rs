@@ -32,21 +32,5 @@ pub trait VectorBorrowed: Copy {
 
     fn operator_cos(self, rhs: Self) -> distance::Distance;
 
-    fn operator_hamming(self, rhs: Self) -> distance::Distance;
-
-    fn operator_jaccard(self, rhs: Self) -> distance::Distance;
-
     fn function_normalize(&self) -> Self::Owned;
-
-    fn operator_add(&self, rhs: Self) -> Self::Owned;
-
-    fn operator_sub(&self, rhs: Self) -> Self::Owned;
-
-    fn operator_mul(&self, rhs: Self) -> Self::Owned;
-
-    fn operator_and(&self, rhs: Self) -> Self::Owned;
-
-    fn operator_or(&self, rhs: Self) -> Self::Owned;
-
-    fn operator_xor(&self, rhs: Self) -> Self::Owned;
 }

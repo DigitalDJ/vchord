@@ -139,44 +139,10 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
         Distance::from(cosine_distance(self.0, rhs.0))
     }
 
-    #[inline(always)]
-    fn operator_hamming(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
-    #[inline(always)]
-    fn operator_jaccard(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
     /// Scales to unit length; a vector without a direction is returned unchanged.
     #[inline(always)]
     fn function_normalize(&self) -> VectOwned<S> {
         VectOwned(normalized(self.0).unwrap_or_else(|| self.0.to_vec()))
-    }
-
-    fn operator_add(&self, rhs: Self) -> Self::Owned {
-        VectOwned::new(S::vector_add(self.slice(), rhs.slice()))
-    }
-
-    fn operator_sub(&self, rhs: Self) -> Self::Owned {
-        VectOwned::new(S::vector_sub(self.slice(), rhs.slice()))
-    }
-
-    fn operator_mul(&self, rhs: Self) -> Self::Owned {
-        VectOwned::new(S::vector_mul(self.slice(), rhs.slice()))
-    }
-
-    fn operator_and(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_or(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_xor(&self, _: Self) -> Self::Owned {
-        unimplemented!()
     }
 }
 
