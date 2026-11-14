@@ -146,19 +146,9 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
 
     #[inline(always)]
     fn operator_cos(self, rhs: Self) -> Distance {
-        let xy = S::reduce_sum_of_xy(self.slice(), rhs.slice());
-        let x2 = S::reduce_sum_of_x2(self.0);
-        let y2 = S::reduce_sum_of_x2(rhs.0);
-        Distance::from(crate::cosine_distance(xy, x2, y2, || {
-            let x = S::vector_to_f32_borrowed(self.0);
-            let y = S::vector_to_f32_borrowed(rhs.0);
-            let (x, y) = (x.as_ref(), y.as_ref());
-            let mut sums = (0.0f64, 0.0f64, 0.0f64);
-            for (&a, &b) in x.iter().zip(y.iter()) {
-                let (a, b) = (f64::from(a), f64::from(b));
-                sums = (sums.0 + a * b, sums.1 + a * a, sums.2 + b * b);
-            }
-            sums
+        let xy = S::reduce_sum_of_xy(self.0, rhs.0);
+        Distance::from(crate::cosine_distance(xy, self.0, rhs.0, |x, y| {
+            f32::reduce_sum_of_xy(x, y)
         }))
     }
 

@@ -6,6 +6,8 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use simd::Floating;
+
 pub mod bvect;
 pub mod rabitq4;
 pub mod rabitq8;
@@ -52,44 +54,87 @@ pub trait VectorBorrowed: Copy {
     fn operator_xor(&self, rhs: Self) -> Self::Owned;
 }
 
-/// Cosine distance `1 - xy / (|x| |y|)` from f32 reductions.
-///
-/// The norms are taken separately (`sqrt(x2 * y2)` underflowed to 0 for tiny
-/// vectors and overflowed for huge ones). If a reduction itself overflowed,
-/// the sums are recomputed in f64 by `wide`. A zero vector still gives NaN,
-/// like pgvector (#35).
+/// Cosine distance, rescaling out-of-range norms exactly; a zero vector gives NaN as in pgvector.
 #[inline(always)]
-pub fn cosine_distance(xy: f32, x2: f32, y2: f32, wide: impl FnOnce() -> (f64, f64, f64)) -> f32 {
-    if xy.is_finite() && x2.is_finite() && y2.is_finite() {
-        1.0 - xy / (x2.sqrt() * y2.sqrt())
+pub fn cosine_distance<S: Floating>(
+    xy: f32,
+    x: &[S],
+    y: &[S],
+    rescaled_xy: impl FnOnce(&[f32], &[f32]) -> f32,
+) -> f32 {
+    let (x2, y2) = (S::reduce_sum_of_x2(x), S::reduce_sum_of_x2(y));
+    let p = x2 * y2;
+    if x2.min(y2) >= MIN_FAST_X2 && p.is_normal() {
+        1.0 - xy / p.sqrt()
     } else {
-        let (xy, x2, y2) = wide();
-        (1.0 - xy / (x2.sqrt() * y2.sqrt())) as f32
+        cosine_distance_rescaled(x, y, rescaled_xy)
     }
+}
+
+#[cold]
+fn cosine_distance_rescaled<S: Floating>(
+    x: &[S],
+    y: &[S],
+    xy: impl FnOnce(&[f32], &[f32]) -> f32,
+) -> f32 {
+    let (Some(x), Some(y)) = (rescaled(x), rescaled(y)) else {
+        return f32::NAN;
+    };
+    1.0 - xy(&x, &y) / (f32::reduce_sum_of_x2(&x) * f32::reduce_sum_of_x2(&y)).sqrt()
+}
+
+/// Below this, subnormal squares could bias `x2`, so the vector is rescaled.
+const MIN_FAST_X2: f32 = 1e-30;
+
+/// The power of two that brings the largest magnitude near 1, or `None` for a zero vector.
+fn scale<S: Floating>(values: &[S]) -> Option<f32> {
+    let (min, max) = S::reduce_min_max_of_x(values);
+    let m = max.max(-min);
+    (m > 0.0).then(|| {
+        let e = ((m.to_bits() >> 23) as i32 - 127).min(126);
+        f32::from_bits(((127 - e) as u32) << 23)
+    })
+}
+
+fn rescaled<S: Floating>(values: &[S]) -> Option<Vec<f32>> {
+    let s = scale(values)?;
+    Some(f32::vector_mul_scalar(
+        S::vector_to_f32_borrowed(values).as_ref(),
+        s,
+    ))
 }
 
 #[test]
 fn cosine_distance_extremes() {
-    use simd::Floating;
     let cos = |x: &[f32], y: &[f32]| {
-        let xy = f32::reduce_sum_of_xy(x, y);
-        let x2 = f32::reduce_sum_of_x2(x);
-        let y2 = f32::reduce_sum_of_x2(y);
-        cosine_distance(xy, x2, y2, || {
-            let mut s = (0.0f64, 0.0f64, 0.0f64);
-            for (&a, &b) in x.iter().zip(y.iter()) {
-                let (a, b) = (f64::from(a), f64::from(b));
-                s = (s.0 + a * b, s.1 + a * a, s.2 + b * b);
-            }
-            s
+        cosine_distance(f32::reduce_sum_of_xy(x, y), x, y, |x, y| {
+            f32::reduce_sum_of_xy(x, y)
         })
     };
     let tiny = [1.0e-13f32; 3];
     assert!(cos(&tiny, &tiny).abs() < 1.0e-6);
+    let tinier = [1.0e-23f32, 2.0e-23, 0.0];
+    assert!(cos(&tinier, &tinier).abs() < 1.0e-6);
+    assert!((cos(&tinier, &[2.0, 4.0, 0.0])).abs() < 1.0e-6);
+    assert!((cos(&tinier, &[0.0, 0.0, 1.0]) - 1.0).abs() < 1.0e-6);
     let huge = [1.0e19f32, 1.0e19];
     assert!(cos(&huge, &huge).abs() < 1.0e-6);
     let huge_opposite = [-1.0e30f32, -1.0e30];
     let huge_positive = [1.0e30f32, 1.0e30];
     assert!((cos(&huge_positive, &huge_opposite) - 2.0).abs() < 1.0e-6);
+    let max = [f32::MAX, f32::MAX, 0.0];
+    assert!((cos(&max, &tinier) - (1.0 - 3.0 / 10f32.sqrt())).abs() < 1.0e-6);
+    let sub = [1.0e-40f32, -1.0e-40];
+    assert!((cos(&sub, &[1.0, -1.0])).abs() < 1.0e-6);
     assert!(cos(&[0.0, 0.0], &[1.0, 0.0]).is_nan());
+    assert!(cos(&[0.0, 0.0], &[0.0, 0.0]).is_nan());
+    // Subnormal squares: rescaled exactly like the fast path on the scaled-up vector.
+    let up = |x: &[f32]| x.iter().map(|&x| x * 2f32.powi(70)).collect::<Vec<_>>();
+    let sub = vec![1.1e-21f32; 65535];
+    let mut ones = vec![1.0f32; 65535];
+    assert_eq!(cos(&sub, &ones).to_bits(), cos(&up(&sub), &ones).to_bits());
+    assert!(cos(&sub, &ones).abs() < 1e-4);
+    ones[0] = -65533.0;
+    assert_eq!(cos(&sub, &ones).to_bits(), cos(&up(&sub), &ones).to_bits());
+    assert!((cos(&sub, &ones) - 1.0).abs() < 1e-4);
 }
