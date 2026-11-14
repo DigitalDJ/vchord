@@ -355,6 +355,119 @@ fn halfbyte_reduce_sum_of_xy(c: &mut Criterion) {
     }
 }
 
+/// The rows of a block whose payload's low 16 bits are one of the keys:
+/// compared key by key up to 32 keys, and tested in a set beyond.
+fn column_payload(c: &mut Criterion) {
+    use rand::RngExt;
+    use simd::column::{Set, matches_payload};
+    let mut rng = rand::rng();
+    let payload = std::array::from_fn::<u64, 32, _>(|_| rng.random());
+    for n in [1, 4, 10, 32, 33, 200, 5000] {
+        let mut keys = (0..n).map(|_| rng.random::<u16>()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        let p = std::hint::black_box(&payload);
+        if n <= 32 {
+            #[cfg(target_arch = "x86_64")]
+            if simd::is_cpu_detected!("v4") {
+                c.bench_function(&format!("column::payload::v4/{n}"), |b| {
+                    b.iter(|| unsafe { simd::column::payload::matches_v4(p, &keys) })
+                });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if simd::is_cpu_detected!("v3") {
+                c.bench_function(&format!("column::payload::v3/{n}"), |b| {
+                    b.iter(|| unsafe { simd::column::payload::matches_v3(p, &keys) })
+                });
+            }
+            #[cfg(target_arch = "aarch64")]
+            if simd::is_cpu_detected!("a2") {
+                c.bench_function(&format!("column::payload::a2/{n}"), |b| {
+                    b.iter(|| unsafe { simd::column::payload::matches_a2(p, &keys) })
+                });
+            }
+            c.bench_function(&format!("column::payload/{n}"), |b| {
+                b.iter(|| matches_payload(p, &keys))
+            });
+        } else {
+            let set = Set::new(&keys);
+            c.bench_function(&format!("column::payload::set/{n}"), |b| {
+                b.iter(|| set.matches_payload(p))
+            });
+        }
+    }
+}
+
+/// A column of 32 values of which about a quarter is one of the keys, and the
+/// rows that match: each value compared with every key, and a set's bitmap and
+/// table.
+fn column_bench<T: simd::column::Value>(c: &mut Criterion, name: &str, random: impl Fn() -> T) {
+    use simd::column::{Set, Value};
+    for n in [1, 4, 10, 16, 32, 33, 64, 200, 5000] {
+        let mut keys = (0..n).map(|_| random()).collect::<Vec<_>>();
+        keys.sort_unstable();
+        keys.dedup();
+        let column = std::array::from_fn::<T, 32, _>(|i| {
+            if i % 4 == 0 {
+                keys[i % keys.len()]
+            } else {
+                random()
+            }
+        });
+        if n <= 64 {
+            c.bench_function(&format!("column::matches::{name}/{n}"), |b| {
+                b.iter(|| T::matches(std::hint::black_box(&column), std::hint::black_box(&keys)))
+            });
+        }
+        let set = Set::new(&keys);
+        c.bench_function(&format!("column::set::{name}/{n}"), |b| {
+            b.iter(|| set.matches(std::hint::black_box(&column)))
+        });
+    }
+}
+
+/// The 16-byte kernels on each target, against a quarter of matching rows.
+fn column_u128(c: &mut Criterion) {
+    let keys = (0..32)
+        .map(|_| rand::random::<[u64; 2]>())
+        .collect::<Vec<_>>();
+    let column = std::array::from_fn::<[u64; 2], 32, _>(|i| {
+        if i % 4 == 0 {
+            keys[i % keys.len()]
+        } else {
+            rand::random()
+        }
+    });
+    for n in [1, 4, 10, 32] {
+        let (column, keys) = (std::hint::black_box(&column), &keys[..n]);
+        #[cfg(target_arch = "x86_64")]
+        if simd::is_cpu_detected!("v4") {
+            c.bench_function(&format!("column::u128::v4/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::u128s::matches_v4(column, keys) })
+            });
+        }
+        #[cfg(target_arch = "x86_64")]
+        if simd::is_cpu_detected!("v3") {
+            c.bench_function(&format!("column::u128::v3/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::u128s::matches_v3(column, keys) })
+            });
+        }
+        #[cfg(target_arch = "aarch64")]
+        if simd::is_cpu_detected!("a2") {
+            c.bench_function(&format!("column::u128::a2/{n}"), |b| {
+                b.iter(|| unsafe { simd::column::u128s::matches_a2(column, keys) })
+            });
+        }
+    }
+}
+
+fn column_matches(c: &mut Criterion) {
+    column_bench(c, "u16", rand::random::<u16>);
+    column_bench(c, "u32", rand::random::<u32>);
+    column_bench(c, "u64", rand::random::<u64>);
+    column_bench(c, "u128", rand::random::<[u64; 2]>);
+}
+
 criterion_group!(
     benches,
     floating_f32_reduce_sum_of_xy,
@@ -365,5 +478,8 @@ criterion_group!(
     byte_reduce_sum_of_xy,
     byte_reduce_sum_of_x,
     halfbyte_reduce_sum_of_xy,
+    column_payload,
+    column_matches,
+    column_u128,
 );
 criterion_main!(benches);
