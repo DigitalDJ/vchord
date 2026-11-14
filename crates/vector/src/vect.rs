@@ -185,16 +185,7 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
 
 impl<S: Floating> PartialEq for VectBorrowed<'_, S> {
     fn eq(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
-            return false;
-        }
-        let n = self.0.len();
-        for i in 0..n {
-            if self.0[i] != other.0[i] {
-                return false;
-            }
-        }
-        true
+        self.0 == other.0
     }
 }
 
@@ -203,15 +194,7 @@ impl<S: Floating> PartialOrd for VectBorrowed<'_, S> {
         if self.0.len() != other.0.len() {
             return None;
         }
-        let n = self.0.len();
-        for i in 0..n {
-            match PartialOrd::partial_cmp(&self.0[i], &other.0[i])? {
-                Ordering::Less => return Some(Ordering::Less),
-                Ordering::Equal => continue,
-                Ordering::Greater => return Some(Ordering::Greater),
-            }
-        }
-        Some(Ordering::Equal)
+        self.0.partial_cmp(other.0)
     }
 }
 
