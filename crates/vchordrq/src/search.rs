@@ -13,16 +13,22 @@ use crate::tape::{by_directory, by_next};
 use crate::tuples::*;
 use crate::{Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
+use dary_heap::QuaternaryHeap as Heap;
 use distance::Distance;
 use index::bump::Bump;
 use index::fetch::BorrowedIter;
 use index::packed::{PackedRefMut4, PackedRefMut8};
-use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily};
+use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily, Sequence};
 use index::relation::{Page, RelationRead};
 use index_accessor::{DefaultWithDimension, FunctionalAccessor, LAccess};
+use rabitq::bit::binary::BinaryLut;
+use rabitq::bit::block::BlockLut;
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::marker::PhantomData;
 use std::num::NonZero;
+use std::rc::Rc;
 use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
@@ -31,433 +37,411 @@ type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 /// Kept so its exact distance can be recomputed after approximate routing.
 type Location<'b> = Option<(u16, BorrowedIter<'b>)>;
 
-/// The probed centroids are chosen with `O::RoutingAccessor`, which may be
-/// approximate. In residual mode their distances are then reused as `dis_f`,
-/// which the residual formulas add to every candidate's lower bound with no
-/// error budget, so recompute them with `O::DistanceAccessor` first. Pages are
-/// re-read through the IDs the routing step already holds; they were just read.
-fn exact_bounds<'b, R: RelationRead, O: Operator>(
+/// (distance, norm, first, location); until it is read, the distance may be routing's estimate.
+type List<'b> = (
+    Reverse<Distance>,
+    AlwaysEqual<f32>,
+    AlwaysEqual<u32>,
+    AlwaysEqual<Location<'b>>,
+);
+
+pub type Candidate<'b> = (
+    (Reverse<Distance>, AlwaysEqual<()>),
+    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
+);
+
+pub type MaxsimCandidate<'b> = (
+    (Reverse<Distance>, AlwaysEqual<Distance>),
+    AlwaysEqual<PackedRefMut8<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
+);
+
+#[derive(Debug)]
+pub struct SearchParams {
+    pub probes: Vec<u32>,
+    pub epsilon: f32,
+}
+
+struct Searcher<'b, R, O, V, B, H1, H0> {
     index: &'b R,
-    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    bump: &'b B,
+    vector: V,
     dim: u32,
-    state: &mut [(
-        Reverse<Distance>,
-        AlwaysEqual<f32>,
-        AlwaysEqual<u32>,
-        AlwaysEqual<Location<'b>>,
-    )],
-) where
+    is_residual: bool,
+    /// Bottom first.
+    cells: Vec<u32>,
+    root: List<'b>,
+    lut: (BlockLut, BinaryLut),
+    epsilon: f32,
+    prefetch_h1_vectors: H1,
+    prefetch_h0_tuples: H0,
+    _operator: PhantomData<fn() -> O>,
+}
+
+struct Route<'b, I> {
+    lists: Vec<List<'b>>,
+    /// The other lists of the bottom level, nearest first, if `sorted`.
+    rest: I,
+}
+
+impl<'b, R, O, V, B, H1, H0> Searcher<'b, R, O, V, B, H1, H0>
+where
+    R: RelationRead,
     R::Page: Page<Opaque = Opaque>,
+    O: Operator,
+    V: Borrow<O::Vector> + Clone,
+    B: Bump,
+    H1: PrefetcherHeapFamily<'b, R>,
+    H0: PrefetcherSequenceFamily<'b, R>,
 {
-    for (Reverse(dis_f), _, _, AlwaysEqual(location)) in state {
-        let (head, prefetch) = location.expect("internal: residual probe without location");
-        *dis_f = centroids::read::<R, O, _>(
-            prefetch.map(|id| index.read(id)),
-            head,
-            LAccess::new(
-                O::Vector::unpack(vector),
-                O::DistanceAccessor::default_with_dimension(dim),
-            ),
+    fn new(
+        index: &'b R,
+        query: V,
+        params: &SearchParams,
+        bump: &'b B,
+        prefetch_h1_vectors: H1,
+        prefetch_h0_tuples: H0,
+    ) -> Self {
+        let vector = query.borrow().as_borrowed();
+        let meta_guard = index.read(0);
+        let meta_bytes = meta_guard.get(1).expect("data corruption");
+        let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
+        let dim = meta_tuple.dim();
+        let is_residual = meta_tuple.is_residual();
+        let height_of_root = meta_tuple.height_of_root();
+        let cells = meta_tuple.cells().to_vec();
+        assert_eq!(dim, vector.dim(), "unmatched dimensions");
+        if height_of_root as usize != 1 + params.probes.len() {
+            panic!(
+                "usage: need {} probes, but {} probes provided",
+                height_of_root - 1,
+                params.probes.len()
+            );
+        }
+        debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
+        let norm = meta_tuple.centroid_norm();
+        let first = meta_tuple.first();
+        let root = if is_residual {
+            let prefetch =
+                BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
+            let head = meta_tuple.centroid_head();
+            let distance = centroids::read::<R, O, _>(
+                prefetch.map(|id| index.read(id)),
+                head,
+                LAccess::new(
+                    O::Vector::unpack(vector),
+                    O::RoutingAccessor::default_with_dimension(dim),
+                ),
+            );
+            (
+                Reverse(distance),
+                AlwaysEqual(norm),
+                AlwaysEqual(first),
+                AlwaysEqual(Some((head, prefetch))),
+            )
+        } else {
+            // fast path
+            (
+                Reverse(Distance::ZERO),
+                AlwaysEqual(norm),
+                AlwaysEqual(first),
+                AlwaysEqual(None),
+            )
+        };
+        drop(meta_guard);
+        let lut = O::Vector::preprocess(vector);
+        Self {
+            index,
+            bump,
+            vector: query,
+            dim,
+            is_residual,
+            cells,
+            root,
+            lut,
+            epsilon: params.epsilon,
+            prefetch_h1_vectors,
+            prefetch_h0_tuples,
+            _operator: PhantomData,
+        }
+    }
+
+    fn route(
+        &mut self,
+        probes: &[u32],
+        sorted: bool,
+    ) -> Route<'b, impl Iterator<Item = List<'b>> + use<'b, R, O, V, B, H1, H0>> {
+        let Self {
+            ref vector,
+            index,
+            bump,
+            dim,
+            is_residual,
+            ref cells,
+            root,
+            ref lut,
+            epsilon,
+            ref mut prefetch_h1_vectors,
+            ..
+        } = *self;
+        let mut step = |lists: Vec<List<'b>>| {
+            let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
+            for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in lists {
+                let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm));
+                tape::read_h1_tape::<R, _, _>(
+                    by_next(index, first),
+                    || O::block_access(&lut.0, residual),
+                    |(rough, err), head, norm, first, prefetch| {
+                        let lowerbound = Distance::from_f32(rough - err * epsilon);
+                        results.push((
+                            Reverse(lowerbound),
+                            AlwaysEqual(bump.alloc((
+                                first,
+                                norm,
+                                head,
+                                BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                            ))),
+                        ));
+                    },
+                );
+            }
+            let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
+            let mut cache = BinaryHeap::<(_, _, _, _)>::new();
+            let vector = vector.clone();
+            std::iter::from_fn(move || {
+                while let Some((
+                    (Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))),
+                    prefetch,
+                )) = heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
+                {
+                    let distance = centroids::read::<R, O, _>(
+                        prefetch,
+                        head,
+                        LAccess::new(
+                            O::Vector::unpack(vector.borrow().as_borrowed()),
+                            O::RoutingAccessor::default_with_dimension(dim),
+                        ),
+                    );
+                    cache.push((
+                        Reverse(distance),
+                        AlwaysEqual(norm),
+                        AlwaysEqual(first),
+                        AlwaysEqual(Some((head, pages))),
+                    ));
+                }
+                cache.pop()
+            })
+        };
+        let levels = probes.len();
+        let mut lists = vec![root];
+        let mut rest = None;
+        for (i, (&probes, &cells)) in
+            std::iter::zip(probes, cells[..levels].iter().rev()).enumerate()
+        {
+            let partial_scan = probes < cells;
+            if partial_scan || is_residual || (sorted && i + 1 == levels) {
+                lists = rest.insert(step(lists)).take(probes as _).collect();
+            } else {
+                // fast path
+                let mut results = LinkedVec::new();
+                for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in lists {
+                    tape::read_h1_tape::<R, _, _>(
+                        by_next(index, first),
+                        || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
+                        |(), _, norm, first, _| {
+                            results.push((
+                                Reverse(Distance::ZERO),
+                                AlwaysEqual(norm),
+                                AlwaysEqual(first),
+                                AlwaysEqual(None),
+                            ));
+                        },
+                    );
+                }
+                lists = results.into_vec();
+            }
+        }
+        Route {
+            lists,
+            rest: rest.into_iter().flatten(),
+        }
+    }
+
+    /// Returns how many rows the list holds.
+    fn read_list(
+        &mut self,
+        (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location)): List<'b>,
+        mut callback: impl for<'a> FnMut((f32, f32), u16, NonZero<u64>, &'a [u32]),
+    ) -> u64 {
+        let Self {
+            index,
+            ref vector,
+            dim,
+            is_residual,
+            ref lut,
+            ref mut prefetch_h0_tuples,
+            ..
+        } = *self;
+        // Between lists nothing is locked (#28).
+        index::interrupt::check();
+        // Residual bounds add `dis_f` with no error budget, so routing's estimate will not do.
+        let dis_f = if is_residual && !O::routing_is_exact() {
+            let (head, prefetch) = location.expect("internal: residual probe without location");
+            centroids::read::<R, O, _>(
+                prefetch.map(|id| index.read(id)),
+                head,
+                LAccess::new(
+                    O::Vector::unpack(vector.borrow().as_borrowed()),
+                    O::DistanceAccessor::default_with_dimension(dim),
+                ),
+            )
+        } else {
+            dis_f
+        }
+        .to_f32();
+        let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm));
+        let jump_guard = index.read(first);
+        let jump_bytes = jump_guard.get(1).expect("data corruption");
+        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+        let block_access = || O::block_access(&lut.0, residual);
+        if prefetch_h0_tuples.is_not_plain() {
+            let directory =
+                tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+            tape::read_frozen_tape::<R, _, _>(
+                by_directory(prefetch_h0_tuples, directory),
+                block_access,
+                &mut callback,
+            );
+        } else {
+            tape::read_frozen_tape::<R, _, _>(
+                by_next(index, jump_tuple.frozen_first()),
+                block_access,
+                &mut callback,
+            );
+        }
+        tape::read_appendable_tape::<R, _>(
+            by_next(index, jump_tuple.appendable_first()),
+            O::binary_access(&lut.1, residual),
+            &mut callback,
         );
+        jump_tuple.tuples()
+    }
+
+    fn read(&mut self, lists: Vec<List<'b>>) -> Vec<Candidate<'b>> {
+        let (bump, epsilon) = (self.bump, self.epsilon);
+        let mut results = LinkedVec::new();
+        for list in lists {
+            self.read_list(
+                list,
+                id_2(|(rough, err), head, payload, prefetch| {
+                    let lowerbound = Distance::from_f32(rough - err * epsilon);
+                    results.push((
+                        (Reverse(lowerbound), AlwaysEqual(())),
+                        AlwaysEqual(PackedRefMut4(bump.alloc((
+                            payload,
+                            head,
+                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                        )))),
+                    ));
+                }),
+            );
+        }
+        results.into_vec()
+    }
+}
+
+pub struct Candidates<'b> {
+    heap: Heap<Candidate<'b>>,
+}
+
+impl<'b> Sequence for Candidates<'b> {
+    type Item = Candidate<'b>;
+    type Inner = std::vec::IntoIter<Candidate<'b>>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Candidate<'b>> {
+        self.heap.pop()
+    }
+
+    #[inline]
+    fn peek(&mut self) -> Option<&Candidate<'b>> {
+        self.heap.peek()
+    }
+
+    fn into_inner(self) -> Self::Inner {
+        self.heap.into_vec().into_iter()
     }
 }
 
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
-    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
-    probes: Vec<u32>,
-    epsilon: f32,
+    vector: Rc<O::Vector>,
+    params: SearchParams,
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
-) -> Vec<(
-    (Reverse<Distance>, AlwaysEqual<()>),
-    AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
-)>
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+) -> Candidates<'b>
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let meta_guard = index.read(0);
-    let meta_bytes = meta_guard.get(1).expect("data corruption");
-    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
-    let dim = meta_tuple.dim();
-    let is_residual = meta_tuple.is_residual();
-    let height_of_root = meta_tuple.height_of_root();
-    let cells = meta_tuple.cells().to_vec();
-    assert_eq!(dim, vector.dim(), "unmatched dimensions");
-    if height_of_root as usize != 1 + probes.len() {
-        panic!(
-            "usage: need {} probes, but {} probes provided",
-            height_of_root - 1,
-            probes.len()
-        );
+    let mut searcher = Searcher::<_, O, _, _, _, _>::new(
+        index,
+        vector,
+        &params,
+        bump,
+        prefetch_h1_vectors,
+        prefetch_h0_tuples,
+    );
+    let Route { lists, .. } = searcher.route(&params.probes, false);
+    Candidates {
+        heap: Heap::from(searcher.read(lists)),
     }
-    debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
-
-    // (distance, norm, first, location). Until `exact_bounds` runs, the
-    // distance is a routing distance and may be approximate.
-    type State<'b> = Vec<(
-        Reverse<Distance>,
-        AlwaysEqual<f32>,
-        AlwaysEqual<u32>,
-        AlwaysEqual<Location<'b>>,
-    )>;
-    let mut state: State<'b> = if is_residual {
-        let prefetch =
-            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
-        let head = meta_tuple.centroid_head();
-        let distance = centroids::read::<R, O, _>(
-            prefetch.map(|id| index.read(id)),
-            head,
-            LAccess::new(
-                O::Vector::unpack(vector),
-                O::RoutingAccessor::default_with_dimension(dim),
-            ),
-        );
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
-        vec![(
-            Reverse(distance),
-            AlwaysEqual(norm),
-            AlwaysEqual(first),
-            AlwaysEqual(Some((head, prefetch))),
-        )]
-    } else {
-        // fast path
-        let distance = Distance::ZERO;
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
-        vec![(
-            Reverse(distance),
-            AlwaysEqual(norm),
-            AlwaysEqual(first),
-            AlwaysEqual(None),
-        )]
-    };
-
-    drop(meta_guard);
-    let lut = O::Vector::preprocess(vector);
-
-    let mut step = |state: State<'b>| {
-        let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
-            tape::read_h1_tape::<R, _, _>(
-                by_next(index, first),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                |(rough, err), head, norm, first, prefetch| {
-                    let lowerbound = Distance::from_f32(rough - err * epsilon);
-                    results.push((
-                        Reverse(lowerbound),
-                        AlwaysEqual(bump.alloc((
-                            first,
-                            norm,
-                            head,
-                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                        ))),
-                    ));
-                },
-            );
-        }
-        let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-        let mut cache = BinaryHeap::<(_, _, _, _)>::new();
-        std::iter::from_fn(move || {
-            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))), prefetch)) =
-                heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
-            {
-                let distance = centroids::read::<R, O, _>(
-                    prefetch,
-                    head,
-                    LAccess::new(
-                        O::Vector::unpack(vector),
-                        O::RoutingAccessor::default_with_dimension(dim),
-                    ),
-                );
-                cache.push((
-                    Reverse(distance),
-                    AlwaysEqual(norm),
-                    AlwaysEqual(first),
-                    AlwaysEqual(Some((head, pages))),
-                ));
-            }
-            cache.pop()
-        })
-    };
-
-    for i in 1..height_of_root {
-        let partial_scan = probes[i as usize - 1] < cells[(height_of_root - 1 - i) as usize];
-        if partial_scan || is_residual {
-            state = step(state).take(probes[i as usize - 1] as _).collect();
-        } else {
-            // fast path
-            let mut results = LinkedVec::new();
-            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in state {
-                tape::read_h1_tape::<R, _, _>(
-                    by_next(index, first),
-                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                    |(), _, norm, first, _| {
-                        results.push((
-                            Reverse(Distance::ZERO),
-                            AlwaysEqual(norm),
-                            AlwaysEqual(first),
-                            AlwaysEqual(None),
-                        ));
-                    },
-                );
-            }
-            state = results.into_vec();
-        }
-    }
-
-    // Non-residual formulas ignore `dis_f`; the fast path never computes it.
-    if is_residual && !O::routing_is_exact() {
-        exact_bounds::<R, O>(index, vector, dim, &mut state);
-    }
-
-    let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
-    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
-        // Between lists nothing is locked (#28).
-        index::interrupt::check();
-        let jump_guard = index.read(first);
-        let jump_bytes = jump_guard.get(1).expect("data corruption");
-        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = id_2(|(rough, err), head, payload, prefetch| {
-            let lowerbound = Distance::from_f32(rough - err * epsilon);
-            results.push((
-                (Reverse(lowerbound), AlwaysEqual(())),
-                AlwaysEqual(PackedRefMut4(bump.alloc((
-                    payload,
-                    head,
-                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                )))),
-            ));
-        });
-        if prefetch_h0_tuples.is_not_plain() {
-            let directory =
-                tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
-            tape::read_frozen_tape::<R, _, _>(
-                by_directory(&mut prefetch_h0_tuples, directory),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                &mut callback,
-            );
-        } else {
-            tape::read_frozen_tape::<R, _, _>(
-                by_next(index, jump_tuple.frozen_first()),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                &mut callback,
-            );
-        }
-        tape::read_appendable_tape::<R, _>(
-            by_next(index, jump_tuple.appendable_first()),
-            O::binary_access(&lut.1, is_residual, dis_f.to_f32(), norm),
-            &mut callback,
-        );
-    }
-    results.into_vec()
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
-    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
-    probes: Vec<u32>,
-    epsilon: f32,
+    vector: &O::Vector,
+    params: &SearchParams,
     mut threshold: u32,
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
-) -> (
-    Vec<(
-        (Reverse<Distance>, AlwaysEqual<Distance>),
-        AlwaysEqual<PackedRefMut8<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
-    )>,
-    Distance,
-)
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
+) -> (Vec<MaxsimCandidate<'b>>, Distance)
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let meta_guard = index.read(0);
-    let meta_bytes = meta_guard.get(1).expect("data corruption");
-    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
-    let dim = meta_tuple.dim();
-    let is_residual = meta_tuple.is_residual();
-    let height_of_root = meta_tuple.height_of_root();
-    let cells = meta_tuple.cells().to_vec();
-    assert_eq!(dim, vector.dim(), "unmatched dimensions");
-    if height_of_root as usize != 1 + probes.len() {
-        panic!(
-            "usage: need {} probes, but {} probes provided",
-            height_of_root - 1,
-            probes.len()
-        );
-    }
-    debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
-
-    // (distance, norm, first, location). Until `exact_bounds` runs, the
-    // distance is a routing distance and may be approximate.
-    type State<'b> = Vec<(
-        Reverse<Distance>,
-        AlwaysEqual<f32>,
-        AlwaysEqual<u32>,
-        AlwaysEqual<Location<'b>>,
-    )>;
-    let mut state: State<'b> = if is_residual {
-        let prefetch =
-            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
-        let head = meta_tuple.centroid_head();
-        let distance = centroids::read::<R, O, _>(
-            prefetch.map(|id| index.read(id)),
-            head,
-            LAccess::new(
-                O::Vector::unpack(vector),
-                O::RoutingAccessor::default_with_dimension(dim),
-            ),
-        );
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
-        vec![(
-            Reverse(distance),
-            AlwaysEqual(norm),
-            AlwaysEqual(first),
-            AlwaysEqual(Some((head, prefetch))),
-        )]
-    } else {
-        // fast path
-        let distance = Distance::ZERO;
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
-        vec![(
-            Reverse(distance),
-            AlwaysEqual(norm),
-            AlwaysEqual(first),
-            AlwaysEqual(None),
-        )]
-    };
-
-    drop(meta_guard);
-    let lut = O::Vector::preprocess(vector);
-
-    let mut step = |state: State<'b>| {
-        let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
-            tape::read_h1_tape::<R, _, _>(
-                by_next(index, first),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                |(rough, err), head, norm, first, prefetch| {
-                    let lowerbound = Distance::from_f32(rough - err * epsilon);
-                    results.push((
-                        Reverse(lowerbound),
-                        AlwaysEqual(bump.alloc((
-                            first,
-                            norm,
-                            head,
-                            BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                        ))),
-                    ));
-                },
-            );
-        }
-        let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-        let mut cache = BinaryHeap::<(_, _, _, _)>::new();
-        std::iter::from_fn(move || {
-            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))), prefetch)) =
-                heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
-            {
-                let distance = centroids::read::<R, O, _>(
-                    prefetch,
-                    head,
-                    LAccess::new(
-                        O::Vector::unpack(vector),
-                        O::RoutingAccessor::default_with_dimension(dim),
-                    ),
-                );
-                cache.push((
-                    Reverse(distance),
-                    AlwaysEqual(norm),
-                    AlwaysEqual(first),
-                    AlwaysEqual(Some((head, pages))),
-                ));
-            }
-            cache.pop()
-        })
-    };
-
-    let mut it = None;
-    for i in 1..height_of_root {
-        let partial_scan = probes[i as usize - 1] < cells[(height_of_root - 1 - i) as usize];
-        let needs_sort = i + 1 == height_of_root && threshold != 0;
-        if partial_scan || is_residual || needs_sort {
-            let it = it.insert(step(state));
-            state = it.take(probes[i as usize - 1] as _).collect();
-        } else {
-            // fast path
-            let mut results = LinkedVec::new();
-            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in state {
-                tape::read_h1_tape::<R, _, _>(
-                    by_next(index, first),
-                    || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                    |(), _, norm, first, _| {
-                        results.push((
-                            Reverse(Distance::ZERO),
-                            AlwaysEqual(norm),
-                            AlwaysEqual(first),
-                            AlwaysEqual(None),
-                        ));
-                    },
-                );
-            }
-            state = results.into_vec();
-        }
-    }
-
-    // Non-residual formulas ignore `dis_f`; the fast path never computes it.
-    if is_residual && !O::routing_is_exact() {
-        exact_bounds::<R, O>(index, vector, dim, &mut state);
-    }
-
+    let mut searcher = Searcher::<_, O, _, _, _, _>::new(
+        index,
+        vector,
+        params,
+        bump,
+        prefetch_h1_vectors,
+        prefetch_h0_tuples,
+    );
+    let epsilon = params.epsilon;
+    let Route { lists, rest, .. } = searcher.route(&params.probes, threshold != 0);
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
-    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
-        // Between lists nothing is locked (#28).
-        index::interrupt::check();
-        let jump_guard = index.read(first);
-        let jump_bytes = jump_guard.get(1).expect("data corruption");
-        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut callback = id_2(|(rough, err), head, payload, prefetch| {
-            let lowerbound = Distance::from_f32(rough - err * epsilon);
-            let rough = Distance::from_f32(rough);
-            results.push((
-                (Reverse(lowerbound), AlwaysEqual(rough)),
-                AlwaysEqual(PackedRefMut8(bump.alloc((
-                    payload,
-                    head,
-                    BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
-                )))),
-            ));
-        });
-        if prefetch_h0_tuples.is_not_plain() {
-            let directory =
-                tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
-            tape::read_frozen_tape::<R, _, _>(
-                by_directory(&mut prefetch_h0_tuples, directory),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                &mut callback,
-            );
-        } else {
-            tape::read_frozen_tape::<R, _, _>(
-                by_next(index, jump_tuple.frozen_first()),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
-                &mut callback,
-            );
-        }
-        tape::read_appendable_tape::<R, _>(
-            by_next(index, jump_tuple.appendable_first()),
-            O::binary_access(&lut.1, is_residual, dis_f.to_f32(), norm),
-            &mut callback,
+    for list in lists {
+        let tuples = searcher.read_list(
+            list,
+            id_2(|(rough, err), head, payload, prefetch| {
+                let lowerbound = Distance::from_f32(rough - err * epsilon);
+                let rough = Distance::from_f32(rough);
+                results.push((
+                    (Reverse(lowerbound), AlwaysEqual(rough)),
+                    AlwaysEqual(PackedRefMut8(bump.alloc((
+                        payload,
+                        head,
+                        BorrowedIter::from_slice(prefetch, |x| bump.alloc_slice(x)),
+                    )))),
+                ));
+            }),
         );
-        threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
+        threshold = threshold.saturating_sub(tuples.min(u32::MAX as _) as _);
     }
     let mut estimation_by_threshold = Distance::NEG_INFINITY;
     // Remaining routing distances only estimate missing MaxSim terms; they are
     // not lower bounds and never reach the reranker.
-    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first), _) in it.into_iter().flatten() {
+    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first), _) in rest {
         if threshold == 0 {
             break;
         }

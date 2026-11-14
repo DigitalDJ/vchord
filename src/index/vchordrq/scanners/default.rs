@@ -14,7 +14,6 @@ use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
-use dary_heap::QuaternaryHeap as Heap;
 use index::bump::Bump;
 use index::filter::filter;
 use index::packed::PackedRefMut4;
@@ -23,6 +22,7 @@ use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadS
 use index_accessor::{Dot, L2S};
 use simd::f16;
 use std::num::NonZero;
+use std::rc::Rc;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{RerankMethod, default_search, how, rerank_heap, rerank_index};
 use vector::VectorOwned;
@@ -120,15 +120,7 @@ impl SearchBuilder for DefaultBuilder {
         if !opfamily.valid_cosine_query(&vector) {
             return Box::new(std::iter::empty());
         }
-        let search_hints = Hints::default().full(true);
         let rerank_hints = Hints::default().full(false);
-        let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };
-        let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-        let make_h0_simple_prefetcher = MakeH0SimplePrefetcher { index };
-        let make_h0_stream_prefetcher = MakeH0StreamPrefetcher {
-            index,
-            hints: search_hints,
-        };
         let f = move |(distance, payload)| (opfamily.output(distance), payload);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
@@ -140,37 +132,13 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -278,37 +246,13 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -416,37 +360,13 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -554,37 +474,13 @@ impl SearchBuilder for DefaultBuilder {
                         unreachable!()
                     };
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            projected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -691,37 +587,14 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let unprojected = Rc::new(unprojected);
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -828,37 +701,14 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let unprojected = Rc::new(unprojected);
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -965,37 +815,14 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let unprojected = Rc::new(unprojected);
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);
@@ -1102,37 +929,14 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    let results = match options.io_search {
-                        Io::Plain => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_plain_prefetcher,
-                        ),
-                        Io::Simple => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_simple_prefetcher,
-                        ),
-                        Io::Stream => default_search::<_, Op>(
-                            index,
-                            unprojected.as_borrowed(),
-                            options.probes,
-                            options.epsilon,
-                            bump,
-                            make_h1_plain_prefetcher,
-                            make_h0_stream_prefetcher,
-                        ),
-                    };
+                    let unprojected = Rc::new(unprojected);
+                    let sequence = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), options.search, bump)
+                    );
                     let method = how(index);
-                    let sequence = Heap::from(results);
                     match (method, options.io_rerank, options.prefilter) {
                         (RerankMethod::Index, Io::Plain, false) => {
                             let prefetcher = PlainPrefetcher::new(index, sequence);

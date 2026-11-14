@@ -17,6 +17,7 @@ use index::packed::PackedRefMut;
 use index::prefetcher::Prefetcher;
 use index::relation::{Page, RelationRead};
 use index_accessor::{Accessor2, DefaultWithDimension, LTryAccess};
+use std::borrow::Borrow;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::marker::PhantomData;
@@ -85,10 +86,10 @@ pub fn rerank_index<
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
     W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 >(
-    vector: O::Vector,
+    vector: impl Borrow<O::Vector>,
     prefetcher: P,
 ) -> Reranker<T, impl FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>, P, W> {
-    let dim = vector.as_borrowed().dim();
+    let dim = vector.borrow().as_borrowed().dim();
     Reranker {
         prefetcher,
         cache: BinaryHeap::new(),
@@ -98,7 +99,7 @@ pub fn rerank_index<
                 head,
                 payload,
                 LTryAccess::new(
-                    O::Vector::unpack(vector.as_borrowed()),
+                    O::Vector::unpack(vector.borrow().as_borrowed()),
                     O::DistanceAccessor::default_with_dimension(dim),
                 ),
             )
@@ -114,16 +115,16 @@ pub fn rerank_heap<
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
     W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 >(
-    vector: O::Vector,
+    vector: impl Borrow<O::Vector>,
     prefetcher: P,
     mut fetch: impl FnMut(NonZero<u64>) -> Option<O::Vector> + 'b,
 ) -> Reranker<T, impl FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>, P, W> {
-    let dim = vector.as_borrowed().dim();
+    let dim = vector.borrow().as_borrowed().dim();
     Reranker {
         prefetcher,
         cache: BinaryHeap::new(),
         f: id_4::<_, P, _, _, _>(move |payload, _, _| {
-            let unpack = O::Vector::unpack(vector.as_borrowed());
+            let unpack = O::Vector::unpack(vector.borrow().as_borrowed());
             let vector = fetch(payload)?;
             let vector = O::Vector::unpack(vector.as_borrowed());
             let mut accessor = O::DistanceAccessor::default_with_dimension(dim);
