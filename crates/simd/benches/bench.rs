@@ -211,10 +211,6 @@ fn floating_f16_dispatch(c: &mut Criterion) {
             |b| b.iter(|| f16::reduce_sum_of_d2_approx(black_box(&x), black_box(&y))),
         );
         c.bench_function(
-            &format!("floating_f16::dispatch::reduce_sum_of_x::{n}"),
-            |b| b.iter(|| f16::reduce_sum_of_x(black_box(&x))),
-        );
-        c.bench_function(
             &format!("floating_f16::dispatch::reduce_sum_of_abs_x::{n}"),
             |b| b.iter(|| f16::reduce_sum_of_abs_x(black_box(&x))),
         );
