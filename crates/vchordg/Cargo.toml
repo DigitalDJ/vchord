@@ -20,6 +20,7 @@ validator.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+index = { path = "../index", features = ["test-support"] }
 bumpalo.workspace = true
 
 [lints]

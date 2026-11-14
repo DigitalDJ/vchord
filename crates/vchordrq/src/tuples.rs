@@ -29,6 +29,18 @@ pub trait Tuple: 'static {
     fn serialize(&self) -> Vec<u8>;
 }
 
+/// The last part of a tuple whose elements may begin in parts on the pages before it.
+pub trait Parts {
+    type Tuple: Tuple;
+    type Element;
+    fn elements(&mut self) -> &mut Vec<Self::Element>;
+    fn size(&self) -> usize;
+    /// The most elements that a part holds in `freespace`.
+    fn fit(&self, freespace: u16) -> Option<usize>;
+    fn part(&self, elements: Vec<Self::Element>) -> Self::Tuple;
+    fn tuple(self) -> Self::Tuple;
+}
+
 pub trait WithReader: Tuple {
     type Reader<'a>;
     fn deserialize_ref(source: &[u8]) -> Self::Reader<'_>;
@@ -644,6 +656,30 @@ impl DirectoryTuple {
     }
 }
 
+impl Parts for DirectoryTuple {
+    type Tuple = Self;
+    type Element = u32;
+    fn elements(&mut self) -> &mut Vec<u32> {
+        match self {
+            Self::_0 { elements } | Self::_1 { elements } => elements,
+        }
+    }
+    fn size(&self) -> usize {
+        match self {
+            Self::_0 { elements } | Self::_1 { elements } => Self::estimate_size_0(elements.len()),
+        }
+    }
+    fn fit(&self, freespace: u16) -> Option<usize> {
+        Self::fit_1(freespace)
+    }
+    fn part(&self, elements: Vec<u32>) -> Self {
+        Self::_1 { elements }
+    }
+    fn tuple(self) -> Self {
+        self
+    }
+}
+
 impl Tuple for DirectoryTuple {
     fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::<u8>::new();
@@ -775,19 +811,20 @@ struct H1TupleHeader1 {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum H1Tuple {
-    _0 {
-        metadata: [[f32; 32]; 4],
-        delta: [f32; 32],
-        prefetch: Vec<[u32; 32]>,
-        head: [u16; 32],
-        norm: [f32; 32],
-        first: [u32; 32],
-        len: u32,
-        elements: Vec<[u8; 16]>,
-    },
-    _1 {
-        elements: Vec<[u8; 16]>,
-    },
+    _0(H1Tuple0),
+    _1 { elements: Vec<[u8; 16]> },
+}
+
+#[derive(Debug, Clone)]
+pub struct H1Tuple0 {
+    pub metadata: [[f32; 32]; 4],
+    pub delta: [f32; 32],
+    pub prefetch: Vec<[u32; 32]>,
+    pub head: [u16; 32],
+    pub norm: [f32; 32],
+    pub first: [u32; 32],
+    pub len: u32,
+    pub elements: Vec<[u8; 16]>,
 }
 
 impl H1Tuple {
@@ -816,11 +853,31 @@ impl H1Tuple {
     }
 }
 
+impl Parts for H1Tuple0 {
+    type Tuple = H1Tuple;
+    type Element = [u8; 16];
+    fn elements(&mut self) -> &mut Vec<[u8; 16]> {
+        &mut self.elements
+    }
+    fn size(&self) -> usize {
+        H1Tuple::estimate_size_0(self.prefetch.len(), self.elements.len())
+    }
+    fn fit(&self, freespace: u16) -> Option<usize> {
+        H1Tuple::fit_1(self.prefetch.len(), freespace)
+    }
+    fn part(&self, elements: Vec<[u8; 16]>) -> H1Tuple {
+        H1Tuple::_1 { elements }
+    }
+    fn tuple(self) -> H1Tuple {
+        H1Tuple::_0(self)
+    }
+}
+
 impl Tuple for H1Tuple {
     fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::<u8>::new();
         match self {
-            Self::_0 {
+            Self::_0(H1Tuple0 {
                 head,
                 norm,
                 metadata,
@@ -829,7 +886,7 @@ impl Tuple for H1Tuple {
                 prefetch,
                 len,
                 elements,
-            } => {
+            }) => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<H1TupleHeader0>()));
                 // prefetch
@@ -1117,17 +1174,18 @@ struct FrozenTupleHeader1 {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum FrozenTuple {
-    _0 {
-        metadata: [[f32; 32]; 4],
-        delta: [f32; 32],
-        payload: [Option<NonZero<u64>>; 32],
-        prefetch: Vec<[u32; 32]>,
-        head: [u16; 32],
-        elements: Vec<[u8; 16]>,
-    },
-    _1 {
-        elements: Vec<[u8; 16]>,
-    },
+    _0(FrozenTuple0),
+    _1 { elements: Vec<[u8; 16]> },
+}
+
+#[derive(Debug, Clone)]
+pub struct FrozenTuple0 {
+    pub metadata: [[f32; 32]; 4],
+    pub delta: [f32; 32],
+    pub payload: [Option<NonZero<u64>>; 32],
+    pub prefetch: Vec<[u32; 32]>,
+    pub head: [u16; 32],
+    pub elements: Vec<[u8; 16]>,
 }
 
 impl FrozenTuple {
@@ -1156,18 +1214,38 @@ impl FrozenTuple {
     }
 }
 
+impl Parts for FrozenTuple0 {
+    type Tuple = FrozenTuple;
+    type Element = [u8; 16];
+    fn elements(&mut self) -> &mut Vec<[u8; 16]> {
+        &mut self.elements
+    }
+    fn size(&self) -> usize {
+        FrozenTuple::estimate_size_0(self.prefetch.len(), self.elements.len())
+    }
+    fn fit(&self, freespace: u16) -> Option<usize> {
+        FrozenTuple::fit_1(self.prefetch.len(), freespace)
+    }
+    fn part(&self, elements: Vec<[u8; 16]>) -> FrozenTuple {
+        FrozenTuple::_1 { elements }
+    }
+    fn tuple(self) -> FrozenTuple {
+        FrozenTuple::_0(self)
+    }
+}
+
 impl Tuple for FrozenTuple {
     fn serialize(&self) -> Vec<u8> {
         let mut buffer = Vec::<u8>::new();
         match self {
-            FrozenTuple::_0 {
+            FrozenTuple::_0(FrozenTuple0 {
                 metadata,
                 delta,
                 payload,
                 prefetch,
                 head,
                 elements,
-            } => {
+            }) => {
                 buffer.extend((0 as Tag).to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<FrozenTupleHeader0>()));
                 // prefetch

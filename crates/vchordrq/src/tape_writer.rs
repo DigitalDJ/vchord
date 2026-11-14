@@ -31,25 +31,9 @@ where
         }
     }
     pub fn push(&mut self, branch: &[u32]) {
-        let mut remain = branch;
-        loop {
-            let freespace = self.tape.freespace();
-            if DirectoryTuple::estimate_size_0(remain.len()) <= freespace as usize {
-                self.tape.tape_put(DirectoryTuple::_0 {
-                    elements: remain.to_vec(),
-                });
-                break;
-            }
-            if let Some(w) = DirectoryTuple::fit_1(freespace) {
-                let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
-                self.tape.tape_put(DirectoryTuple::_1 {
-                    elements: left.to_vec(),
-                });
-                remain = right;
-            } else {
-                self.tape.tape_move();
-            }
-        }
+        self.tape.push_parts(DirectoryTuple::_0 {
+            elements: branch.to_vec(),
+        });
     }
     pub fn into_inner(self) -> TapeWriter<'a, R, DirectoryTuple> {
         self.tape
@@ -62,7 +46,6 @@ where
 {
     tape: TapeWriter<'a, R, H1Tuple>,
     branches: Vec<Branch<u32>>,
-    prefetch: usize,
 }
 
 impl<'a, R> H1TapeWriter<'a, R>
@@ -70,90 +53,57 @@ where
     R: RelationWrite + 'a,
     R::Page: Page<Opaque = Opaque>,
 {
-    pub fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
+    pub fn create(index: &'a R, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
-            prefetch,
         }
     }
     pub fn push(&mut self, branch: Branch<u32>) {
         self.branches.push(branch);
         if let Ok(chunk) = <&[_; 32]>::try_from(self.branches.as_slice()) {
-            let elements =
-                padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)));
-            let mut remain = elements.as_slice();
-            loop {
-                let freespace = self.tape.freespace();
-                if H1Tuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
-                    self.tape.tape_put(H1Tuple::_0 {
-                        metadata: [
-                            chunk.each_ref().map(|x| x.code.0.dis_u_2),
-                            chunk.each_ref().map(|x| x.code.0.factor_cnt),
-                            chunk.each_ref().map(|x| x.code.0.factor_ip),
-                            chunk.each_ref().map(|x| x.code.0.factor_err),
-                        ],
-                        delta: chunk.each_ref().map(|x| x.delta),
-                        prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
-                        norm: chunk.each_ref().map(|x| x.norm),
-                        head: chunk.each_ref().map(|x| x.head),
-                        first: chunk.each_ref().map(|x| x.extra),
-                        len: chunk.len() as _,
-                        elements: remain.to_vec(),
-                    });
-                    break;
-                }
-                if let Some(w) = H1Tuple::fit_1(self.prefetch, freespace) {
-                    let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
-                    self.tape.tape_put(H1Tuple::_1 {
-                        elements: left.to_vec(),
-                    });
-                    remain = right;
-                } else {
-                    self.tape.tape_move();
-                }
-            }
+            self.tape.push_parts(H1Tuple0 {
+                metadata: [
+                    chunk.each_ref().map(|x| x.code.0.dis_u_2),
+                    chunk.each_ref().map(|x| x.code.0.factor_cnt),
+                    chunk.each_ref().map(|x| x.code.0.factor_ip),
+                    chunk.each_ref().map(|x| x.code.0.factor_err),
+                ],
+                delta: chunk.each_ref().map(|x| x.delta),
+                prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
+                norm: chunk.each_ref().map(|x| x.norm),
+                head: chunk.each_ref().map(|x| x.head),
+                first: chunk.each_ref().map(|x| x.extra),
+                len: chunk.len() as _,
+                elements: padding_pack(
+                    chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)),
+                ),
+            });
             self.branches.clear();
         }
     }
     pub fn into_inner(self) -> (TapeWriter<'a, R, H1Tuple>, Vec<Branch<u32>>) {
         (self.tape, self.branches)
     }
-    pub fn flush(tape: &mut TapeWriter<'_, R, H1Tuple>, prefetch: usize, chunk: Vec<Branch<u32>>) {
+    pub fn flush(tape: &mut TapeWriter<'_, R, H1Tuple>, chunk: Vec<Branch<u32>>) {
         if chunk.is_empty() {
             return;
         }
-        let mut remain = padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)));
-        loop {
-            let freespace = tape.freespace();
-            if H1Tuple::estimate_size_0(prefetch, remain.len()) <= freespace as usize {
-                tape.tape_put(H1Tuple::_0 {
-                    metadata: [
-                        any_pack(chunk.iter().map(|x| x.code.0.dis_u_2)),
-                        any_pack(chunk.iter().map(|x| x.code.0.factor_cnt)),
-                        any_pack(chunk.iter().map(|x| x.code.0.factor_ip)),
-                        any_pack(chunk.iter().map(|x| x.code.0.factor_err)),
-                    ],
-                    delta: any_pack(chunk.iter().map(|x| x.delta)),
-                    prefetch: fix_bad(chunk.iter().map(|x| x.prefetch.as_slice())),
-                    head: any_pack(chunk.iter().map(|x| x.head)),
-                    norm: any_pack(chunk.iter().map(|x| x.norm)),
-                    first: any_pack(chunk.iter().map(|x| x.extra)),
-                    len: chunk.len() as _,
-                    elements: remain,
-                });
-                break;
-            }
-            if let Some(w) = H1Tuple::fit_1(prefetch, freespace) {
-                let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
-                tape.tape_put(H1Tuple::_1 {
-                    elements: left.to_vec(),
-                });
-                remain = right.to_vec();
-            } else {
-                tape.tape_move();
-            }
-        }
+        tape.push_parts(H1Tuple0 {
+            metadata: [
+                any_pack(chunk.iter().map(|x| x.code.0.dis_u_2)),
+                any_pack(chunk.iter().map(|x| x.code.0.factor_cnt)),
+                any_pack(chunk.iter().map(|x| x.code.0.factor_ip)),
+                any_pack(chunk.iter().map(|x| x.code.0.factor_err)),
+            ],
+            delta: any_pack(chunk.iter().map(|x| x.delta)),
+            prefetch: fix_bad(chunk.iter().map(|x| x.prefetch.as_slice())),
+            head: any_pack(chunk.iter().map(|x| x.head)),
+            norm: any_pack(chunk.iter().map(|x| x.norm)),
+            first: any_pack(chunk.iter().map(|x| x.extra)),
+            len: chunk.len() as _,
+            elements: padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1))),
+        });
     }
 }
 
@@ -163,7 +113,6 @@ where
 {
     tape: TapeWriter<'a, R, FrozenTuple>,
     branches: Vec<Branch<NonZero<u64>>>,
-    prefetch: usize,
 }
 
 impl<'a, R> FrozenTapeWriter<'a, R>
@@ -171,47 +120,30 @@ where
     R: RelationWrite + 'a,
     R::Page: Page<Opaque = Opaque>,
 {
-    pub fn create(index: &'a R, prefetch: usize, tracking_freespace: bool) -> Self {
+    pub fn create(index: &'a R, tracking_freespace: bool) -> Self {
         Self {
             tape: TapeWriter::create(index, tracking_freespace),
             branches: Vec::new(),
-            prefetch,
         }
     }
     pub fn push(&mut self, branch: Branch<NonZero<u64>>) {
         self.branches.push(branch);
         if let Ok(chunk) = <&[_; 32]>::try_from(self.branches.as_slice()) {
-            let elements =
-                padding_pack(chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)));
-            let mut remain = elements.as_slice();
-            loop {
-                let freespace = self.tape.freespace();
-                if FrozenTuple::estimate_size_0(self.prefetch, remain.len()) <= freespace as usize {
-                    self.tape.tape_put(FrozenTuple::_0 {
-                        metadata: [
-                            chunk.each_ref().map(|x| x.code.0.dis_u_2),
-                            chunk.each_ref().map(|x| x.code.0.factor_cnt),
-                            chunk.each_ref().map(|x| x.code.0.factor_ip),
-                            chunk.each_ref().map(|x| x.code.0.factor_err),
-                        ],
-                        delta: chunk.each_ref().map(|x| x.delta),
-                        prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
-                        head: chunk.each_ref().map(|x| x.head),
-                        payload: chunk.each_ref().map(|x| Some(x.extra)),
-                        elements: remain.to_vec(),
-                    });
-                    break;
-                }
-                if let Some(w) = FrozenTuple::fit_1(self.prefetch, freespace) {
-                    let (left, right) = remain.split_at(std::cmp::min(w, remain.len()));
-                    self.tape.tape_put(FrozenTuple::_1 {
-                        elements: left.to_vec(),
-                    });
-                    remain = right;
-                } else {
-                    self.tape.tape_move();
-                }
-            }
+            self.tape.push_parts(FrozenTuple0 {
+                metadata: [
+                    chunk.each_ref().map(|x| x.code.0.dis_u_2),
+                    chunk.each_ref().map(|x| x.code.0.factor_cnt),
+                    chunk.each_ref().map(|x| x.code.0.factor_ip),
+                    chunk.each_ref().map(|x| x.code.0.factor_err),
+                ],
+                delta: chunk.each_ref().map(|x| x.delta),
+                prefetch: fix_good(chunk.each_ref().map(|x| x.prefetch.as_slice())),
+                head: chunk.each_ref().map(|x| x.head),
+                payload: chunk.each_ref().map(|x| Some(x.extra)),
+                elements: padding_pack(
+                    chunk.iter().map(|x| rabitq::packing::pack_to_u4(&x.code.1)),
+                ),
+            });
             self.branches.clear();
         }
     }
@@ -252,4 +184,92 @@ fn fix_bad<'a>(into_iter: impl IntoIterator<Item = &'a [u32]>) -> Vec<[u32; 32]>
     let (arrays, remainder) = flattened.as_chunks::<32>();
     assert!(remainder.is_empty());
     arrays.to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use index::test_support::MemoryRelation;
+
+    fn branch<T>(i: usize, dim: usize, extra: T) -> Branch<T> {
+        Branch {
+            code: (
+                rabitq::bit::CodeMetadata::from_array([1.0; 4]),
+                (0..dim).map(|j| (i + j) % 3 == 0).collect(),
+            ),
+            delta: 0.0,
+            prefetch: vec![i as u32],
+            head: 0,
+            norm: 0.0,
+            extra,
+        }
+    }
+
+    #[test]
+    fn parts() {
+        for dim in [64, 768, 1000, 1536, 3000] {
+            let relation = MemoryRelation::<Opaque>::new([]);
+            let mut tape = FrozenTapeWriter::create(&relation, false);
+            let n = 32 * 40;
+            for i in 0..n {
+                tape.push(branch(i, dim, NonZero::new(1 + i as u64).unwrap()));
+            }
+            let first = tape.into_inner().0.first();
+            let mut rows = 0;
+            for guard in crate::tape::by_next(&relation, first) {
+                for i in 1..=guard.len() {
+                    match FrozenTuple::deserialize_ref(guard.get(i).unwrap()) {
+                        FrozenTupleReader::_0(tuple) => rows += tuple.payload().len(),
+                        FrozenTupleReader::_1(tuple) => {
+                            assert!(!tuple.elements().is_empty(), "dim {dim}: an empty part")
+                        }
+                    }
+                }
+            }
+            assert_eq!(rows, n);
+            let relation = MemoryRelation::<Opaque>::new([]);
+            let mut tape = H1TapeWriter::create(&relation, false);
+            let n = 32 * 40 + 7;
+            for i in 0..n {
+                tape.push(branch(i, dim, i as u32));
+            }
+            let (mut tape, chunk) = tape.into_inner();
+            H1TapeWriter::flush(&mut tape, chunk);
+            let first = { tape }.first();
+            let mut rows = 0;
+            for guard in crate::tape::by_next(&relation, first) {
+                for i in 1..=guard.len() {
+                    match H1Tuple::deserialize_ref(guard.get(i).unwrap()) {
+                        H1TupleReader::_0(tuple) => rows += tuple.len() as usize,
+                        H1TupleReader::_1(tuple) => {
+                            assert!(!tuple.elements().is_empty(), "dim {dim}: an empty part")
+                        }
+                    }
+                }
+            }
+            assert_eq!(rows, n);
+        }
+        for n in [1, 100, 2040, 2041, 5000, 20000] {
+            let relation = MemoryRelation::<Opaque>::new([]);
+            let mut tape = DirectoryTapeWriter::create(&relation, false);
+            let ids = (0..n).collect::<Vec<u32>>();
+            tape.push(&ids);
+            tape.push(&ids);
+            let first = tape.into_inner().first();
+            let mut read = Vec::new();
+            for guard in crate::tape::by_next(&relation, first) {
+                for i in 1..=guard.len() {
+                    let elements = match DirectoryTuple::deserialize_ref(guard.get(i).unwrap()) {
+                        DirectoryTupleReader::_0(tuple) => tuple.elements(),
+                        DirectoryTupleReader::_1(tuple) => {
+                            assert!(!tuple.elements().is_empty(), "{n}: an empty part");
+                            tuple.elements()
+                        }
+                    };
+                    read.extend_from_slice(elements);
+                }
+            }
+            assert_eq!(read, [ids.as_slice(), ids.as_slice()].concat());
+        }
+    }
 }

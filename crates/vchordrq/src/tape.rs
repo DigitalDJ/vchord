@@ -115,6 +115,34 @@ where
     }
 }
 
+impl<'a, R, T> TapeWriter<'a, R, T>
+where
+    R: RelationWrite + 'a,
+    R::Page: Page<Opaque = Opaque>,
+    T: Tuple,
+{
+    /// Writes `last`, its elements in parts on the pages it does not fit.
+    pub fn push_parts(&mut self, mut last: impl Parts<Tuple = T>) {
+        loop {
+            let freespace = self.freespace();
+            if last.size() <= freespace as usize {
+                self.tape_put(last.tuple());
+                return;
+            }
+            let n = last.elements().len();
+            match last.fit(freespace).map(|w| w.min(n)) {
+                // A part without elements would only fill the page's tail.
+                Some(w) if w > 0 => {
+                    let rest = last.elements().split_off(w);
+                    let part = std::mem::replace(last.elements(), rest);
+                    self.tape_put(last.part(part));
+                }
+                _ => self.tape_move(),
+            }
+        }
+    }
+}
+
 pub fn read_directory_tape<'b, R>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
 ) -> impl Iterator<Item = u32>

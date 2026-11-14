@@ -7,7 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
-use crate::operator::{Operator, Vector};
+use crate::operator::Operator;
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
 use crate::{Branch, Opaque, freepages, tape};
@@ -134,7 +134,7 @@ where
             })
         });
 
-        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dim) as _, false);
+        let mut tape = FrozenTapeWriter::create(&hooked_index, false);
 
         let mut trace_directory = Vec::new();
         let mut trace_forzen = Vec::new();

@@ -14,4 +14,6 @@ pub mod interrupt;
 pub mod packed;
 pub mod prefetcher;
 pub mod relation;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 pub mod tuples;
