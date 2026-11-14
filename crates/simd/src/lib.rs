@@ -192,16 +192,6 @@ impl F16 for f16 {
 pub trait Floating:
     Copy + Send + Sync + std::fmt::Debug + Default + 'static + PartialEq + PartialOrd
 {
-    fn zero() -> Self;
-    fn infinity() -> Self;
-    fn mask(self, m: bool) -> Self;
-
-    fn scalar_neg(this: Self) -> Self;
-    fn scalar_add(lhs: Self, rhs: Self) -> Self;
-    fn scalar_sub(lhs: Self, rhs: Self) -> Self;
-    fn scalar_mul(lhs: Self, rhs: Self) -> Self;
-
-    fn reduce_or_of_is_zero_x(this: &[Self]) -> bool;
     fn reduce_sum_of_abs_x(this: &[Self]) -> f32;
     fn reduce_sum_of_x2(this: &[Self]) -> f32;
     fn reduce_min_max_of_x(this: &[Self]) -> (f32, f32);
@@ -220,8 +210,6 @@ pub trait Floating:
     fn reduce_sum_of_d2_approx_is_exact() -> bool {
         true
     }
-    fn reduce_sum_of_xy_sparse(lidx: &[u32], lval: &[Self], ridx: &[u32], rval: &[Self]) -> f32;
-    fn reduce_sum_of_d2_sparse(lidx: &[u32], lval: &[Self], ridx: &[u32], rval: &[Self]) -> f32;
 
     fn vector_from_f32(this: &[f32]) -> Vec<Self>;
     fn vector_to_f32(this: &[Self]) -> Vec<f32>;

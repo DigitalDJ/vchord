@@ -10,46 +10,6 @@ use crate::{F16, Floating, f16};
 
 impl Floating for f16 {
     #[inline(always)]
-    fn zero() -> Self {
-        f16::_ZERO
-    }
-
-    #[inline(always)]
-    fn infinity() -> Self {
-        f16::INFINITY
-    }
-
-    #[inline(always)]
-    fn mask(self, m: bool) -> Self {
-        f16::from_bits(self.to_bits() & (m as u16).wrapping_neg())
-    }
-
-    #[inline(always)]
-    fn scalar_neg(this: Self) -> Self {
-        -this
-    }
-
-    #[inline(always)]
-    fn scalar_add(lhs: Self, rhs: Self) -> Self {
-        lhs + rhs
-    }
-
-    #[inline(always)]
-    fn scalar_sub(lhs: Self, rhs: Self) -> Self {
-        lhs - rhs
-    }
-
-    #[inline(always)]
-    fn scalar_mul(lhs: Self, rhs: Self) -> Self {
-        lhs * rhs
-    }
-
-    #[inline(always)]
-    fn reduce_or_of_is_zero_x(this: &[f16]) -> bool {
-        reduce_or_of_is_zero_x::reduce_or_of_is_zero_x(this)
-    }
-
-    #[inline(always)]
     fn reduce_sum_of_abs_x(this: &[f16]) -> f32 {
         this.iter().map(|x| x._to_f32().abs()).sum()
     }
@@ -86,16 +46,6 @@ impl Floating for f16 {
     #[inline(always)]
     fn reduce_sum_of_d2_approx_is_exact() -> bool {
         !reduce_sum_of_d2_approx::is_fast_path_detected()
-    }
-
-    #[inline(always)]
-    fn reduce_sum_of_xy_sparse(lidx: &[u32], lval: &[f16], ridx: &[u32], rval: &[f16]) -> f32 {
-        reduce_sum_of_xy_sparse::reduce_sum_of_xy_sparse(lidx, lval, ridx, rval)
-    }
-
-    #[inline(always)]
-    fn reduce_sum_of_d2_sparse(lidx: &[u32], lval: &[f16], ridx: &[u32], rval: &[f16]) -> f32 {
-        reduce_sum_of_d2_sparse::reduce_sum_of_d2_sparse(lidx, lval, ridx, rval)
     }
 
     #[inline(always)]
@@ -146,22 +96,6 @@ impl Floating for f16 {
     #[inline(always)]
     fn vector_abs_inplace(this: &mut [Self]) {
         vector_abs_inplace::vector_abs_inplace(this);
-    }
-}
-
-mod reduce_or_of_is_zero_x {
-    use crate::{F16, f16};
-
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn reduce_or_of_is_zero_x(this: &[f16]) -> bool {
-        for &x in this {
-            if x == f16::_ZERO {
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -574,85 +508,6 @@ mod reduce_sum_of_d2_approx {
                 }
             }
         }
-    }
-}
-
-mod reduce_sum_of_xy_sparse {
-    // There is no manually-implemented SIMD version.
-    // Add it if `svecf16` is supported.
-
-    use crate::{F16, f16};
-
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn reduce_sum_of_xy_sparse(lidx: &[u32], lval: &[f16], ridx: &[u32], rval: &[f16]) -> f32 {
-        use std::cmp::Ordering;
-        assert_eq!(lidx.len(), lval.len());
-        assert_eq!(ridx.len(), rval.len());
-        let (mut lp, ln) = (0, lidx.len());
-        let (mut rp, rn) = (0, ridx.len());
-        let mut sum = 0.0f32;
-        while lp < ln && rp < rn {
-            match Ord::cmp(&lidx[lp], &ridx[rp]) {
-                Ordering::Equal => {
-                    sum += lval[lp]._to_f32() * rval[rp]._to_f32();
-                    lp += 1;
-                    rp += 1;
-                }
-                Ordering::Less => {
-                    lp += 1;
-                }
-                Ordering::Greater => {
-                    rp += 1;
-                }
-            }
-        }
-        sum
-    }
-}
-
-mod reduce_sum_of_d2_sparse {
-    // There is no manually-implemented SIMD version.
-    // Add it if `svecf16` is supported.
-
-    use crate::{F16, f16};
-
-    #[crate::multiversion(
-        "v4", "v3", "v2", "a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1"
-    )]
-    pub fn reduce_sum_of_d2_sparse(lidx: &[u32], lval: &[f16], ridx: &[u32], rval: &[f16]) -> f32 {
-        use std::cmp::Ordering;
-        assert_eq!(lidx.len(), lval.len());
-        assert_eq!(ridx.len(), rval.len());
-        let (mut lp, ln) = (0, lidx.len());
-        let (mut rp, rn) = (0, ridx.len());
-        let mut sum = 0.0f32;
-        while lp < ln && rp < rn {
-            match Ord::cmp(&lidx[lp], &ridx[rp]) {
-                Ordering::Equal => {
-                    let d = lval[lp]._to_f32() - rval[rp]._to_f32();
-                    sum += d * d;
-                    lp += 1;
-                    rp += 1;
-                }
-                Ordering::Less => {
-                    sum += lval[lp]._to_f32() * lval[lp]._to_f32();
-                    lp += 1;
-                }
-                Ordering::Greater => {
-                    sum += rval[rp]._to_f32() * rval[rp]._to_f32();
-                    rp += 1;
-                }
-            }
-        }
-        for i in lp..ln {
-            sum += lval[i]._to_f32() * lval[i]._to_f32();
-        }
-        for i in rp..rn {
-            sum += rval[i]._to_f32() * rval[i]._to_f32();
-        }
-        sum
     }
 }
 

@@ -28,64 +28,6 @@ pub unsafe fn partial<T: Copy, const N: usize>(p: *const T, len: usize, fill: T)
     r
 }
 
-// VP2INTERSECT emulation.
-// Díez-Cañas, G. (2021). Faster-Than-Native Alternatives for x86 VP2INTERSECT
-// Instructions. arXiv preprint arXiv:2112.06342.
-#[inline]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub fn emulate_mm512_2intersect_epi32(
-    a: core::arch::x86_64::__m512i,
-    b: core::arch::x86_64::__m512i,
-) -> (core::arch::x86_64::__mmask16, core::arch::x86_64::__mmask16) {
-    use core::arch::x86_64::*;
-
-    let a1 = _mm512_alignr_epi32(a, a, 4);
-    let a2 = _mm512_alignr_epi32(a, a, 8);
-    let a3 = _mm512_alignr_epi32(a, a, 12);
-    let b1 = _mm512_shuffle_epi32(b, _MM_PERM_ADCB);
-    let b2 = _mm512_shuffle_epi32(b, _MM_PERM_BADC);
-    let b3 = _mm512_shuffle_epi32(b, _MM_PERM_CBAD);
-    let m00 = _mm512_cmpeq_epi32_mask(a, b);
-    let m01 = _mm512_cmpeq_epi32_mask(a, b1);
-    let m02 = _mm512_cmpeq_epi32_mask(a, b2);
-    let m03 = _mm512_cmpeq_epi32_mask(a, b3);
-    let m10 = _mm512_cmpeq_epi32_mask(a1, b);
-    let m11 = _mm512_cmpeq_epi32_mask(a1, b1);
-    let m12 = _mm512_cmpeq_epi32_mask(a1, b2);
-    let m13 = _mm512_cmpeq_epi32_mask(a1, b3);
-    let m20 = _mm512_cmpeq_epi32_mask(a2, b);
-    let m21 = _mm512_cmpeq_epi32_mask(a2, b1);
-    let m22 = _mm512_cmpeq_epi32_mask(a2, b2);
-    let m23 = _mm512_cmpeq_epi32_mask(a2, b3);
-    let m30 = _mm512_cmpeq_epi32_mask(a3, b);
-    let m31 = _mm512_cmpeq_epi32_mask(a3, b1);
-    let m32 = _mm512_cmpeq_epi32_mask(a3, b2);
-    let m33 = _mm512_cmpeq_epi32_mask(a3, b3);
-
-    let m0 = m00 | m10 | m20 | m30;
-    let m1 = m01 | m11 | m21 | m31;
-    let m2 = m02 | m12 | m22 | m32;
-    let m3 = m03 | m13 | m23 | m33;
-
-    let res_a = m00
-        | m01
-        | m02
-        | m03
-        | (m10 | m11 | m12 | m13).rotate_left(4)
-        | (m20 | m21 | m22 | m23).rotate_left(8)
-        | (m30 | m31 | m32 | m33).rotate_right(4);
-
-    let res_b = m0
-        | ((0x7777 & m1) << 1)
-        | ((m1 >> 3) & 0x1111)
-        | ((0x3333 & m2) << 2)
-        | ((m2 >> 2) & 0x3333)
-        | ((0x1111 & m3) << 3)
-        | ((m3 >> 1) & 0x7777);
-    (res_a, res_b)
-}
-
 #[inline]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
