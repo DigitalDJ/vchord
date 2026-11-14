@@ -604,10 +604,10 @@ CREATE OPERATOR CLASS rabitq4_maxsim_ops
     OPERATOR 3 @# (rabitq4[], rabitq4[]) FOR ORDER BY float_ops,
     FUNCTION 1 _vchordrq_support_rabitq4_maxsim_ops();
 
--- Filter key columns store the key itself. The optional `bytes`, as in
--- `key uuid_ops (bytes = 4)`, stores a hash of that width instead: smaller
--- blocks and slightly faster scans, but PostgreSQL rechecks the key on the
--- returned rows and different keys can share a hash.
+-- Filter key columns store the key itself; put the most selective first. The
+-- optional `bytes`, as in `key uuid_ops (bytes = 4)`, stores a hash of that
+-- width instead: smaller blocks and slightly faster scans, but PostgreSQL
+-- rechecks the key on the returned rows and different keys can share a hash.
 
 CREATE OPERATOR CLASS uuid_ops
     DEFAULT FOR TYPE uuid USING vchordrq FAMILY uuid_ops AS

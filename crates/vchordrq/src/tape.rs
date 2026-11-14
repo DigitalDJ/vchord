@@ -144,86 +144,6 @@ where
     }
 }
 
-pub fn read_directory_tape<'b, R>(
-    iter: impl Iterator<Item = R::ReadGuard<'b>>,
-) -> impl Iterator<Item = u32>
-where
-    R: RelationRead + 'b,
-{
-    use std::pin::Pin;
-    use std::ptr::NonNull;
-
-    #[pin_project::pin_project]
-    struct State<'b, R: RelationRead + 'b, I> {
-        slice: NonNull<[u32]>,
-        #[pin]
-        now: Option<(R::ReadGuard<'b>, u16)>,
-        iter: I,
-    }
-
-    impl<'b, R: RelationRead + 'b, I: Iterator<Item = R::ReadGuard<'b>>> State<'b, R, I> {
-        fn init(self: Pin<&mut Self>) {
-            let mut this = self.project();
-            let now = this.iter.next().map(|guard| (guard, 0));
-            this.now.set(now);
-        }
-
-        fn next(mut self: Pin<&mut Self>) -> Option<u32> {
-            loop {
-                let mut this = self.as_mut().project();
-                // Safety: If the slice is not empty, the function will return immediately,
-                // so the guard will not be moved or dropped and the slice remains valid. If
-                // the slice is empty, a pointer is trivially never dangling, so it's safe
-                // to use.
-                #[allow(unsafe_code)]
-                if let Some((first, more)) = unsafe { this.slice.as_ref() }.split_first() {
-                    *this.slice = more.into();
-                    return Some(*first);
-                }
-                // Safety: `guard` is never moved in this block
-                #[allow(unsafe_code)]
-                if let Some((guard, i)) = unsafe { this.now.as_mut().get_unchecked_mut() } {
-                    if *i < guard.len() {
-                        *i += 1;
-                        let bytes = guard.get(*i).expect("data corruption");
-                        let tuple = DirectoryTuple::deserialize_ref(bytes);
-                        *this.slice = match tuple {
-                            DirectoryTupleReader::_0(tuple) => tuple.elements(),
-                            DirectoryTupleReader::_1(tuple) => tuple.elements(),
-                        }
-                        .into();
-                        continue;
-                    }
-                } else {
-                    return None;
-                }
-                let now = this.iter.next().map(|guard| (guard, 0));
-                this.now.set(now);
-            }
-        }
-    }
-
-    let mut state = Box::pin(State::<'b, R, _> {
-        slice: NonNull::from(&mut []),
-        now: None,
-        iter,
-    });
-
-    impl<'b, R: RelationRead + 'b, I: Iterator<Item = R::ReadGuard<'b>>> Iterator
-        for Pin<Box<State<'b, R, I>>>
-    {
-        type Item = u32;
-
-        fn next(&mut self) -> Option<u32> {
-            self.as_mut().next()
-        }
-    }
-
-    state.as_mut().init();
-
-    state
-}
-
 pub fn by_directory<'b, R>(
     p: &mut impl PrefetcherSequenceFamily<'b, R>,
     iter: impl Iterator<Item = u32>,
@@ -300,12 +220,26 @@ pub fn read_h1_tape<'b, R, A, T>(
 
 /// Selects the rows a tape reader passes on; `()` selects every row.
 pub trait Filter: Copy {
+    /// Whether to read only the blocks that [`Filter::ranges`] selects ([`plan`]).
+    fn selects_blocks(self) -> bool;
+    /// The blocks whose first-key range meets the filter.
+    fn ranges(self, ranges: &[u32; 32]) -> u32;
     /// The rows of a frozen block to pass on.
     fn block(self, columns: &[u8]) -> u32;
     fn row(self, columns: Columns<'_>) -> bool;
 }
 
 impl Filter for () {
+    #[inline(always)]
+    fn selects_blocks(self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn ranges(self, _: &[u32; 32]) -> u32 {
+        u32::MAX
+    }
+
     #[inline(always)]
     fn block(self, _: &[u8]) -> u32 {
         u32::MAX
@@ -326,8 +260,57 @@ pub struct Row<'a, T> {
     pub columns: Columns<'a>,
 }
 
+/// The blocks of a frozen tape that a reader reads, over the pages it is given.
+pub trait Blocks {
+    /// The block that the first tuple of the next page belongs to.
+    fn page(&mut self) -> u32;
+    fn contains(&self, b: u32) -> bool;
+}
+
+pub struct All;
+
+impl Blocks for All {
+    #[inline(always)]
+    fn page(&mut self) -> u32 {
+        0
+    }
+
+    #[inline(always)]
+    fn contains(&self, _: u32) -> bool {
+        true
+    }
+}
+
+pub struct Selected<'a> {
+    firsts: std::slice::Iter<'a, u32>,
+    masks: &'a [u32],
+}
+
+impl<'a> Selected<'a> {
+    pub fn new(firsts: &'a [u32], masks: &'a [u32]) -> Self {
+        Self {
+            firsts: firsts.iter(),
+            masks,
+        }
+    }
+}
+
+impl Blocks for Selected<'_> {
+    #[inline(always)]
+    fn page(&mut self) -> u32 {
+        *self.firsts.next().unwrap()
+    }
+
+    #[inline(always)]
+    fn contains(&self, b: u32) -> bool {
+        self.masks[b as usize / 32] >> (b % 32) & 1 != 0
+    }
+}
+
+/// Reads the selected rows; `pages` must hold every part of a selected block.
 pub fn read_frozen_tape<'b, R, A, T>(
-    iter: impl Iterator<Item = R::ReadGuard<'b>>,
+    pages: impl Iterator<Item = R::ReadGuard<'b>>,
+    mut blocks: impl Blocks,
     accessor: impl Fn() -> A,
     filter: impl Filter,
     mut callback: impl for<'a> FnMut(Row<'a, T>),
@@ -336,13 +319,20 @@ pub fn read_frozen_tape<'b, R, A, T>(
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
 {
     let mut x = None;
-    for guard in iter {
+    for guard in pages {
+        let mut b = blocks.page();
         for i in 1..=guard.len() {
+            let selected = blocks.contains(b);
             let bytes = guard.get(i).expect("data corruption");
             let tuple = FrozenTuple::deserialize_ref(bytes);
             match tuple {
                 FrozenTupleReader::_0(tuple) => {
-                    let mask = filter.block(tuple.columns());
+                    b += 1;
+                    let mask = if selected {
+                        filter.block(tuple.columns())
+                    } else {
+                        0
+                    };
                     if mask == 0 {
                         // Skip the block, with the parts of it pushed so far.
                         x = None;
@@ -370,11 +360,118 @@ pub fn read_frozen_tape<'b, R, A, T>(
                     }
                 }
                 FrozenTupleReader::_1(tuple) => {
-                    x.get_or_insert_with(&accessor).push(tuple.elements());
+                    if selected {
+                        x.get_or_insert_with(&accessor).push(tuple.elements());
+                    }
                 }
             }
         }
     }
+}
+
+/// Marks a page's first block as begun on an earlier page.
+pub const CONTINUED: u32 = 1 << 31;
+
+/// The page ids and the layout of a frozen tape, as its pages and tuples are read.
+#[derive(Debug, Default)]
+pub struct Layout {
+    pub ids: Vec<u32>,
+    firsts: Vec<u32>,
+    ranges: Vec<u32>,
+    continued: bool,
+}
+
+impl Layout {
+    pub fn page(&mut self, id: u32) {
+        let continued = if self.continued { CONTINUED } else { 0 };
+        self.ids.push(id);
+        self.firsts.push(self.ranges.len() as u32 | continued);
+    }
+    /// A block's last part with its range, or `None` for a part before it.
+    pub fn tuple(&mut self, range: Option<u32>) {
+        self.continued = range.is_none();
+        self.ranges.extend(range);
+    }
+    /// The words that follow the page ids in the directory.
+    pub fn words(&self) -> Vec<u32> {
+        [self.firsts.as_slice(), self.ranges.as_slice()].concat()
+    }
+}
+
+/// Reads the page ids, and with `layout` the layout, into `words`; returns the page count.
+pub fn read_directory_words<'b, R>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
+    words: &mut Vec<u32>,
+    layout: bool,
+) -> usize
+where
+    R: RelationRead + 'b,
+{
+    words.clear();
+    let mut pages = 0;
+    for guard in iter {
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            let (elements, is_id) = match DirectoryTuple::deserialize_ref(bytes) {
+                DirectoryTupleReader::_0(tuple) => (tuple.elements(), true),
+                DirectoryTupleReader::_1(tuple) => (tuple.elements(), true),
+                DirectoryTupleReader::_2(tuple) => (tuple.elements(), false),
+            };
+            if !is_id && !layout {
+                // the layout follows every page id
+                return pages;
+            }
+            words.extend_from_slice(elements);
+            pages += if is_id { elements.len() } else { 0 };
+        }
+    }
+    pages
+}
+
+/// The pages to read and their selected blocks, or `None` to read every page.
+pub fn plan(words: &mut [u32], pages: usize, filter: impl Filter) -> Option<usize> {
+    let (ids, layout) = words.split_at_mut(pages);
+    let (firsts, ranges) = layout.split_at_mut_checked(pages)?;
+    let blocks = ranges.len();
+    let masks = select_blocks(filter, ranges);
+    if masks.iter().map(|x| x.count_ones() as usize).sum::<usize>() == blocks {
+        return None;
+    }
+    Some(select_pages(ids, firsts, masks, blocks))
+}
+
+/// Replaces the ranges with the bitmask of the blocks `filter` selects, a word per 32 blocks.
+fn select_blocks(filter: impl Filter, ranges: &mut [u32]) -> &[u32] {
+    let n = ranges.len().div_ceil(32);
+    for i in 0..n {
+        // word `i` is written once the chunk `i` that holds it is read
+        let chunk = &ranges[32 * i..ranges.len().min(32 * (i + 1))];
+        let len = chunk.len();
+        let mut padded = [crate::keys::EMPTY_RANGE; 32];
+        padded[..len].copy_from_slice(chunk);
+        ranges[i] = filter.ranges(&padded) & u32::MAX >> (32 - len);
+    }
+    &ranges[..n]
+}
+
+/// Keeps the pages that hold a selected block's part, in place; returns how many.
+fn select_pages(ids: &mut [u32], firsts: &mut [u32], masks: &[u32], blocks: usize) -> usize {
+    let n = ids.len();
+    let mut kept = 0;
+    for i in 0..n {
+        let first = firsts[i] & !CONTINUED;
+        // the blocks with a part on page `i` are `first..end`
+        let end = match firsts.get(i + 1) {
+            Some(&next) => (next & !CONTINUED) + (next >> 31),
+            None => blocks as u32,
+        };
+        if (first..end).any(|j| masks[j as usize / 32] >> (j % 32) & 1 != 0) {
+            ids[kept] = ids[i];
+            firsts[kept] = first;
+            kept += 1;
+        }
+    }
+    kept
 }
 
 pub fn read_appendable_tape<'b, R, T>(
@@ -488,6 +585,108 @@ where
             } else {
                 current = read.get_opaque().next;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::KeyFilter;
+
+    fn filter(keys: Vec<u16>) -> KeyFilter {
+        let set = keys.into_iter().map(u128::from).collect();
+        let keys = crate::keys::Keys::new([(crate::keys::Width::W2, true)]);
+        KeyFilter::new(&keys, vec![Some(set)]).unwrap()
+    }
+
+    /// Per page, its tuples as (block, whether the block's last), and the blocks' sorted ranges.
+    fn tape() -> (Vec<Vec<(usize, bool)>>, Vec<u32>) {
+        let blocks = rand::random::<u32>() as usize % 100;
+        let mut pages = vec![Vec::new()];
+        for j in 0..blocks {
+            let n = 1 + rand::random::<u32>() as usize % 4;
+            for k in 0..n {
+                if !pages.last().unwrap().is_empty() && rand::random::<u8>() % 3 == 0 {
+                    pages.push(Vec::new());
+                }
+                pages.last_mut().unwrap().push((j, k == n - 1));
+            }
+        }
+        let mut tags = (0..2 * blocks)
+            .map(|_| rand::random::<u16>() % 1000)
+            .collect::<Vec<_>>();
+        tags.sort_unstable();
+        let ranges = (0..blocks)
+            .map(|j| tags[2 * j] as u32 | (tags[2 * j + 1] as u32) << 16)
+            .collect();
+        (pages, ranges)
+    }
+
+    fn directory(pages: &[Vec<(usize, bool)>], ranges: &[u32], layout: bool) -> Vec<u32> {
+        let mut x = Layout::default();
+        for (i, page) in pages.iter().enumerate() {
+            x.page(7000 + i as u32);
+            for &(j, last) in page {
+                x.tuple(last.then(|| ranges[j]));
+            }
+        }
+        let mut words = x.ids.clone();
+        if layout {
+            words.extend(x.words());
+        }
+        words
+    }
+
+    #[test]
+    fn layout() {
+        for _ in 0..256 {
+            let (pages, ranges) = tape();
+            let wanted = (0..1 + rand::random::<u32>() % 4)
+                .map(|_| rand::random::<u16>() % 1000)
+                .collect::<Vec<_>>();
+            let filter = filter(wanted.clone());
+            let meets = |r: u32| {
+                let (min, max) = (r as u16, (r >> 16) as u16);
+                wanted.iter().any(|&t| min <= t && t <= max)
+            };
+            let mut words = directory(&pages, &ranges, true);
+            let n = pages.len();
+            let Some(kept) = plan(&mut words, n, &filter) else {
+                assert!(ranges.iter().all(|&r| meets(r)));
+                continue;
+            };
+            let (ids, layout) = words.split_at(n);
+            let (firsts, masks) = layout.split_at(n);
+            for (j, &r) in ranges.iter().enumerate() {
+                assert_eq!(masks[j / 32] >> (j % 32) & 1 != 0, meets(r));
+            }
+            let expected = (0..n)
+                .filter(|&i| pages[i].iter().any(|&(j, _)| meets(ranges[j])))
+                .map(|i| 7000 + i as u32)
+                .collect::<Vec<_>>();
+            assert_eq!(&ids[..kept], expected);
+            for (&id, &first) in std::iter::zip(&ids[..kept], &firsts[..kept]) {
+                let mut j = first as usize;
+                for &(block, last) in &pages[(id - 7000) as usize] {
+                    assert_eq!(j, block);
+                    j += last as usize;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layout_all() {
+        for _ in 0..64 {
+            let (pages, ranges) = tape();
+            let n = pages.len();
+            let some = filter(vec![rand::random::<u16>() % 1000]);
+            let mut words = directory(&pages, &ranges, false);
+            assert_eq!(plan(&mut words, n, &some), None);
+            let all = filter((0..1000).collect());
+            let mut words = directory(&pages, &ranges, true);
+            assert_eq!(plan(&mut words, n, &all), None);
         }
     }
 }

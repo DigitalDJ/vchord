@@ -147,12 +147,23 @@ where
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
+    // what a keyed list may take to be sorted: maintenance memory, as a vacuum reads it
+    let memory = unsafe {
+        use pgrx::pg_sys::{BackendType, MyBackendType, autovacuum_work_mem, maintenance_work_mem};
+        if MyBackendType == BackendType::B_AUTOVAC_WORKER && autovacuum_work_mem != -1 {
+            autovacuum_work_mem
+        } else {
+            maintenance_work_mem
+        }
+    } as usize
+        * 1024;
     let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
             vchordrq::maintain::<_, Op<VectOwned<f32>, L2S>>(
                 index,
                 make_h0_plain_prefetcher,
                 chooser,
+                memory,
                 check,
             )
         }
@@ -161,6 +172,7 @@ where
                 index,
                 make_h0_plain_prefetcher,
                 chooser,
+                memory,
                 check,
             )
         }
@@ -169,6 +181,7 @@ where
                 index,
                 make_h0_plain_prefetcher,
                 chooser,
+                memory,
                 check,
             )
         }
@@ -177,6 +190,7 @@ where
                 index,
                 make_h0_plain_prefetcher,
                 chooser,
+                memory,
                 check,
             )
         }
@@ -184,24 +198,28 @@ where
             index,
             make_h0_plain_prefetcher,
             chooser,
+            memory,
             check,
         ),
         (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq8Owned, Dot>>(
             index,
             make_h0_plain_prefetcher,
             chooser,
+            memory,
             check,
         ),
         (VectorKind::Rabitq4, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq4Owned, L2S>>(
             index,
             make_h0_plain_prefetcher,
             chooser,
+            memory,
             check,
         ),
         (VectorKind::Rabitq4, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq4Owned, Dot>>(
             index,
             make_h0_plain_prefetcher,
             chooser,
+            memory,
             check,
         ),
     };

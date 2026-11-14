@@ -658,10 +658,13 @@ struct DirectoryTupleHeader1 {
     _padding_0: [Padding; 4],
 }
 
+/// Page ids (`_0`, `_1`), then in keyed indexes the layout (`_2`): per page its first block, with
+/// `tape::CONTINUED`; per block its first-key range.
 #[derive(Debug, Clone)]
 pub enum DirectoryTuple {
     _0 { elements: Vec<u32> },
     _1 { elements: Vec<u32> },
+    _2 { elements: Vec<u32> },
 }
 
 impl DirectoryTuple {
@@ -692,19 +695,24 @@ impl Parts for DirectoryTuple {
     type Element = u32;
     fn elements(&mut self) -> &mut Vec<u32> {
         match self {
-            Self::_0 { elements } | Self::_1 { elements } => elements,
+            Self::_0 { elements } | Self::_1 { elements } | Self::_2 { elements } => elements,
         }
     }
     fn size(&self) -> usize {
         match self {
-            Self::_0 { elements } | Self::_1 { elements } => Self::estimate_size_0(elements.len()),
+            Self::_0 { elements } | Self::_1 { elements } | Self::_2 { elements } => {
+                Self::estimate_size_0(elements.len())
+            }
         }
     }
     fn fit(&self, freespace: u16) -> Option<usize> {
         Self::fit_1(freespace)
     }
     fn part(&self, elements: Vec<u32>) -> Self {
-        Self::_1 { elements }
+        match self {
+            Self::_2 { .. } => Self::_2 { elements },
+            _ => Self::_1 { elements },
+        }
     }
     fn tuple(self) -> Self {
         self
@@ -735,8 +743,9 @@ impl Tuple for DirectoryTuple {
                     .as_bytes(),
                 );
             }
-            Self::_1 { elements } => {
-                buffer.extend((1 as Tag).to_ne_bytes());
+            Self::_1 { elements } | Self::_2 { elements } => {
+                let tag: Tag = if let Self::_1 { .. } = self { 1 } else { 2 };
+                buffer.extend(tag.to_ne_bytes());
                 buffer.extend(std::iter::repeat_n(0, size_of::<DirectoryTupleHeader1>()));
                 // elements
                 let elements_s = buffer.len() as u16;
@@ -778,6 +787,12 @@ impl WithReader for DirectoryTuple {
                 let elements = checker.bytes(header.elements_s, header.elements_e);
                 DirectoryTupleReader::_1(DirectoryTupleReader1 { header, elements })
             }
+            2 => {
+                let checker = RefChecker::new(source);
+                let header: &DirectoryTupleHeader1 = checker.prefix(size_of::<Tag>());
+                let elements = checker.bytes(header.elements_s, header.elements_e);
+                DirectoryTupleReader::_2(DirectoryTupleReader1 { header, elements })
+            }
             _ => panic!("deserialization: bad bytes"),
         }
     }
@@ -787,6 +802,7 @@ impl WithReader for DirectoryTuple {
 pub enum DirectoryTupleReader<'a> {
     _0(DirectoryTupleReader0<'a>),
     _1(DirectoryTupleReader1<'a>),
+    _2(DirectoryTupleReader1<'a>),
 }
 
 #[derive(Debug, Clone, Copy)]

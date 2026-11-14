@@ -14,7 +14,6 @@ simd = { path = "../simd" }
 vector = { path = "../vector" }
 
 dary_heap.workspace = true
-pin-project = "1.1.13"
 serde.workspace = true
 validator.workspace = true
 zerocopy.workspace = true

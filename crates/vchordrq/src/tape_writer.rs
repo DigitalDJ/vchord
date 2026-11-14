@@ -36,6 +36,11 @@ where
             elements: branch.to_vec(),
         });
     }
+    pub fn push_layout(&mut self, layout: &[u32]) {
+        self.tape.push_parts(DirectoryTuple::_2 {
+            elements: layout.to_vec(),
+        });
+    }
     pub fn into_inner(self) -> TapeWriter<'a, R, DirectoryTuple> {
         self.tape
     }
@@ -272,13 +277,14 @@ mod tests {
             let ids = (0..n).collect::<Vec<u32>>();
             tape.push(&ids);
             tape.push(&ids);
+            tape.push_layout(&ids);
             let first = tape.into_inner().first();
             let mut read = Vec::new();
             for guard in crate::tape::by_next(&relation, first) {
                 for i in 1..=guard.len() {
                     let elements = match DirectoryTuple::deserialize_ref(guard.get(i).unwrap()) {
                         DirectoryTupleReader::_0(tuple) => tuple.elements(),
-                        DirectoryTupleReader::_1(tuple) => {
+                        DirectoryTupleReader::_1(tuple) | DirectoryTupleReader::_2(tuple) => {
                             assert!(!tuple.elements().is_empty(), "{n}: an empty part");
                             tuple.elements()
                         }
@@ -286,7 +292,10 @@ mod tests {
                     read.extend_from_slice(elements);
                 }
             }
-            assert_eq!(read, [ids.as_slice(), ids.as_slice()].concat());
+            assert_eq!(
+                read,
+                [ids.as_slice(), ids.as_slice(), ids.as_slice()].concat()
+            );
         }
     }
 }

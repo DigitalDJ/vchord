@@ -7,11 +7,13 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 //! Each filter key is a column; its hashes and stored forms are on disk and must never change.
+//! Block ranges hold whatever the order of the rows, so correctness never depends on sorting.
 
 use crate::tape::Filter;
 use crate::tuples::{AppendableTuple, FrozenTuple, MetaTuple, MetaTupleReader, WithReader};
 use index::relation::{Page, RelationRead};
 use simd::column::{Set, Value};
+use std::num::NonZero;
 use zerocopy::{FromBytes, Immutable, KnownLayout};
 
 /// The splitmix64 finalizer.
@@ -74,6 +76,26 @@ pub const fn raw_int(x: i64, width: Width) -> Option<u64> {
     Some((x as u64 ^ 1 << (bits - 1)) & (u64::MAX >> (64 - bits)))
 }
 
+/// A range `min | max << 16` that holds no key.
+pub const EMPTY_RANGE: u32 = u16::MAX as u32;
+
+/// Whether `bitmap` has a key in `range`.
+#[inline(always)]
+fn meets_bitmap(bitmap: &[u64; 1024], range: u32) -> bool {
+    let (min, max) = (range as u16 as usize, (range >> 16) as usize);
+    if min > max {
+        return false;
+    }
+    let (a, b) = (min / 64, max / 64);
+    let first = bitmap[a] & u64::MAX << (min % 64);
+    let last = bitmap[b] & u64::MAX >> (63 - max % 64);
+    if a == b {
+        first & last != 0
+    } else {
+        first != 0 || last != 0 || bitmap[a + 1..b].iter().any(|&x| x != 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     pub width: Width,
@@ -86,6 +108,14 @@ impl Key {
     /// Whether `set` selects exactly its keys' rows: a NULL is stored as zero.
     fn exact(&self, set: &[u128]) -> bool {
         !self.hashed && !set.contains(&0)
+    }
+    /// The 16-bit sort key; a wide whole key is hashed first, as its bytes need not spread.
+    pub fn sort_key(&self, stored: u128) -> u16 {
+        if self.width == Width::W2 || self.hashed {
+            [stored as u64, (stored >> 64) as u64].fold_one()
+        } else {
+            hash_uuid(&stored.to_le_bytes()).fold_one()
+        }
     }
 }
 
@@ -135,6 +165,20 @@ impl Keys {
     }
     pub fn columns(&self) -> usize {
         self.columns as usize
+    }
+    /// The sort key of a row's first key.
+    pub fn sort_key(&self, columns: Columns<'_>) -> u16 {
+        let key = &self.keys[0];
+        let bytes = key.width.bytes();
+        let mut x = [0; 16];
+        x[..bytes].copy_from_slice(columns.get(key.offset, bytes));
+        key.sort_key(u128::from_le_bytes(x))
+    }
+    pub fn range_of_block(&self, payload: &[Option<NonZero<u64>>; 32], columns: &[u8]) -> u32 {
+        let rows = (0..32).filter(|&i| payload[i].is_some());
+        let folds = rows.map(|i| self.sort_key(Columns::block(columns, i)));
+        let (min, max) = folds.fold((u16::MAX, 0), |(a, b), x| (a.min(x), b.max(x)));
+        min as u32 | (max as u32) << 16
     }
     /// The columns of a block, each key's 32 values in order, from 32 rows' own.
     pub fn block(&self, rows: &[u8]) -> Vec<u8> {
@@ -332,6 +376,8 @@ impl Column {
 
 #[derive(Debug)]
 pub struct KeyFilter {
+    /// The sort keys of the first key's set.
+    first: Option<Values<u16>>,
     columns: Vec<(u16, Column)>,
     exact: bool,
 }
@@ -340,12 +386,17 @@ impl KeyFilter {
     /// `sets`: per key, the stored forms a row may hold, or `None` for any; `None` if none can.
     pub fn new(keys: &Keys, sets: impl IntoIterator<Item = Option<Vec<u128>>>) -> Option<Self> {
         let mut filter = Self {
+            first: None,
             columns: Vec::new(),
             exact: true,
         };
-        for (key, set) in std::iter::zip(keys.as_slice(), sets) {
+        for (i, (key, set)) in std::iter::zip(keys.as_slice(), sets).enumerate() {
             let Some(set) = set else { continue };
             filter.exact &= key.exact(&set);
+            if i == 0 {
+                let keys = set.iter().map(|&x| key.sort_key(x)).collect();
+                filter.first = Some(Values::new(keys)?);
+            }
             filter
                 .columns
                 .push((key.offset, Column::new(key.width, &set)?));
@@ -359,6 +410,26 @@ impl KeyFilter {
 }
 
 impl Filter for &KeyFilter {
+    #[inline(always)]
+    fn selects_blocks(self) -> bool {
+        self.first.is_some()
+    }
+
+    #[inline(always)]
+    fn ranges(self, ranges: &[u32; 32]) -> u32 {
+        match &self.first {
+            Some(Values::Few(keys)) => simd::column::meets(ranges, keys),
+            Some(Values::Many(set)) => {
+                let mut mask = 0;
+                for (i, &range) in ranges.iter().enumerate() {
+                    mask |= (meets_bitmap(set.bitmap(), range) as u32) << i;
+                }
+                mask
+            }
+            None => u32::MAX,
+        }
+    }
+
     #[inline(always)]
     fn block(self, columns: &[u8]) -> u32 {
         let mut mask = u32::MAX;
@@ -528,5 +599,59 @@ mod tests {
             }
         }
         assert!(KeyFilter::new(&all[0], vec![Some(Vec::new())]).is_none());
+    }
+
+    #[test]
+    fn ranges() {
+        use Width::*;
+        let range = |min: u16, max: u16| min as u32 | (max as u32) << 16;
+        let keys = Keys::new([(W2, true)]);
+        let block = |values: &[u16]| {
+            let payload =
+                std::array::from_fn(|i| (i < values.len()).then(|| NonZero::new(1).unwrap()));
+            let columns: [u16; 32] = std::array::from_fn(|i| values.get(i).copied().unwrap_or(0));
+            keys.range_of_block(&payload, columns.as_bytes())
+        };
+        assert_eq!(block(&[]), EMPTY_RANGE);
+        assert_eq!(block(&[7]), range(7, 7));
+        assert_eq!(block(&[9, 0, 65535, 3]), range(0, 65535));
+        let keys = Keys::new([(W4, false), (W2, true)]);
+        let values: [u32; 32] = std::array::from_fn(|i| 0x0001_0000 * i as u32 + 5);
+        let full = std::array::from_fn(|_| NonZero::new(1));
+        let columns = [values.as_bytes(), [0; 64].as_slice()].concat();
+        let r = keys.range_of_block(&full, &columns);
+        let folds = values.map(|x| keys.as_slice()[0].sort_key(x as u128));
+        let (min, max) = (*folds.iter().min().unwrap(), *folds.iter().max().unwrap());
+        assert_eq!(r, range(min, max));
+        let filter = KeyFilter::new(&keys, vec![Some(vec![values[3] as u128]), None]).unwrap();
+        let mut ranges = [EMPTY_RANGE; 32];
+        ranges[1] = range(folds[3], folds[3]);
+        ranges[2] = range(folds[3].wrapping_add(1), folds[3].wrapping_add(1));
+        assert_eq!((&filter).ranges(&ranges), 0b10);
+        let filter = KeyFilter::new(&keys, vec![None, Some(vec![1])]).unwrap();
+        assert!(!(&filter).selects_blocks());
+        let keys = Keys::new([(W2, true)]);
+        for n in [1, 40, 200, 5000] {
+            let set = (0..n).map(|_| rand::random::<u16>()).collect::<Vec<_>>();
+            let filter =
+                KeyFilter::new(&keys, vec![Some(set.iter().map(|&x| x as u128).collect())])
+                    .unwrap();
+            for _ in 0..64 {
+                let ranges: [u32; 32] = std::array::from_fn(|i| match i % 4 {
+                    0 => EMPTY_RANGE,
+                    1 => range(set[i % n], set[i % n]),
+                    _ => {
+                        let min = rand::random::<u16>();
+                        range(min, min.saturating_add(rand::random::<u16>() >> (i % 16)))
+                    }
+                });
+                let expected = (0..32).fold(0, |mask, i| {
+                    let (min, max) = (ranges[i] as u16, (ranges[i] >> 16) as u16);
+                    let hit = set.iter().any(|&t| min <= t && t <= max);
+                    mask | (hit as u32) << i
+                });
+                assert_eq!((&filter).ranges(&ranges), expected);
+            }
+        }
     }
 }
