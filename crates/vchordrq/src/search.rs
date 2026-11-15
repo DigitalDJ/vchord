@@ -10,23 +10,24 @@ use crate::closure_lifetime_binder::{id_0, id_1, id_2};
 use crate::keys::KeyFilter;
 use crate::linked_vec::LinkedVec;
 use crate::operator::*;
-use crate::tape::{All, Filter, Row, Selected, by_directory, by_next};
+use crate::tape::{All, Filter, Row, Selected, by_next};
 use crate::tuples::*;
 use crate::{Opaque, centroids, tape};
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
 use distance::Distance;
 use index::bump::Bump;
-use index::fetch::BorrowedIter;
+use index::fetch::{BorrowedIter, Fetch};
 use index::packed::{PackedRefMut4, PackedRefMut8};
 use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily, Sequence};
-use index::relation::{Page, RelationRead};
+use index::relation::{Page, Relation, RelationRead, RelationReadTypes};
 use index_accessor::{DefaultWithDimension, FunctionalAccessor, LAccess};
 use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::BlockLut;
 use std::borrow::Borrow;
+use std::cell::{Cell, RefCell};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::num::NonZero;
 use std::rc::Rc;
@@ -280,12 +281,12 @@ where
         }
     }
 
-    /// Returns how many rows the list holds.
+    /// Returns how many rows the lists hold.
     // Inlined with its callback, whose per-row work is most of a scan's.
     #[inline(always)]
-    fn read_list(
+    fn read_lists(
         &mut self,
-        (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location)): List<'b>,
+        lists: Vec<List<'b>>,
         filter: impl Filter,
         mut callback: impl for<'a> FnMut(Row<'a, (f32, f32)>),
     ) -> u64 {
@@ -299,105 +300,207 @@ where
             ref mut words,
             ..
         } = *self;
-        // Between lists nothing is locked (#28).
-        index::interrupt::check();
-        // Residual bounds add `dis_f` with no error budget, so routing's estimate will not do.
-        let dis_f = if is_residual && !O::routing_is_exact() {
-            let (head, prefetch) = location.expect("internal: residual probe without location");
-            centroids::read::<R, O, _>(
-                prefetch.map(|id| index.read(id)),
-                head,
-                LAccess::new(
-                    O::Vector::unpack(vector.borrow().as_borrowed()),
-                    O::DistanceAccessor::default_with_dimension(dim),
-                ),
-            )
+        let is_not_plain = prefetch_h0_tuples.is_not_plain();
+        let firsts = if is_not_plain {
+            lists.iter().map(|list| list.2.0).collect()
         } else {
-            dis_f
-        }
-        .to_f32();
-        let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm));
-        let jump_guard = index.read(first);
-        let jump_bytes = jump_guard.get(1).expect("data corruption");
-        let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let block_access = || O::block_access(&lut.0, residual);
-        let mut pages = None;
-        if filter.selects_blocks() || prefetch_h0_tuples.is_not_plain() {
-            let directory = by_next(index, jump_tuple.directory_first());
-            pages = Some(tape::read_directory_words::<R>(
-                directory,
-                words,
-                filter.selects_blocks(),
-            ));
-        }
-        let selected = match pages {
-            Some(pages) if filter.selects_blocks() => {
-                tape::plan(words, pages, filter).map(|n| (pages, n))
-            }
-            _ => None,
+            Vec::new()
         };
-        if let Some((pages, n)) = selected {
-            let (ids, layout) = words.split_at(pages);
-            let (firsts, masks) = layout.split_at(pages);
-            if n != 0 {
-                tape::read_frozen_tape::<R, _, _>(
-                    by_directory(prefetch_h0_tuples, ids[..n].iter().copied()),
-                    Selected::new(&firsts[..n], masks),
-                    block_access,
-                    filter,
-                    &mut callback,
-                );
-            }
-        } else if let Some(pages) = pages
-            && prefetch_h0_tuples.is_not_plain()
+        let ahead = Ahead {
+            index,
+            pages: RefCell::new(schedule(index, prefetch_h0_tuples, firsts, filter)),
+            list: Cell::new(0),
+        };
+        let mut tuples = 0;
+        for (i, (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location))) in
+            lists.into_iter().enumerate()
         {
-            tape::read_frozen_tape::<R, _, _>(
-                by_directory(prefetch_h0_tuples, words[..pages].iter().copied()),
-                All,
-                block_access,
+            // Between lists nothing is locked (#28).
+            index::interrupt::check();
+            ahead.begin(i);
+            // Residual bounds add `dis_f` with no error budget, so routing's estimate will not do.
+            let dis_f = if is_residual && !O::routing_is_exact() {
+                let (head, prefetch) = location.expect("internal: residual probe without location");
+                centroids::read::<R, O, _>(
+                    prefetch.map(|id| index.read(id)),
+                    head,
+                    LAccess::new(
+                        O::Vector::unpack(vector.borrow().as_borrowed()),
+                        O::DistanceAccessor::default_with_dimension(dim),
+                    ),
+                )
+            } else {
+                dis_f
+            }
+            .to_f32();
+            let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm));
+            let jump_guard = ahead.read(first);
+            let jump_bytes = jump_guard.get(1).expect("data corruption");
+            let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+            let block_access = || O::block_access(&lut.0, residual);
+            let directory = (filter.selects_blocks() || is_not_plain).then(|| {
+                let directory = by_next(&ahead, jump_tuple.directory_first());
+                tape::read_directory::<R>(directory, words, filter)
+            });
+            match directory {
+                Some((pages, Some(selected))) => {
+                    let (ids, layout) = words.split_at(pages);
+                    let (firsts, masks) = layout.split_at(pages);
+                    if selected != 0 {
+                        tape::read_frozen_tape::<R, _, _>(
+                            ids[..selected].iter().map(|&id| ahead.read(id)),
+                            Selected::new(&firsts[..selected], masks),
+                            block_access,
+                            filter,
+                            &mut callback,
+                        );
+                    }
+                }
+                Some((pages, None)) if is_not_plain => {
+                    tape::read_frozen_tape::<R, _, _>(
+                        words[..pages].iter().map(|&id| ahead.read(id)),
+                        All,
+                        block_access,
+                        filter,
+                        &mut callback,
+                    );
+                }
+                _ => {
+                    tape::read_frozen_tape::<R, _, _>(
+                        by_next(&ahead, jump_tuple.frozen_first()),
+                        All,
+                        block_access,
+                        filter,
+                        &mut callback,
+                    );
+                }
+            }
+            tape::read_appendable_tape::<R, _>(
+                by_next(&ahead, jump_tuple.appendable_first()),
+                O::binary_access(&lut.1, residual),
                 filter,
                 &mut callback,
             );
-        } else {
-            tape::read_frozen_tape::<R, _, _>(
-                by_next(index, jump_tuple.frozen_first()),
-                All,
-                block_access,
-                filter,
-                &mut callback,
-            );
+            tuples += jump_tuple.tuples();
         }
-        tape::read_appendable_tape::<R, _>(
-            by_next(index, jump_tuple.appendable_first()),
-            O::binary_access(&lut.1, residual),
-            filter,
-            &mut callback,
-        );
-        jump_tuple.tuples()
+        tuples
     }
 
     fn read(&mut self, lists: Vec<List<'b>>, filter: impl Filter) -> Vec<Candidate<'b>> {
         let (bump, epsilon) = (self.bump, self.epsilon);
         let mut results = LinkedVec::new();
-        for list in lists {
-            self.read_list(
-                list,
-                filter,
-                id_2(|row| {
-                    let (rough, err) = row.value;
-                    let lowerbound = Distance::from_f32(rough - err * epsilon);
-                    results.push((
-                        (Reverse(lowerbound), AlwaysEqual(())),
-                        AlwaysEqual(PackedRefMut4(bump.alloc((
-                            row.payload,
-                            row.head,
-                            BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
-                        )))),
-                    ));
-                }),
-            );
-        }
+        self.read_lists(
+            lists,
+            filter,
+            id_2(|row| {
+                let (rough, err) = row.value;
+                let lowerbound = Distance::from_f32(rough - err * epsilon);
+                results.push((
+                    (Reverse(lowerbound), AlwaysEqual(())),
+                    AlwaysEqual(PackedRefMut4(bump.alloc((
+                        row.payload,
+                        row.head,
+                        BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
+                    )))),
+                ));
+            }),
+        );
         results.into_vec()
+    }
+}
+
+/// A page of the `list`-th list, scheduled ahead of reading it.
+struct Scheduled {
+    list: usize,
+    id: u32,
+}
+
+impl Fetch<'_> for Scheduled {
+    type Iter = std::iter::Once<u32>;
+
+    #[inline(always)]
+    fn fetch(&self) -> Self::Iter {
+        std::iter::once(self.id)
+    }
+}
+
+/// Reads ahead the jump pages of the lists at `firsts`, then the tape pages their directories list.
+/// A directory is read, not read ahead, under its jump page, as its list is.
+fn schedule<'b, R>(
+    index: &'b R,
+    p: &mut impl PrefetcherSequenceFamily<'b, R>,
+    firsts: Vec<u32>,
+    filter: impl Filter,
+) -> impl Prefetcher<'b, R = R, Item = Scheduled>
+where
+    R: RelationRead + 'b,
+    R::Page: Page<Opaque = Opaque>,
+{
+    let jumps = firsts
+        .into_iter()
+        .enumerate()
+        .map(|(list, id)| Scheduled { list, id });
+    let mut jumps = p.prefetch(jumps.collect::<VecDeque<_>>());
+    let (mut words, mut queue) = (Vec::new(), VecDeque::new());
+    p.prefetch(
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(page) = queue.pop_front() {
+                    return Some(page);
+                }
+                let (Scheduled { list, .. }, mut guards) = jumps.next()?;
+                let jump_guard = guards.next().expect("should be at least one element");
+                let jump_tuple =
+                    JumpTuple::deserialize_ref(jump_guard.get(1).expect("data corruption"));
+                let directory = by_next(index, jump_tuple.directory_first());
+                let (pages, selected) = tape::read_directory::<R>(directory, &mut words, filter);
+                let ids = words[..selected.unwrap_or(pages)].iter().copied();
+                let ids = ids.chain([jump_tuple.appendable_first()]);
+                queue.extend(ids.map(|id| Scheduled { list, id }));
+            }
+        })
+        .peekable(),
+    )
+}
+
+/// Reads the pages of the `list`-th list, taking those its schedule read ahead.
+/// Buffers are locked only when taken, under the list's jump page: a stale schedule costs reads.
+struct Ahead<'b, R, P> {
+    index: &'b R,
+    pages: RefCell<P>,
+    list: Cell<usize>,
+}
+
+impl<'b, R: RelationRead + 'b, P: Prefetcher<'b, R = R, Item = Scheduled>> Ahead<'b, R, P> {
+    /// Begins the `list`-th list, dropping the pages scheduled for earlier lists.
+    fn begin(&self, list: usize) {
+        self.list.set(list);
+        let mut pages = self.pages.borrow_mut();
+        while pages.next_if(|page| page.list < list).is_some() {}
+    }
+}
+
+impl<R: RelationRead, P> Relation for Ahead<'_, R, P> {
+    type Page = R::Page;
+}
+
+impl<'b, R: RelationRead, P> RelationReadTypes for Ahead<'b, R, P> {
+    type ReadGuard<'a> = R::ReadGuard<'b>;
+}
+
+impl<'b, R: RelationRead + 'b, P: Prefetcher<'b, R = R, Item = Scheduled>> RelationRead
+    for Ahead<'b, R, P>
+{
+    fn read(&self, id: u32) -> R::ReadGuard<'b> {
+        let list = self.list.get();
+        let page = self
+            .pages
+            .borrow_mut()
+            .next_if(|page| page.list == list && page.id == id);
+        match page {
+            Some((_, mut guards)) => guards.next().expect("should be at least one element"),
+            None => self.index.read(id),
+        }
     }
 }
 
@@ -556,26 +659,24 @@ where
     let epsilon = params.epsilon;
     let Route { lists, rest, .. } = searcher.route(&params.probes, threshold != 0);
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
-    for list in lists {
-        let tuples = searcher.read_list(
-            list,
-            (),
-            id_2(|row| {
-                let (rough, err) = row.value;
-                let lowerbound = Distance::from_f32(rough - err * epsilon);
-                let rough = Distance::from_f32(rough);
-                results.push((
-                    (Reverse(lowerbound), AlwaysEqual(rough)),
-                    AlwaysEqual(PackedRefMut8(bump.alloc((
-                        row.payload,
-                        row.head,
-                        BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
-                    )))),
-                ));
-            }),
-        );
-        threshold = threshold.saturating_sub(tuples.min(u32::MAX as _) as _);
-    }
+    let tuples = searcher.read_lists(
+        lists,
+        (),
+        id_2(|row| {
+            let (rough, err) = row.value;
+            let lowerbound = Distance::from_f32(rough - err * epsilon);
+            let rough = Distance::from_f32(rough);
+            results.push((
+                (Reverse(lowerbound), AlwaysEqual(rough)),
+                AlwaysEqual(PackedRefMut8(bump.alloc((
+                    row.payload,
+                    row.head,
+                    BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
+                )))),
+            ));
+        }),
+    );
+    threshold = threshold.saturating_sub(tuples.min(u32::MAX as _) as _);
     let mut estimation_by_threshold = Distance::NEG_INFINITY;
     // Remaining routing distances only estimate missing MaxSim terms; they are
     // not lower bounds and never reach the reranker.

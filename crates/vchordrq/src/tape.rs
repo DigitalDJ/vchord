@@ -428,8 +428,22 @@ where
     pages
 }
 
+/// Reads a directory into `words`; returns its page count and, if `filter` selects blocks, `plan`.
+pub fn read_directory<'b, R>(
+    iter: impl Iterator<Item = R::ReadGuard<'b>>,
+    words: &mut Vec<u32>,
+    filter: impl Filter,
+) -> (usize, Option<usize>)
+where
+    R: RelationRead + 'b,
+{
+    let pages = read_directory_words::<R>(iter, words, filter.selects_blocks());
+    let selected = filter.selects_blocks().then(|| plan(words, pages, filter));
+    (pages, selected.flatten())
+}
+
 /// The pages to read and their selected blocks, or `None` to read every page.
-pub fn plan(words: &mut [u32], pages: usize, filter: impl Filter) -> Option<usize> {
+fn plan(words: &mut [u32], pages: usize, filter: impl Filter) -> Option<usize> {
     let (ids, layout) = words.split_at_mut(pages);
     let (firsts, ranges) = layout.split_at_mut_checked(pages)?;
     let blocks = ranges.len();
