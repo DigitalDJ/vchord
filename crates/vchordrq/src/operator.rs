@@ -11,9 +11,9 @@ use index_accessor::{
     Accessor1, Accessor2, ApproximateL2S, ByteDistanceAccessor, DefaultWithDimension,
     DistanceAccessor, Dot, HalfbyteDistanceAccessor, L2S, RAccess,
 };
-use rabitq::bit::CodeMetadata;
 use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::{BlockLut, STEP};
+use rabitq::bit::{CodeMetadata, Residual};
 use simd::{Floating, f16};
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -437,18 +437,22 @@ pub trait Operator: 'static + Debug + Copy {
     /// `dis_f`.
     fn routing_is_exact() -> bool;
 
+    /// Centered on the query's projection on the centroid; L2 cannot be, lacking `<r, c>`.
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual;
+
+    /// Centred on the centroid: routing's `dis_f` is an estimate, and a projection would build on it.
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Self::residual(lut, dis_f, norm)
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>;
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32);
 
     fn build(
@@ -479,30 +483,29 @@ impl Operator for Op<VectOwned<f32>, L2S> {
         true
     }
 
+    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
+        Residual::l2(dis_f)
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
         RAccess::new(
             (&lut.1, ()),
-            BlockAccessor([0_u32; 32], move |value, code, delta| {
-                if !is_residual {
-                    rabitq::bit::block::half_process_l2s(value, code, lut.0)
-                } else {
-                    rabitq::bit::block::half_process_l2s_residual(value, code, lut.0, dis_f, delta)
-                }
+            BlockAccessor([0_u32; 32], move |value, code, delta| match residual {
+                None => rabitq::bit::block::half_process_l2s(value, code, lut.0),
+                Some(residual) => rabitq::bit::block::half_process_l2s_residual(
+                    value, code, lut.0, residual, delta,
+                ),
             }),
         )
     }
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
         move |metadata: [f32; 4], elements: &[u64], delta: f32| {
             let value = rabitq::bit::binary::accumulate(elements, &lut.1);
@@ -512,10 +515,11 @@ impl Operator for Op<VectOwned<f32>, L2S> {
                 factor_ip: metadata[2],
                 factor_err: metadata[3],
             };
-            if !is_residual {
-                rabitq::bit::binary::half_process_l2s(value, code, lut.0)
-            } else {
-                rabitq::bit::binary::half_process_l2s_residual(value, code, lut.0, dis_f, delta)
+            match residual {
+                None => rabitq::bit::binary::half_process_l2s(value, code, lut.0),
+                Some(residual) => rabitq::bit::binary::half_process_l2s_residual(
+                    value, code, lut.0, residual, delta,
+                ),
             }
         }
     }
@@ -564,22 +568,25 @@ impl Operator for Op<VectOwned<f32>, Dot> {
         true
     }
 
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
+    }
+
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, 1.0)
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
         RAccess::new(
             (&lut.1, ()),
-            BlockAccessor([0_u32; 32], move |sum, code, delta| {
-                if !is_residual {
-                    rabitq::bit::block::half_process_dot(sum, code, lut.0)
-                } else {
-                    rabitq::bit::block::half_process_dot_residual(
-                        sum, code, lut.0, dis_f, delta, norm,
-                    )
+            BlockAccessor([0_u32; 32], move |sum, code, delta| match residual {
+                None => rabitq::bit::block::half_process_dot(sum, code, lut.0),
+                Some(residual) => {
+                    rabitq::bit::block::half_process_dot_residual(sum, code, lut.0, residual, delta)
                 }
             }),
         )
@@ -587,9 +594,7 @@ impl Operator for Op<VectOwned<f32>, Dot> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
         move |metadata: [f32; 4], elements: &[u64], delta: f32| {
             let sum = rabitq::bit::binary::accumulate(elements, &lut.1);
@@ -599,10 +604,11 @@ impl Operator for Op<VectOwned<f32>, Dot> {
                 factor_ip: metadata[2],
                 factor_err: metadata[3],
             };
-            if !is_residual {
-                rabitq::bit::binary::half_process_dot(sum, code, lut.0)
-            } else {
-                rabitq::bit::binary::half_process_dot_residual(sum, code, lut.0, dis_f, delta, norm)
+            match residual {
+                None => rabitq::bit::binary::half_process_dot(sum, code, lut.0),
+                Some(residual) => rabitq::bit::binary::half_process_dot_residual(
+                    sum, code, lut.0, residual, delta,
+                ),
             }
         }
     }
@@ -651,30 +657,29 @@ impl Operator for Op<VectOwned<f16>, L2S> {
         f16::reduce_sum_of_d2_approx_is_exact()
     }
 
+    fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
+        Residual::l2(dis_f)
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
         RAccess::new(
             (&lut.1, ()),
-            BlockAccessor([0_u32; 32], move |value, code, delta| {
-                if !is_residual {
-                    rabitq::bit::block::half_process_l2s(value, code, lut.0)
-                } else {
-                    rabitq::bit::block::half_process_l2s_residual(value, code, lut.0, dis_f, delta)
-                }
+            BlockAccessor([0_u32; 32], move |value, code, delta| match residual {
+                None => rabitq::bit::block::half_process_l2s(value, code, lut.0),
+                Some(residual) => rabitq::bit::block::half_process_l2s_residual(
+                    value, code, lut.0, residual, delta,
+                ),
             }),
         )
     }
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
         move |metadata: [f32; 4], elements: &[u64], delta: f32| {
             let value = rabitq::bit::binary::accumulate(elements, &lut.1);
@@ -684,10 +689,11 @@ impl Operator for Op<VectOwned<f16>, L2S> {
                 factor_ip: metadata[2],
                 factor_err: metadata[3],
             };
-            if !is_residual {
-                rabitq::bit::binary::half_process_l2s(value, code, lut.0)
-            } else {
-                rabitq::bit::binary::half_process_l2s_residual(value, code, lut.0, dis_f, delta)
+            match residual {
+                None => rabitq::bit::binary::half_process_l2s(value, code, lut.0),
+                Some(residual) => rabitq::bit::binary::half_process_l2s_residual(
+                    value, code, lut.0, residual, delta,
+                ),
             }
         }
     }
@@ -737,22 +743,25 @@ impl Operator for Op<VectOwned<f16>, Dot> {
         true
     }
 
+    fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
+    }
+
+    fn routing_residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
+        Residual::dot(lut, dis_f, norm, 1.0)
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
         RAccess::new(
             (&lut.1, ()),
-            BlockAccessor([0_u32; 32], move |sum, code, delta| {
-                if !is_residual {
-                    rabitq::bit::block::half_process_dot(sum, code, lut.0)
-                } else {
-                    rabitq::bit::block::half_process_dot_residual(
-                        sum, code, lut.0, dis_f, delta, norm,
-                    )
+            BlockAccessor([0_u32; 32], move |sum, code, delta| match residual {
+                None => rabitq::bit::block::half_process_dot(sum, code, lut.0),
+                Some(residual) => {
+                    rabitq::bit::block::half_process_dot_residual(sum, code, lut.0, residual, delta)
                 }
             }),
         )
@@ -760,9 +769,7 @@ impl Operator for Op<VectOwned<f16>, Dot> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        dis_f: f32,
-        norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
         move |metadata: [f32; 4], elements: &[u64], delta: f32| {
             let sum = rabitq::bit::binary::accumulate(elements, &lut.1);
@@ -772,10 +779,11 @@ impl Operator for Op<VectOwned<f16>, Dot> {
                 factor_ip: metadata[2],
                 factor_err: metadata[3],
             };
-            if !is_residual {
-                rabitq::bit::binary::half_process_dot(sum, code, lut.0)
-            } else {
-                rabitq::bit::binary::half_process_dot_residual(sum, code, lut.0, dis_f, delta, norm)
+            match residual {
+                None => rabitq::bit::binary::half_process_dot(sum, code, lut.0),
+                Some(residual) => rabitq::bit::binary::half_process_dot_residual(
+                    sum, code, lut.0, residual, delta,
+                ),
             }
         }
     }
@@ -825,14 +833,16 @@ impl Operator for Op<Rabitq8Owned, L2S> {
         true
     }
 
+    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+        unreachable!("residual quantization is not supported for rabitq8")
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         RAccess::new(
             (&lut.1, ()),
             BlockAccessor([0_u32; 32], move |value, code, _delta| {
@@ -843,11 +853,9 @@ impl Operator for Op<Rabitq8Owned, L2S> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
             let value = rabitq::bit::binary::accumulate(elements, &lut.1);
             let code = CodeMetadata {
@@ -882,14 +890,16 @@ impl Operator for Op<Rabitq8Owned, Dot> {
         true
     }
 
+    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+        unreachable!("residual quantization is not supported for rabitq8")
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         RAccess::new(
             (&lut.1, ()),
             BlockAccessor([0_u32; 32], move |sum, code, _delta| {
@@ -900,11 +910,9 @@ impl Operator for Op<Rabitq8Owned, Dot> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
             let sum = rabitq::bit::binary::accumulate(elements, &lut.1);
             let code = CodeMetadata {
@@ -939,14 +947,16 @@ impl Operator for Op<Rabitq4Owned, L2S> {
         true
     }
 
+    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+        unreachable!("residual quantization is not supported for rabitq4")
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         RAccess::new(
             (&lut.1, ()),
             BlockAccessor([0_u32; 32], move |value, code, _delta| {
@@ -957,11 +967,9 @@ impl Operator for Op<Rabitq4Owned, L2S> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
             let value = rabitq::bit::binary::accumulate(elements, &lut.1);
             let code = CodeMetadata {
@@ -996,14 +1004,16 @@ impl Operator for Op<Rabitq4Owned, Dot> {
         true
     }
 
+    fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
+        unreachable!("residual quantization is not supported for rabitq4")
+    }
+
     fn block_access(
         lut: &BlockLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl for<'x> Accessor1<[u8; 16], (&'x [[f32; 32]; 4], &'x [f32; 32]), Output = [(f32, f32); 32]>
     {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         RAccess::new(
             (&lut.1, ()),
             BlockAccessor([0_u32; 32], move |sum, code, _delta| {
@@ -1014,11 +1024,9 @@ impl Operator for Op<Rabitq4Owned, Dot> {
 
     fn binary_access(
         lut: &BinaryLut,
-        is_residual: bool,
-        _dis_f: f32,
-        _norm: f32,
+        residual: Option<Residual>,
     ) -> impl FnMut([f32; 4], &[u64], f32) -> (f32, f32) {
-        assert!(!is_residual);
+        assert!(residual.is_none());
         move |metadata: [f32; 4], elements: &[u64], _delta: f32| {
             let sum = rabitq::bit::binary::accumulate(elements, &lut.1);
             let code = CodeMetadata {

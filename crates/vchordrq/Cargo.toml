@@ -13,12 +13,13 @@ rabitq = { path = "../rabitq" }
 simd = { path = "../simd" }
 vector = { path = "../vector" }
 
-pin-project = "1.1.13"
+dary_heap.workspace = true
 serde.workspace = true
 validator.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+index = { path = "../index", features = ["test-support"] }
 rand.workspace = true
 
 [lints]

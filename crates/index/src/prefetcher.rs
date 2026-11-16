@@ -24,6 +24,10 @@ pub trait Sequence {
     #[must_use]
     fn peek(&mut self) -> Option<&Self::Item>;
     fn into_inner(self) -> Self::Inner;
+    /// Asked once every item is taken: whether the sequence gained new items.
+    fn refill(&mut self) -> bool {
+        false
+    }
 }
 
 impl<T: Ord> Sequence for BinaryHeap<T> {
@@ -108,6 +112,7 @@ where
         &mut self,
         predicate: impl FnOnce(&Self::Item) -> bool,
     ) -> Option<(Self::Item, Self::Guards)>;
+    fn refill(&mut self) -> bool;
 }
 
 pub struct PlainPrefetcher<'b, R, S: Sequence> {
@@ -178,6 +183,11 @@ where
                 list,
             },
         ))
+    }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        self.sequence.refill()
     }
 }
 
@@ -294,6 +304,11 @@ where
             },
         ))
     }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        self.sequence.refill()
+    }
 }
 
 pub struct SimplePrefetcherGuards<'b, R, L> {
@@ -384,6 +399,12 @@ where
         predicate: impl FnOnce(&Self::Item) -> bool,
     ) -> Option<(S::Item, Self::Guards)> {
         self.stream.next_if(predicate)
+    }
+
+    #[inline]
+    fn refill(&mut self) -> bool {
+        self.stream
+            .refill(|StreamPrefetcherSequence(sequence)| sequence.refill())
     }
 }
 

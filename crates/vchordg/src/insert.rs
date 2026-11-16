@@ -605,7 +605,7 @@ mod tests {
 
     #[test]
     fn new_vertex_page_is_published_with_its_link() {
-        let r = fixture(false).with_full_page(1, 2);
+        let r = fixture(false).with_full_page(1);
         let guard = append_vertex_tuple(&r, 1, 64);
         let vertex = guard.id();
         drop(guard);

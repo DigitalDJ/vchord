@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[features]
+test-support = []
+
 [dependencies]
 always_equal = { path = "../always_equal" }
 small_iter = { path = "../small_iter" }

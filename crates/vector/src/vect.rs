@@ -11,7 +11,7 @@ use distance::Distance;
 use simd::Floating;
 use std::cmp::Ordering;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[repr(transparent)]
 pub struct VectOwned<S>(Vec<S>);
 

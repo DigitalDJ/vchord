@@ -228,6 +228,47 @@ impl FilterableTuple for HeapTuple<'_> {
     }
 }
 
+/// Starts reads of the table pages of rows about to be returned, with `PrefetchBuffer`.
+#[derive(Debug)]
+pub struct TablePrefetch {
+    relation: pgrx::pg_sys::Relation,
+    window: usize,
+}
+
+impl TablePrefetch {
+    /// Reads ahead by the tablespace's `effective_io_concurrency`, for a heap table only.
+    pub unsafe fn new(scan: pgrx::pg_sys::IndexScanDesc) -> Self {
+        unsafe {
+            let relation = (*scan).heapRelation;
+            // Only the heap's tuple ids name blocks of the main fork.
+            let window = if (*relation).rd_tableam == pgrx::pg_sys::GetHeapamTableAmRoutine() {
+                let tablespace = (*(*relation).rd_rel).reltablespace;
+                pgrx::pg_sys::get_tablespace_io_concurrency(tablespace) as usize
+            } else {
+                0
+            };
+            Self { relation, window }
+        }
+    }
+}
+
+impl vchordrq::Table for TablePrefetch {
+    fn window(&self) -> usize {
+        self.window
+    }
+
+    fn prefetch(&mut self, payload: NonZero<u64>) {
+        let ([bi_hi, bi_lo, _], _) = pointer_to_kv(payload);
+        unsafe {
+            pgrx::pg_sys::PrefetchBuffer(
+                self.relation,
+                pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
+                (bi_hi as u32) << 16 | bi_lo as u32,
+            );
+        }
+    }
+}
+
 pub const fn ctid_to_key(
     ItemPointerData {
         ip_blkid: BlockIdData { bi_hi, bi_lo },

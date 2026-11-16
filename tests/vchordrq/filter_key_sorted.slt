@@ -1,0 +1,234 @@
+# Full scans of sorted keyed lists return the heap's rows, before and after inserts and VACUUM.
+
+statement ok
+CREATE TABLE fs (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs SELECT i,
+  CASE WHEN i % 97 = 0 THEN NULL WHEN i <= 6000 THEN (i * 7919) % 61 ELSE 1000 END,
+  ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 768) j)::real[]::halfvec
+FROM generate_series(1, 8000) i;
+
+statement ok
+SET max_parallel_maintenance_workers = 2;
+
+statement ok
+ALTER TABLE fs SET (parallel_workers = 2);
+
+statement ok
+CREATE INDEX fs_v ON fs USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [8]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+ALTER TABLE fs RESET (parallel_workers);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+CREATE TABLE fs_q AS SELECT v FROM fs WHERE id = 4321;
+
+statement ok
+CREATE FUNCTION fs_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[]; q text := (SELECT v::text FROM fs_q);
+BEGIN
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fs WHERE %s '
+    'ORDER BY v <-> %L) s', cond, q) INTO a;
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM fs WHERE (%s) IS TRUE', cond) INTO b;
+  RETURN a IS NOT DISTINCT FROM b;
+END
+$$;
+
+statement ok
+CREATE FUNCTION fs_check() RETURNS boolean LANGUAGE sql AS $$
+  SELECT bool_and(fs_same(c)) FROM (
+    SELECT format('owner = %s', k) FROM generate_series(0, 60) k
+    UNION ALL SELECT unnest(ARRAY['owner = 1000', 'owner = 2000', 'owner = 123456', 'owner IS NULL',
+      'owner IN (1000, 9)', 'owner = ANY(''{3,17,42}'')', 'owner = ANY(''{2000,17,1000}'')', 'owner = ANY(''{5,6}'')',
+      format('owner = ANY(%L)', (SELECT array_agg(k)::text FROM generate_series(1, 20) k)),
+      format('owner = ANY(%L)', (SELECT array_agg(k)::text FROM generate_series(1, 40) k))])
+  ) s(c)
+$$;
+
+query T
+SELECT fs_check();
+----
+t
+
+statement ok
+INSERT INTO fs SELECT i, CASE WHEN i % 2 = 0 THEN 2000 ELSE (i * 7919) % 61 END,
+  ARRAY(SELECT cos(i * 0.29 + j * (1 + i % 11)) FROM generate_series(1, 768) j)::real[]::halfvec
+FROM generate_series(8001, 9000) i;
+
+query T
+SELECT fs_check();
+----
+t
+
+statement ok
+DELETE FROM fs WHERE owner = 5 OR id % 10 = 3;
+
+query T
+SELECT fs_check();
+----
+t
+
+statement ok
+VACUUM fs;
+
+query T
+SELECT fs_check();
+----
+t
+
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+REINDEX INDEX fs_v;
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+query T
+SELECT fs_check();
+----
+t
+
+# Lists too large for maintenance_work_mem are written unsorted.
+statement ok
+INSERT INTO fs SELECT id + 10000, owner, v FROM fs;
+
+statement ok
+DROP INDEX fs_v;
+
+statement ok
+SET maintenance_work_mem = '1MB';
+
+statement ok
+CREATE INDEX fs_v ON fs USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [1]
+$$);
+
+statement ok
+RESET maintenance_work_mem;
+
+query T
+SELECT fs_check();
+----
+t
+
+# VACUUM leaves a list with no deleted row and fewer than 32 new rows as it is.
+statement ok
+CREATE TABLE fs2 (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs2 SELECT id, id % 20, v FROM fs WHERE id <= 2000;
+
+statement ok
+CREATE INDEX ON fs2 USING vchordrq (v halfvec_l2_ops, owner) WITH (options = 'residual_quantization = true');
+
+statement ok
+INSERT INTO fs2 SELECT id + 100000, 1000, v FROM fs WHERE id <= 5;
+
+statement ok
+VACUUM fs2;
+
+statement ok
+SET vchordrq.probes = '';
+
+query T
+SELECT a = b FROM
+  (SELECT array_agg(id ORDER BY id) a FROM (SELECT id FROM fs2 WHERE owner = ANY('{7,1000}')
+    ORDER BY v <-> (SELECT v FROM fs_q)) s) x,
+  (SELECT array_agg(id ORDER BY id) b FROM fs2 WHERE owner = ANY('{7,1000}')) y;
+----
+t
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+DROP TABLE fs2;
+
+statement ok
+CREATE TABLE fs1 (id int PRIMARY KEY, owner int8, v halfvec(768));
+
+statement ok
+INSERT INTO fs1 SELECT id, 7, v FROM fs WHERE id <= 3000;
+
+statement ok
+CREATE INDEX ON fs1 USING vchordrq (v halfvec_l2_ops, owner) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [4]
+$$);
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fs1)
+FROM (SELECT id FROM fs1 WHERE owner = 7 ORDER BY v <-> (SELECT v FROM fs_q)) s;
+----
+t
+
+query I
+SELECT count(*) FROM (SELECT id FROM fs1 WHERE owner = 8 ORDER BY v <-> (SELECT v FROM fs_q)) s;
+----
+0
+
+# The order and ranges are the first key's; a later key alone still reads every block.
+statement ok
+DROP INDEX fs_v;
+
+statement ok
+ALTER TABLE fs ADD COLUMN grp int4;
+
+statement ok
+UPDATE fs SET grp = id % 5;
+
+statement ok
+CREATE INDEX fs_two ON fs USING vchordrq (v halfvec_l2_ops, owner int8_ops (bytes = 8), grp int4_ops (bytes = 4)) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [8]
+$$);
+
+query T
+SELECT bool_and(fs_same(format('owner = %s', k)) AND fs_same(format('owner = %s AND grp = %s', k, k % 5)))
+FROM generate_series(0, 60) k;
+----
+t
+
+query T
+SELECT fs_same('grp = 3') AND fs_same('grp = ANY(''{1,4}'')') AND fs_same('owner = 1000 AND grp = ANY(''{0,2}'')')
+  AND fs_same('owner = ANY(''{3,17,1000}'') AND grp = 2') AND fs_same('owner = 2000 AND grp = 0');
+----
+t
+
+statement ok
+DROP TABLE fs, fs1, fs_q;
+
+statement ok
+DROP FUNCTION fs_check, fs_same;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET vchordrq.probes;

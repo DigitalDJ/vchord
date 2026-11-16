@@ -28,6 +28,13 @@ pub fn pg_cleanup_allowed() -> bool {
 /// user expressions. MemoryContext and ResourceOwner cleanup may already have
 /// invalidated their PostgreSQL pointers.
 pub fn abandon<T>(value: T) {
+    // A FATAL error exits from inside the scan without unwinding, so its objects
+    // may be mid-operation: a `LazyCell` being forced holds a copy of its closure.
+    if unsafe { pgrx::pg_sys::proc_exit_inprogress } {
+        std::mem::forget(value);
+        return;
+    }
+
     struct Restore(bool);
 
     impl Drop for Restore {

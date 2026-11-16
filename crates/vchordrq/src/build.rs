@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::keys::Keys;
 use crate::operator::{Operator, Vector};
 use crate::tape::TapeWriter;
 use crate::tape_writer::{DirectoryTapeWriter, H1TapeWriter};
@@ -18,6 +19,7 @@ use vector::{VectorBorrowed, VectorOwned};
 pub fn build<R: RelationWrite, O: Operator>(
     vector_options: VectorOptions,
     vchordrq_options: VchordrqIndexOptions,
+    keys: &Keys,
     index: &R,
     structures: Vec<Structure<O::Vector>>,
 ) where
@@ -87,7 +89,7 @@ pub fn build<R: RelationWrite, O: Operator>(
                 });
                 level.push(jump.first());
             } else {
-                let mut tape = H1TapeWriter::create(index, O::Vector::count(dim) as _, false);
+                let mut tape = H1TapeWriter::create(index, false);
                 let centroid = structures[i].centroids[j].as_borrowed();
                 for child in structures[i].children[j].iter().copied() {
                     let vector = structures[i - 1].centroids[child as usize].as_borrowed();
@@ -102,13 +104,14 @@ pub fn build<R: RelationWrite, O: Operator>(
                     });
                 }
                 let (mut tape, chunk) = tape.into_inner();
-                H1TapeWriter::flush(&mut tape, O::Vector::count(dim) as _, chunk);
+                H1TapeWriter::flush(&mut tape, chunk);
                 level.push(tape.first());
             }
         }
         pointer_of_firsts.push(level);
     }
     meta.push(MetaTuple {
+        keys: (!keys.is_empty()).then(|| keys.descriptors()),
         dim,
         height_of_root: structures.len() as u32,
         is_residual,

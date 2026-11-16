@@ -51,12 +51,16 @@ pub trait ReadStream<'b> {
     type Guards: ExactSizeIterator<Item = <Self::Relation as RelationReadTypes>::ReadGuard<'b>>;
     type Item;
     type Inner: Iterator<Item = Self::Item>;
+    /// The iterator the stream reads ahead from.
+    type Iter;
     fn next(&mut self) -> Option<(Self::Item, Self::Guards)>;
     fn next_if<P: FnOnce(&Self::Item) -> bool>(
         &mut self,
         predicate: P,
     ) -> Option<(Self::Item, Self::Guards)>;
     fn into_inner(self) -> Self::Inner;
+    /// Once every item is taken: if `refill` gives the iterator items, the stream starts again.
+    fn refill(&mut self, refill: impl FnOnce(&mut Self::Iter) -> bool) -> bool;
 }
 
 pub trait Relation {
@@ -126,7 +130,7 @@ impl Hints {
 }
 
 pub trait RelationReadStreamTypes: RelationReadTypes {
-    type ReadStream<'b, I: Iterator>: ReadStream<'b, Item = I::Item, Relation = Self>
+    type ReadStream<'b, I: Iterator>: ReadStream<'b, Item = I::Item, Iter = I, Relation = Self>
     where
         I::Item: Fetch<'b>;
 }

@@ -7,7 +7,8 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
-use crate::operator::{Operator, Vector};
+use crate::keys::Keys;
+use crate::operator::Operator;
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
 use crate::{Branch, Opaque, freepages, tape};
@@ -18,6 +19,7 @@ use index::relation::{
 use index_accessor::FunctionalAccessor;
 use rabitq::packing::unpack;
 use std::cell::RefCell;
+use std::num::NonZero;
 
 pub trait MaintainChooser {
     fn choose(&mut self, i: usize) -> bool;
@@ -37,10 +39,12 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
+/// `memory`: the most bytes a list may take to be sorted by its first key.
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
     chooser: &mut impl MaintainChooser,
+    memory: usize,
     check: impl Fn(),
 ) -> Maintain
 where
@@ -52,6 +56,8 @@ where
     let dim = meta_tuple.dim();
     let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
+    let keys = Keys::of_meta(meta_tuple);
+    let keyed = !keys.is_empty();
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -92,6 +98,7 @@ where
     let mut number_of_tuples = 0_u64;
     let mut number_of_freed_pages = 0_usize;
 
+    let mut words = Vec::new();
     for (idx, first) in state.into_iter().enumerate() {
         if !chooser.choose(idx) {
             continue;
@@ -134,31 +141,53 @@ where
             })
         });
 
-        let mut tape = FrozenTapeWriter::create(&hooked_index, O::Vector::count(dim) as _, false);
+        let mut tape = FrozenTapeWriter::create(&hooked_index, &keys, false);
 
         let mut trace_directory = Vec::new();
         let mut trace_forzen = Vec::new();
         let mut trace_appendable = Vec::new();
 
         let mut tuples = 0_u64;
-        let mut callback = id_2(|(code, delta): (_, _), head, payload, prefetch: &[_]| {
-            tape.push(Branch {
-                code,
-                delta,
-                prefetch: prefetch.to_vec(),
-                head,
-                norm: 0.0,
-                extra: payload,
-            });
+        let mut rows = Rows::new(dim as _);
+        let mut sorting = keyed;
+        let mut bytes = Vec::new();
+        let mut callback = id_2(|row| {
+            if sorting {
+                rows.push(row, &keys);
+                if rows.bytes() > memory {
+                    for i in 0..rows.len() {
+                        let (branch, columns) = rows.branch(i);
+                        tape.push(branch, columns);
+                    }
+                    rows = Rows::new(dim as _);
+                    sorting = false;
+                }
+            } else {
+                let (code, delta) = row.value;
+                let branch = Branch {
+                    code,
+                    delta,
+                    prefetch: row.prefetch.to_vec(),
+                    head: row.head,
+                    norm: 0.0,
+                    extra: row.payload,
+                };
+                bytes.clear();
+                row.columns.extend(&keys, &mut bytes);
+                tape.push(branch, &bytes);
+            }
             tuples += 1;
         });
-        let directory = tape::read_directory_tape::<R>(
+        let pages = tape::read_directory_words::<R>(
             tape::by_next(index, *jump_tuple.directory_first())
                 .inspect(|guard| trace_directory.push(guard.id())),
+            &mut words,
+            true,
         );
         tape::read_frozen_tape::<R, _, _>(
-            tape::by_directory(&mut prefetch_h0_tuples, directory)
+            tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied())
                 .inspect(|guard| trace_forzen.push(guard.id())),
+            tape::All,
             || {
                 FunctionalAccessor::new(
                     Vec::<[u8; 16]>::new(),
@@ -186,38 +215,28 @@ where
                     ),
                 )
             },
+            (),
             &mut callback,
         );
         tape::read_appendable_tape::<R, _>(
             tape::by_next(index, *jump_tuple.appendable_first())
                 .inspect(|guard| trace_appendable.push(guard.id())),
-            |metadata, elements, delta| {
-                let signs = elements
-                    .iter()
-                    .flat_map(|x| std::array::from_fn::<_, 64, _>(|i| *x & (1 << i) != 0))
-                    .take(dim as _)
-                    .collect::<Vec<_>>();
-                (
-                    (
-                        rabitq::bit::CodeMetadata {
-                            dis_u_2: metadata[0],
-                            factor_cnt: metadata[1],
-                            factor_ip: metadata[2],
-                            factor_err: metadata[3],
-                        },
-                        signs,
-                    ),
-                    delta,
-                )
-            },
+            |metadata, elements, delta| (unpack_code(metadata, elements, dim as _), delta),
+            (),
             &mut callback,
         );
 
-        let (frozen_tape, branches) = tape.into_inner();
+        for i in rows.sorted() {
+            let (branch, columns) = rows.branch(i as _);
+            tape.push(branch, columns);
+        }
+
+        let (frozen_tape, branches, columns) = tape.into_inner();
 
         let mut appendable_tape = tape::TapeWriter::create(&hooked_index, false);
 
-        for branch in branches {
+        let width = keys.columns();
+        for (i, branch) in branches.into_iter().enumerate() {
             appendable_tape.push(AppendableTuple {
                 metadata: [
                     branch.code.0.dis_u_2,
@@ -230,17 +249,33 @@ where
                 prefetch: branch.prefetch,
                 head: branch.head,
                 payload: Some(branch.extra),
+                columns: columns[i * width..][..width].to_vec(),
             });
         }
 
         let frozen_first = { frozen_tape }.first();
 
-        let directory = tape::by_next(index, frozen_first)
-            .map(|guard| guard.id())
-            .collect::<Vec<_>>();
+        let mut directory = tape::Layout::default();
+        for guard in tape::by_next(index, frozen_first) {
+            directory.page(guard.id());
+            if keyed {
+                for i in 1..=guard.len() {
+                    let bytes = guard.get(i).expect("data corruption");
+                    directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
+                        FrozenTupleReader::_0(x) => {
+                            Some(keys.range_of_block(x.payload(), x.columns()))
+                        }
+                        FrozenTupleReader::_1(_) => None,
+                    });
+                }
+            }
+        }
 
         let mut directory_tape = DirectoryTapeWriter::create(&hooked_index, false);
-        directory_tape.push(directory.as_slice());
+        directory_tape.push(directory.ids.as_slice());
+        if keyed {
+            directory_tape.push_layout(&directory.words());
+        }
         let directory_tape = directory_tape.into_inner();
 
         *jump_tuple.directory_first() = { directory_tape }.first();
@@ -296,10 +331,10 @@ where
     let jump_bytes = jump_guard.get(1).expect("data corruption");
     let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
     let mut frozen = 0_u64;
-    let directory =
-        tape::read_directory_tape::<R>(tape::by_next(index, jump_tuple.directory_first()))
-            .collect::<Vec<_>>();
-    for id in directory {
+    let mut words = Vec::new();
+    let directory = tape::by_next(index, jump_tuple.directory_first());
+    let pages = tape::read_directory_words::<R>(directory, &mut words, false);
+    for &id in &words[..pages] {
         let guard = index.read(id);
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
@@ -325,6 +360,104 @@ where
     }
     drop(jump_guard);
     Some(frozen + appendable)
+}
+
+/// A keyed list's row, but for its signs, pages and columns.
+#[derive(Clone, Copy)]
+struct Fixed {
+    metadata: [f32; 4],
+    delta: f32,
+    head: u16,
+    payload: NonZero<u64>,
+    /// The sort key of its first key.
+    key: u16,
+}
+
+/// A keyed list's rows, packed, to be sorted by their first key.
+struct Rows {
+    dim: usize,
+    fixed: Vec<Fixed>,
+    /// per row: the signs of the code, a bit each
+    signs: Vec<u64>,
+    /// per row: the same number of pages
+    prefetch: Vec<u32>,
+    /// per row: the filter key columns, as an appendable tuple stores them
+    columns: Vec<u8>,
+}
+
+impl Rows {
+    fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            fixed: Vec::new(),
+            signs: Vec::new(),
+            prefetch: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+    fn len(&self) -> usize {
+        self.fixed.len()
+    }
+    fn bytes(&self) -> usize {
+        let fixed = size_of::<Fixed>() + size_of::<u32>();
+        let words = self.signs.len() * size_of::<u64>() + self.prefetch.len() * 4;
+        self.len() * fixed + words + self.columns.len()
+    }
+    fn push(&mut self, row: tape::Row<'_, (rabitq::bit::Code, f32)>, keys: &Keys) {
+        let ((m, signs), delta) = row.value;
+        let metadata = [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err];
+        let key = keys.sort_key(row.columns);
+        let (head, payload) = (row.head, row.payload);
+        self.fixed.push(Fixed {
+            metadata,
+            delta,
+            head,
+            payload,
+            key,
+        });
+        // a frozen code is padded to a multiple of 4 signs, with zeros
+        let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
+        self.signs.extend_from_slice(&signs);
+        self.prefetch.extend_from_slice(row.prefetch);
+        row.columns.extend(keys, &mut self.columns);
+    }
+    /// The rows in the order of their first keys, stable.
+    fn sorted(&self) -> Vec<u32> {
+        let mut order = (0..self.len() as u32).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|&i| (self.fixed[i as usize].key, i));
+        order
+    }
+    fn branch(&self, i: usize) -> (Branch<NonZero<u64>>, &[u8]) {
+        let Fixed {
+            metadata,
+            delta,
+            head,
+            payload,
+            ..
+        } = self.fixed[i];
+        let words = self.dim.div_ceil(64);
+        let n = self.prefetch.len() / self.len();
+        let width = self.columns.len() / self.len();
+        let branch = Branch {
+            code: unpack_code(metadata, &self.signs[i * words..][..words], self.dim),
+            delta,
+            prefetch: self.prefetch[i * n..][..n].to_vec(),
+            head,
+            norm: 0.0,
+            extra: payload,
+        };
+        (branch, &self.columns[i * width..][..width])
+    }
+}
+
+/// A code from its metadata and its first `dim` signs, as an appendable tuple stores it.
+fn unpack_code(metadata: [f32; 4], words: &[u64], dim: usize) -> rabitq::bit::Code {
+    let signs = words
+        .iter()
+        .flat_map(|x| std::array::from_fn::<_, 64, _>(|j| x & (1 << j) != 0))
+        .take(dim)
+        .collect();
+    (rabitq::bit::CodeMetadata::from_array(metadata), signs)
 }
 
 #[derive(Clone)]

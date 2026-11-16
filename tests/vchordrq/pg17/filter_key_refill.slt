@@ -1,0 +1,76 @@
+# From PostgreSQL 17, a scan with `key = ANY(...)` also reads further lists.
+
+statement ok
+CREATE TABLE rf_any (id int PRIMARY KEY, owner int4, v vector(3));
+
+# owner 1: 300 rows, owner 2: 2,000 rows, owners 10..19: the rest
+statement ok
+INSERT INTO rf_any SELECT i,
+  CASE WHEN i % 200 = 0 THEN 1 WHEN i % 30 = 1 THEN 2 ELSE 10 + i % 10 END,
+  ARRAY[sin(i), cos(1.3 * i), sin(0.7 * i)]::real[]::vector
+FROM generate_series(1, 60000) i;
+
+statement ok
+CREATE INDEX ON rf_any USING vchordrq (v vector_l2_ops, owner int4_ops) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [64]
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+query I
+SELECT count(*) FROM (SELECT id FROM rf_any WHERE owner = ANY('{1,3}') ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 50) s;
+----
+50
+
+query I
+SELECT count(*) FROM (SELECT id FROM rf_any WHERE owner = ANY('{1,3}') ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+300
+
+query I
+SELECT count(*) FROM (SELECT id FROM rf_any WHERE owner = ANY('{1,2}') ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+2300
+
+statement ok
+SET vchordrq.io_rerank = 'read_stream';
+
+query I
+SELECT count(*) FROM (SELECT id FROM rf_any WHERE owner = ANY('{1,3}') ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 50) s;
+----
+50
+
+statement ok
+SET vchordrq.prefilter = on;
+
+query I
+SELECT count(*) FROM (SELECT id FROM rf_any WHERE owner = ANY('{1,3}') AND id % 400 = 0 ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+150
+
+statement ok
+DROP TABLE rf_any;
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+RESET vchordrq.io_rerank;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;

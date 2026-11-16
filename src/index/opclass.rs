@@ -146,6 +146,30 @@ fn _vchordrq_support_rabitq4_maxsim_ops() -> String {
     "vchordrq_rabitq4_maxsim_ops".to_string()
 }
 
+#[pgrx::pg_extern(immutable, strict, parallel_safe)]
+fn _vchordrq_uuid_options(relopts: pgrx::Internal) {
+    use crate::index::vchordrq::filter_key::{Type, options};
+    unsafe { options(relopts, Type::Uuid) }
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe)]
+fn _vchordrq_int2_options(relopts: pgrx::Internal) {
+    use crate::index::vchordrq::filter_key::{Type, options};
+    unsafe { options(relopts, Type::Int2) }
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe)]
+fn _vchordrq_int4_options(relopts: pgrx::Internal) {
+    use crate::index::vchordrq::filter_key::{Type, options};
+    unsafe { options(relopts, Type::Int4) }
+}
+
+#[pgrx::pg_extern(immutable, strict, parallel_safe)]
+fn _vchordrq_int8_options(relopts: pgrx::Internal) {
+    use crate::index::vchordrq::filter_key::{Type, options};
+    unsafe { options(relopts, Type::Int8) }
+}
+
 pub struct Sphere<T> {
     pub center: T,
     pub radius: f32,

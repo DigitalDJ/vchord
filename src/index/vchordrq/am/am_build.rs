@@ -14,6 +14,7 @@ use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::traverse::{HeapTraverser, Traverser};
 use crate::index::vchordrq::am::Reloption;
 use crate::index::vchordrq::build::{Normalize, Normalized};
+use crate::index::vchordrq::filter_key::{FilterKeys, of_options};
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::types::*;
 use index::relation::{
@@ -222,7 +223,8 @@ pub unsafe extern "C-unwind" fn ambuild(
     index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> *mut pgrx::pg_sys::IndexBuildResult {
     use validator::Validate;
-    let (vector_options, vchordrq_options) = unsafe { options(index_relation) };
+    let keys = unsafe { of_options(index_relation) };
+    let (vector_options, vchordrq_options) = unsafe { options(index_relation, &keys) };
     if let Err(errors) = Validate::validate(&vector_options) {
         report_invalid_options(errors);
     }
@@ -296,6 +298,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     crate::index::vchordrq::dispatch::build(
         vector_options,
         vchordrq_options.index,
+        &keys,
         &index,
         structures,
     );
@@ -453,6 +456,7 @@ pub unsafe extern "C-unwind" fn ambuild(
                 index_relation,
                 heap_relation,
                 index_info,
+                &keys,
                 &cached,
                 |indtuples| {
                     reporter.tuples_done(indtuples);
@@ -990,6 +994,8 @@ unsafe fn parallel_build(
         )
     };
     let opfamily = unsafe { opfamily(index_relation) };
+    let keys = unsafe { of_options(index_relation) };
+    let keys = FilterKeys::new(index_relation, &keys);
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
     struct IdChooser(u32);
@@ -1024,6 +1030,7 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let columns = unsafe { keys.row(values, is_nulls) };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1036,6 +1043,7 @@ unsafe fn parallel_build(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1065,6 +1073,7 @@ unsafe fn parallel_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let columns = unsafe { keys.row(values, is_nulls) };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1077,6 +1086,7 @@ unsafe fn parallel_build(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1129,6 +1139,7 @@ unsafe fn sequential_build(
     index_relation: pgrx::pg_sys::Relation,
     heap_relation: pgrx::pg_sys::Relation,
     index_info: *mut pgrx::pg_sys::IndexInfo,
+    keys: &vchordrq::keys::Keys,
     vchordrqcached: &[u8],
     mut callback: impl FnMut(u64),
     sync_0: impl FnOnce(),
@@ -1140,6 +1151,7 @@ unsafe fn sequential_build(
     let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
 
     let opfamily = unsafe { opfamily(index_relation) };
+    let keys = FilterKeys::new(index_relation, keys);
     let traverser = unsafe {
         HeapTraverser::new(
             heap_relation,
@@ -1179,6 +1191,7 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let columns = unsafe { keys.row(values, is_nulls) };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1191,6 +1204,7 @@ unsafe fn sequential_build(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1212,6 +1226,7 @@ unsafe fn sequential_build(
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
                 let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+                let columns = unsafe { keys.row(values, is_nulls) };
                 let store = value
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
@@ -1224,6 +1239,7 @@ unsafe fn sequential_build(
                         opfamily,
                         &index,
                         payload,
+                        &columns,
                         vector,
                         true,
                         true,
@@ -1263,6 +1279,7 @@ pub unsafe extern "C-unwind" fn ambuildempty(_index_relation: pgrx::pg_sys::Rela
 
 unsafe fn options(
     index_relation: pgrx::pg_sys::Relation,
+    keys: &vchordrq::keys::Keys,
 ) -> (VectorOptions, VchordrqIndexingOptions) {
     let att = unsafe { &mut *(*index_relation).rd_att };
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
@@ -1279,9 +1296,6 @@ unsafe fn options(
     if atts.is_empty() {
         pgrx::error!("indexing on no columns is not supported");
     }
-    if atts.len() != 1 {
-        pgrx::error!("multicolumn index is not supported");
-    }
     // get dim
     let typmod = Typmod::new(atts[0].atttypmod).unwrap();
     let dim = if let Some(dim) = typmod.dim() {
@@ -1293,11 +1307,38 @@ unsafe fn options(
     };
     // get v, d
     let opfamily = unsafe { opfamily(index_relation) };
+    if unsafe { (*(*index_relation).rd_index).indnkeyatts } > 1
+        && matches!(
+            opfamily,
+            Opfamily::VectorMaxsim
+                | Opfamily::HalfvecMaxsim
+                | Opfamily::Rabitq8Maxsim
+                | Opfamily::Rabitq4Maxsim
+        )
+    {
+        pgrx::error!("filter key column with a maxsim operator class is not supported");
+    }
     let vector = VectorOptions {
         dim,
         v: opfamily.vector_kind(),
         d: opfamily.distance_kind(),
     };
+    use pgrx::pg_sys::{BLCKSZ, ItemIdData, PageHeaderData};
+    let freespace = BLCKSZ as usize
+        - std::mem::offset_of!(PageHeaderData, pd_linp)
+        - size_of::<vchordrq::Opaque>()
+        - size_of::<ItemIdData>();
+    let prefetch = crate::index::vchordrq::dispatch::prefetch(vector.v, dim);
+    let words = (dim as usize).div_ceil(64);
+    let most = vchordrq::keys::Keys::most_columns(words, prefetch, freespace);
+    if keys.columns() > most {
+        pgrx::error!(
+            "filter keys of {} bytes per row do not fit: an index of {} dimensions holds at most {} bytes per row, as a block keeps the keys of its 32 rows on one page",
+            keys.columns(),
+            dim,
+            most
+        );
+    }
     // get indexing options
     let indexing_options = {
         let reloption = unsafe { (*index_relation).rd_options as *const Reloption };

@@ -62,6 +62,8 @@ impl CodeMetadata {
 /// equals the centroid the radicand can come out slightly negative; clamp such
 /// finite roundoff to zero instead of producing a NaN lower bound (#35). NaN
 /// and negative infinity from invalid inputs are left alone.
+///
+/// With `lambda` times the centroid's `norm` and `dis_f`, it is `|q - lambda c|`.
 #[inline(always)]
 fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
     let r = dis_v_2 + norm * norm + 2.0 * dis_f;
@@ -69,6 +71,42 @@ fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
         0.0
     } else {
         r.sqrt()
+    }
+}
+
+/// `<q, c> / |c|^2`, the `lambda` that minimizes `|q - lambda c|`, or 1 for a zero centroid.
+#[inline]
+pub fn projection(dis_f: f32, norm: f32) -> f32 {
+    let lambda = -dis_f / (norm * norm);
+    if lambda.is_finite() { lambda } else { 1.0 }
+}
+
+/// The terms of a list's residual estimates, from its centroid `c`.
+#[derive(Debug, Clone, Copy)]
+pub struct Residual {
+    /// `|q - c|^2` for L2, `-<q, c>` for a dot product.
+    pub dis_f: f32,
+    /// The query is centered on `lambda c`.
+    pub lambda: f32,
+    /// The norm of the query's residual.
+    pub norm: f32,
+}
+
+impl Residual {
+    pub fn l2(dis_f: f32) -> Self {
+        Self {
+            dis_f,
+            lambda: 1.0,
+            norm: dis_f.sqrt(),
+        }
+    }
+    /// `norm`: the centroid's.
+    pub fn dot((metadata, _): &BlockLut, dis_f: f32, norm: f32, lambda: f32) -> Self {
+        Self {
+            dis_f,
+            lambda,
+            norm: residual_norm(metadata.dis_v_2, lambda * norm, lambda * dis_f),
+        }
     }
 }
 
@@ -246,12 +284,12 @@ pub mod binary {
             k,
             qvector_sum,
         }: BinaryLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
-        let rough = dis_u_2 + dis_f - 2.0 * e * factor_ip + delta;
-        let err = 2.0 * factor_err * dis_f.sqrt();
+        let rough = dis_u_2 + residual.dis_f - 2.0 * e * factor_ip + delta;
+        let err = 2.0 * factor_err * residual.norm;
         (rough, err)
     }
 
@@ -277,6 +315,7 @@ pub mod binary {
         (rough, err)
     }
 
+    /// See `block::half_process_dot_residual`.
     #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
@@ -287,18 +326,17 @@ pub mod binary {
             factor_err,
         }: CodeMetadata,
         BinaryLutMetadata {
-            dis_v_2,
+            dis_v_2: _,
             b,
             k,
             qvector_sum,
         }: BinaryLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
-        norm: f32,
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
-        let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
+        let rough = -e * factor_ip + residual.dis_f + residual.lambda * delta;
+        let err = factor_err * residual.norm;
         (rough, err)
     }
 
@@ -325,12 +363,13 @@ pub mod block {
 
     #[derive(Debug, Clone, Copy)]
     pub struct BlockLutMetadata {
-        dis_v_2: f32,
+        pub(super) dis_v_2: f32,
         k: f32,
         c: f32,
     }
 
     pub type BlockLut = (BlockLutMetadata, Vec<[u8; 16]>);
+
     pub type BlockCode<'a> = (
         &'a [f32; 32],
         &'a [f32; 32],
@@ -437,12 +476,12 @@ pub mod block {
             factor_err,
         }: CodeMetadata,
         BlockLutMetadata { dis_v_2: _, k, c }: BlockLutMetadata,
-        dis_f: f32,
+        residual: super::Residual,
         delta: f32,
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
-        let rough = dis_u_2 + dis_f - 2.0 * e * factor_ip + delta;
-        let err = 2.0 * factor_err * dis_f.sqrt();
+        let rough = dis_u_2 + residual.dis_f - 2.0 * e * factor_ip + delta;
+        let err = 2.0 * factor_err * residual.norm;
         (rough, err)
     }
 
@@ -463,6 +502,8 @@ pub mod block {
         (rough, err)
     }
 
+    /// `-<x, q> = -<r, q - lambda c> - lambda <r, c> + dis_f` for `x = c + r`: with the
+    /// stored `delta = est<r, c> - <r, c>`, `-e factor_ip + dis_f + lambda delta`.
     #[inline(always)]
     pub fn half_process_dot_residual(
         sum: u32,
@@ -472,14 +513,13 @@ pub mod block {
             factor_ip,
             factor_err,
         }: CodeMetadata,
-        BlockLutMetadata { dis_v_2, k, c }: BlockLutMetadata,
-        dis_f: f32,
+        BlockLutMetadata { dis_v_2: _, k, c }: BlockLutMetadata,
+        residual: super::Residual,
         delta: f32,
-        norm: f32,
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
-        let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
+        let rough = -e * factor_ip + residual.dis_f + residual.lambda * delta;
+        let err = factor_err * residual.norm;
         (rough, err)
     }
 
@@ -672,8 +712,25 @@ mod tests {
             let (metadata, elements) = code(&residual);
             let lut = binary::preprocess(&query);
             let sum = binary::accumulate(&binary::pack_code(&elements), &lut.1);
-            let (rough, err) = binary::half_process_l2s_residual(sum, metadata, lut.0, dis_f, 0.0);
+            let (rough, err) =
+                binary::half_process_l2s_residual(sum, metadata, lut.0, Residual::l2(dis_f), 0.0);
             assert_eq!((rough, err), (dis_f, 0.0));
+        }
+    }
+
+    #[test]
+    fn projection_minimizes_residual_norm() {
+        assert_eq!(projection(-0.2, 0.5), 0.8);
+        assert_eq!(projection(0.0, 0.0), 1.0);
+        assert_eq!(projection(-0.3, 0.0), 1.0);
+        let mut rng = lcg(5);
+        for _ in 0..1000 {
+            let (dis_v_2, dis_f, norm) = (1.0 + rng().abs(), rng(), 0.5 + rng().abs());
+            let lambda = projection(dis_f, norm);
+            let at = |lambda: f32| residual_norm(dis_v_2, lambda * norm, lambda * dis_f);
+            for other in [1.0, 0.0, lambda - 0.01, lambda + 0.01] {
+                assert!(at(lambda) <= at(other) * (1.0 + 1e-6), "{lambda} {other}");
+            }
         }
     }
 }

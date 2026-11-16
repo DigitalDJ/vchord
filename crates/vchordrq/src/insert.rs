@@ -64,6 +64,7 @@ where
 pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     payload: NonZero<u64>,
+    columns: &[u8],
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
@@ -116,9 +117,10 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
         {
             let (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) = state;
+            let residual = is_residual.then(|| O::routing_residual(&lut.0, dis_f.to_f32(), norm));
             tape::read_h1_tape::<R, _, _>(
                 tape::by_next(index, first),
-                || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
+                || O::block_access(&lut.0, residual),
                 |(rough, err), head, norm, first, prefetch| {
                     let lowerbound = Distance::from_f32(rough - err * epsilon);
                     results.push((
@@ -197,6 +199,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         prefetch,
         head,
         elements: rabitq::bit::binary::pack_code(&code.1),
+        columns: columns.to_vec(),
     });
 
     tape::append(

@@ -53,17 +53,17 @@ where
     for _ in (1..height_of_root).rev() {
         state = step(state);
     }
+    let mut words = Vec::new();
     for first in state {
         // The list's jump page stays share-locked while it is processed.
         check();
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut directory =
-            tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
+        let directory = by_next(index, jump_tuple.directory_first());
+        let pages = tape::read_directory_words::<R>(directory, &mut words, false);
         {
-            let mut current = directory.next().unwrap_or(u32::MAX);
-            while current != u32::MAX {
+            for &current in &words[..pages] {
                 let read = index.read(current);
                 let flag = 'flag: {
                     for i in 1..=read.len() {
@@ -95,7 +95,6 @@ where
                         }
                     }
                 }
-                current = directory.next().unwrap_or(u32::MAX);
             }
         }
         {

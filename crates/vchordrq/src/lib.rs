@@ -27,6 +27,7 @@ mod tuples;
 mod vectors;
 
 pub mod build_memory;
+pub mod keys;
 pub mod operator;
 pub mod types;
 
@@ -39,8 +40,8 @@ pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
 pub use maintain::{MaintainChooser, maintain};
 pub use prewarm::prewarm;
-pub use rerank::{how, rerank_heap, rerank_index};
-pub use search::{default_search, maxsim_search};
+pub use rerank::{Table, how, rerank_heap, rerank_index};
+pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

@@ -14,144 +14,55 @@ use distance::Distance;
 use index::relation::{
     Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
+use index::test_support::{MemoryPage, MemoryRelation};
 use index_accessor::L2S;
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::num::{NonZero, Wrapping};
-use std::ops::{Deref, DerefMut};
 use vector::vect::VectOwned;
-use zerocopy::IntoBytes;
 
 pub(crate) type TestOp = Op<VectOwned<f32>, L2S>;
-pub(crate) struct TestPage {
-    opaque: Opaque,
-    items: Vec<Option<Vec<u64>>>,
-    freespace: u16,
-}
-impl Page for TestPage {
-    type Opaque = Opaque;
-    fn get_opaque(&self) -> &Opaque {
-        &self.opaque
-    }
-    fn get_opaque_mut(&mut self) -> &mut Opaque {
-        &mut self.opaque
-    }
-    fn len(&self) -> u16 {
-        self.items.len() as u16
-    }
-    fn get(&self, i: u16) -> Option<&[u8]> {
-        self.items
-            .get(i as usize - 1)?
-            .as_deref()
-            .map(IntoBytes::as_bytes)
-    }
-    fn get_mut(&mut self, i: u16) -> Option<&mut [u8]> {
-        self.items
-            .get_mut(i as usize - 1)?
-            .as_deref_mut()
-            .map(IntoBytes::as_mut_bytes)
-    }
-    fn alloc(&mut self, data: &[u8]) -> Option<u16> {
-        self.items.push(Some(aligned(data)));
-        Some(self.len())
-    }
-    fn free(&mut self, i: u16) {
-        self.items[i as usize - 1] = None;
-    }
-    fn freespace(&self) -> u16 {
-        self.freespace
-    }
-    fn clear(&mut self, opaque: Opaque) {
-        self.items.clear();
-        self.opaque = opaque;
-    }
-}
-pub(crate) struct Read<'a> {
-    id: u32,
-    page: Ref<'a, TestPage>,
-}
-impl Deref for Read<'_> {
-    type Target = TestPage;
-    fn deref(&self) -> &TestPage {
-        &self.page
-    }
-}
-impl PageGuard for Read<'_> {
-    fn id(&self) -> u32 {
-        self.id
-    }
-}
-pub(crate) struct Write<'a> {
-    id: u32,
-    page: RefMut<'a, TestPage>,
-}
-impl Deref for Write<'_> {
-    type Target = TestPage;
-    fn deref(&self) -> &TestPage {
-        &self.page
-    }
-}
-impl DerefMut for Write<'_> {
-    fn deref_mut(&mut self) -> &mut TestPage {
-        &mut self.page
-    }
-}
-impl PageGuard for Write<'_> {
-    fn id(&self) -> u32 {
-        self.id
-    }
-}
 pub(crate) struct TestRelation {
-    pages: Vec<RefCell<TestPage>>,
+    pages: MemoryRelation<Opaque>,
     pub inject: Cell<bool>,
     pub conflicts: Cell<usize>,
-    /// Pages from this index on are handed out by `extend`.
-    spare: Cell<usize>,
     /// `(first, second)` of every `commit_pair`, in call order.
     pub pairs: RefCell<Vec<(u32, u32)>>,
 }
 impl TestRelation {
-    fn new(pages: Vec<RefCell<TestPage>>, inject: bool) -> Self {
+    fn new(pages: Vec<MemoryPage<Opaque>>, inject: bool) -> Self {
         Self {
-            spare: Cell::new(pages.len()),
-            pages,
+            pages: MemoryRelation::new(pages),
             inject: Cell::new(inject),
             conflicts: Cell::new(0),
             pairs: RefCell::new(Vec::new()),
         }
     }
-    /// Marks page `id` as full and adds `spare` pages for `extend`.
-    pub(crate) fn with_full_page(mut self, id: u32, spare: usize) -> Self {
-        self.pages[id as usize].get_mut().freespace = 0;
-        for _ in 0..spare {
-            self.pages.push(page(u32::MAX, u32::MAX, Vec::new()));
-        }
+    pub(crate) fn with_full_page(self, id: u32) -> Self {
+        self.pages.page(id).borrow_mut().full = true;
         self
     }
 }
 impl Relation for TestRelation {
-    type Page = TestPage;
+    type Page = MemoryPage<Opaque>;
 }
 impl RelationReadTypes for TestRelation {
-    type ReadGuard<'b> = Read<'b>;
+    type ReadGuard<'b> = <MemoryRelation<Opaque> as RelationReadTypes>::ReadGuard<'b>;
 }
 impl RelationRead for TestRelation {
-    fn read(&self, id: u32) -> Read<'_> {
-        Read {
-            id,
-            page: self.pages[id as usize].borrow(),
-        }
+    fn read(&self, id: u32) -> Self::ReadGuard<'_> {
+        self.pages.read(id)
     }
 }
 impl RelationWriteTypes for TestRelation {
-    type WriteGuard<'b> = Write<'b>;
+    type WriteGuard<'b> = <MemoryRelation<Opaque> as RelationWriteTypes>::WriteGuard<'b>;
 }
 impl RelationWrite for TestRelation {
-    fn commit_pair(&self, first: Write<'_>, second: Write<'_>) {
-        self.pairs.borrow_mut().push((first.id, second.id));
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+        self.pairs.borrow_mut().push((first.id(), second.id()));
     }
 
-    fn write(&self, id: u32, _: bool) -> Write<'_> {
-        let mut page = self.pages[id as usize].borrow_mut();
+    fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
+        let mut page = self.pages.write(id, tracking_freespace);
         // Emulate intervening successful list writes before taking the write
         // lock: the observed list version is now stale. No thread scheduling.
         if self.inject.get() && id == 2 {
@@ -163,38 +74,22 @@ impl RelationWrite for TestRelation {
             *tuple.version() += 1;
             self.conflicts.set(self.conflicts.get() + 1);
         }
-        Write { id, page }
+        page
     }
-    fn extend(&self, opaque: Opaque, _: bool) -> Write<'_> {
-        let id = self.spare.get();
-        assert!(id < self.pages.len(), "unexpected extend");
-        self.spare.set(id + 1);
-        let mut page = self.pages[id].borrow_mut();
-        page.clear(opaque);
-        Write {
-            id: id as u32,
-            page,
-        }
+    fn extend(&self, opaque: Opaque, tracking_freespace: bool) -> Self::WriteGuard<'_> {
+        self.pages.extend(opaque, tracking_freespace)
     }
-    fn search(&self, _: usize) -> Option<Write<'_>> {
+    fn search(&self, _: usize) -> Option<Self::WriteGuard<'_>> {
         None
     }
 }
-// Serialized tuples are padded to ALIGN bytes; match PostgreSQL's tuple
-// alignment instead of relying on the allocator over-aligning Vec<u8>.
-fn aligned(data: &[u8]) -> Vec<u64> {
-    assert_eq!(data.len() % size_of::<u64>(), 0);
-    let mut words = vec![0u64; data.len() / size_of::<u64>()];
-    words.as_mut_bytes().copy_from_slice(data);
-    words
-}
 
-fn page(link: u32, next: u32, items: Vec<Vec<u8>>) -> RefCell<TestPage> {
-    RefCell::new(TestPage {
-        opaque: Opaque { link, next },
-        items: items.into_iter().map(|data| Some(aligned(&data))).collect(),
-        freespace: 7000,
-    })
+fn page(link: u32, next: u32, items: Vec<Vec<u8>>) -> MemoryPage<Opaque> {
+    let mut page = MemoryPage::new(Opaque { link, next });
+    for item in items {
+        page.alloc(&item).unwrap();
+    }
+    page
 }
 pub(crate) fn fixture(inject: bool) -> TestRelation {
     let meta = MetaTuple {

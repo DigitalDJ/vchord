@@ -9,7 +9,7 @@
 use crate::{VectorBorrowed, VectorOwned};
 use distance::Distance;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Rabitq4Owned {
     dim: u32,
     sum_of_x2: f32,

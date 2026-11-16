@@ -1,0 +1,569 @@
+# Full index scans with filter keys return the heap's rows.
+
+statement ok
+CREATE TABLE fk (id int PRIMARY KEY, owner uuid, grp int4, note text, u uuid NOT NULL, un uuid, i2 int2,
+  i4 int4 NOT NULL, i8 int8, v vector(3));
+
+statement ok
+INSERT INTO fk SELECT i,
+  CASE WHEN i % 100 = 0 THEN NULL
+       ELSE ('00000000-0000-0000-0000-' || lpad((i % 10)::text, 12, '0'))::uuid END,
+  i % 7, NULL,
+  ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid,
+  CASE WHEN i % 100 = 0 THEN NULL ELSE ('00000000-0000-0000-0000-' || lpad((i % 7)::text, 12, '0'))::uuid END,
+  CASE WHEN i % 100 = 1 THEN NULL ELSE (i % 301 - 150)::int2 END,
+  i % 1000,
+  CASE WHEN i % 100 = 2 THEN NULL ELSE (i % 37)::int8 * 1000000000000 END,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector
+FROM generate_series(1, 30000) i;
+
+statement error has no default operator class for access method
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, note);
+
+statement ok
+CREATE TABLE fk_maxsim (owner uuid, v vector(3)[]);
+
+statement error filter key column with a maxsim operator class is not supported
+CREATE INDEX ON fk_maxsim USING vchordrq (v vector_maxsim_ops, owner);
+
+statement ok
+DROP TABLE fk_maxsim;
+
+statement error does not support included columns
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops) INCLUDE (owner);
+
+statement error unknown operator class of a filter key column
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, v vector_ip_ops);
+
+statement ok
+SET max_parallel_maintenance_workers = 2;
+
+statement ok
+ALTER TABLE fk SET (parallel_workers = 2);
+
+statement ok
+CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes = 2)) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+ALTER TABLE fk RESET (parallel_workers);
+
+query T
+SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes=''2''))%';
+----
+t
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement ok
+SET vchordrq.probes = '32';
+
+statement ok
+CREATE FUNCTION fk_same(cond text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[];
+BEGIN
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fk WHERE %s '
+    'ORDER BY v <-> ''[0.5,0.5,0.5]'') s', cond) INTO a;
+  EXECUTE format('SELECT array_agg(id ORDER BY id) FROM fk WHERE (%s) IS TRUE', cond) INTO b;
+  RETURN a IS NOT DISTINCT FROM b;
+END
+$$;
+
+statement ok
+CREATE FUNCTION fk_plan(q text, with_analyze boolean DEFAULT false) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE r text; result text := '';
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (COSTS OFF' ||
+    CASE WHEN with_analyze THEN ', ANALYZE, TIMING OFF, SUMMARY OFF' ELSE '' END || ') ' || q LOOP
+    result := result || r || E'\n';
+  END LOOP;
+  RETURN result;
+END
+$$;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000001''');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'')');
+----
+t
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,NULL}'')');
+----
+t
+
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner = ANY('{}') ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner = ANY(NULL::uuid[]) ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+0
+
+# NULLs never match a key; IS NULL is a Filter.
+query I
+SELECT count(*) FROM (SELECT id FROM fk WHERE owner IS NULL ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+300
+
+query I
+SELECT count(*) FROM (SELECT id, owner FROM fk WHERE owner = ANY(ARRAY(SELECT DISTINCT owner FROM fk WHERE owner IS NOT NULL))
+  ORDER BY v <-> '[0.5,0.5,0.5]') s WHERE owner IS NULL;
+----
+0
+
+query T
+SELECT fk_plan('SELECT id FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001'' ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 10')
+  LIKE '%Index Cond: (owner = %Order By:%';
+----
+t
+
+# A filter key alone does not use the index.
+query T
+SELECT fk_plan('SELECT count(*) FROM fk WHERE owner = ''00000000-0000-0000-0000-000000000001''') LIKE '%fk_v%';
+----
+f
+
+statement ok
+PREPARE fkp(uuid[]) AS SELECT
+  (SELECT array_agg(id ORDER BY id) FROM (SELECT id FROM fk WHERE owner = ANY($1) ORDER BY v <-> '[0.5,0.5,0.5]') s)
+  = (SELECT array_agg(id ORDER BY id) FROM fk WHERE owner = ANY($1));
+
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+query T
+EXECUTE fkp('{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000004}');
+----
+t
+
+query T
+EXECUTE fkp('{00000000-0000-0000-0000-000000000006}');
+----
+t
+
+statement ok
+RESET plan_cache_mode;
+
+statement ok
+DEALLOCATE fkp;
+
+query T
+SELECT fk_plan('SELECT s.id FROM (VALUES (''00000000-0000-0000-0000-000000000001''::uuid), (''00000000-0000-0000-0000-000000000002''::uuid)) o(owner)
+  CROSS JOIN LATERAL (SELECT id FROM fk WHERE fk.owner = o.owner ORDER BY v <-> ''[0.5,0.5,0.5]'' LIMIT 20) s') LIKE '%Nested Loop%Index Scan using fk_v%Index Cond: (owner = %';
+----
+t
+
+query T
+SELECT (SELECT array_agg(id ORDER BY id) FROM (VALUES ('00000000-0000-0000-0000-000000000001'::uuid), ('00000000-0000-0000-0000-000000000002'::uuid)) o(owner)
+  CROSS JOIN LATERAL (SELECT id FROM fk WHERE fk.owner = o.owner ORDER BY v <-> '[0.5,0.5,0.5]') s)
+  = (SELECT array_agg(id ORDER BY id) FROM fk WHERE owner IN ('00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002'));
+----
+t
+
+query T
+SELECT fk_same('v <<->> ANY(ARRAY[sphere(''[0,0,0]''::vector, 0.5), sphere(''[1,1,1]''::vector, 0.5)])');
+----
+t
+
+statement ok
+SET vchordrq.prefilter = on;
+
+query T
+SELECT fk_same('owner = ''00000000-0000-0000-0000-000000000003'' AND grp = 3');
+----
+t
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+SET vchordrq.max_scan_tuples = 50;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE owner = '00000000-0000-0000-0000-000000000004')
+FROM (SELECT owner FROM fk WHERE owner = '00000000-0000-0000-0000-000000000004' ORDER BY v <-> '[0.5,0.5,0.5]') s;
+----
+50 50
+
+statement ok
+RESET vchordrq.max_scan_tuples;
+
+statement ok
+CREATE INDEX fk_rt ON fk USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+rerank_in_table = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('owner = ANY(''{00000000-0000-0000-0000-000000000001,00000000-0000-0000-0000-000000000002}'')');
+----
+t
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP INDEX fk_rt;
+
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+CREATE INDEX fk_g ON fk USING vchordrq (v vector_l2_ops, grp) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('grp = ANY(''{1,2}''::int8[])');
+----
+t
+
+statement ok
+ROLLBACK;
+
+statement ok
+ALTER TABLE fk ALTER COLUMN grp TYPE int8;
+
+query T
+SELECT o.opcname FROM pg_index i JOIN pg_opclass o ON o.oid = i.indclass[1] WHERE i.indexrelid = 'fk_g'::regclass;
+----
+int8_ops
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX fk_v;
+
+query T
+SELECT fk_same('grp = ANY(''{1,2}''::int4[])');
+----
+t
+
+statement ok
+ROLLBACK;
+
+statement error operator class "uuid_ops" does not accept data type text
+ALTER TABLE fk ALTER COLUMN owner TYPE text USING owner::text;
+
+statement ok
+DROP INDEX fk_v, fk_g;
+
+statement ok
+RESET vchordrq.probes;
+
+statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+
+statement error value 4 out of bounds for option "bytes"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i2 int2_ops (bytes = 4));
+
+statement error value 8 out of bounds for option "bytes"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i4 int4_ops (bytes = 8));
+
+statement error value 32 out of bounds for option "bytes"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 32));
+
+statement error unrecognized parameter "width"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (width = 4));
+
+statement error vector_l2_ops has no options
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops (bytes = 4), u);
+
+statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
+CREATE INDEX CONCURRENTLY fk_bad ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+
+query I
+SELECT count(*) FROM pg_class WHERE relname = 'fk_bad';
+----
+0
+
+# At 3 dimensions a row holds 220 bytes of keys: 13 whole uuids, not 14.
+statement ok
+CREATE TABLE fw (id int, v vector(3), k1 uuid, k2 uuid, k3 uuid, k4 uuid, k5 uuid, k6 uuid, k7 uuid,
+  k8 uuid, k9 uuid, k10 uuid, k11 uuid, k12 uuid, k13 uuid, k14 uuid);
+
+statement ok
+INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
+FROM generate_series(1, 20) i;
+
+statement error filter keys of 224 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
+CREATE INDEX ON fw USING vchordrq (v vector_l2_ops, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14);
+
+statement ok
+CREATE INDEX fw_13 ON fw USING vchordrq (v vector_l2_ops, k13, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k1);
+
+statement ok
+INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(), gen_random_uuid(),
+  ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
+FROM generate_series(21, 2000) i;
+
+statement ok
+VACUUM fw;
+
+query T
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fw WHERE k13 = '00000000-0000-0000-0000-000000000004')
+FROM (SELECT id FROM fw WHERE k13 = '00000000-0000-0000-0000-000000000004' ORDER BY v <-> '[1,2,3]') s;
+----
+t
+
+statement ok
+DROP TABLE fw;
+
+statement ok
+SET vchordrq.probes = '16';
+
+statement ok
+CREATE FUNCTION fk_recheck(cond text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json; node json;
+BEGIN
+  EXECUTE format('EXPLAIN (ANALYZE, TIMING OFF, SUMMARY OFF, FORMAT JSON) SELECT id FROM fk '
+    'WHERE %s ORDER BY v <-> ''[0.5,0.5,0.5]''', cond) INTO plan;
+  node := plan -> 0 -> 'Plan';
+  WHILE node ->> 'Node Type' <> 'Index Scan' LOOP
+    node := node -> 'Plans' -> 0;
+  END LOOP;
+  RETURN (node ->> 'Actual Rows')::numeric::int || ' returned, '
+    || coalesce((node ->> 'Rows Removed by Index Recheck')::int, 0) || ' removed by the recheck';
+END
+$$;
+
+statement ok
+CREATE FUNCTION fk_subsets(conds text[]) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE n int := array_length(conds, 1); m int; cond text; bad text := '';
+BEGIN
+  FOR m IN 1..(1 << n) - 1 LOOP
+    SELECT string_agg(conds[i], ' AND ') INTO cond FROM generate_series(1, n) i WHERE m >> (i - 1) & 1 = 1;
+    IF NOT fk_same(cond) THEN
+      bad := bad || cond || E'\n';
+    END IF;
+  END LOOP;
+  RETURN coalesce(nullif(bad, ''), 'all equal');
+END
+$$;
+
+statement ok
+CREATE INDEX fk_whole ON fk USING vchordrq (v vector_l2_ops, u, i4, i2) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+query T
+SELECT pg_get_indexdef('fk_whole'::regclass) LIKE '%(v vector_l2_ops, u, i4, i2)%';
+----
+t
+
+query T
+SELECT fk_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = 207', 'i2 = 57']);
+----
+all equal
+
+query T
+SELECT fk_subsets(ARRAY['u = ANY(''{00000000-0000-0000-0000-000000000007,00000000-0000-0000-0000-000000000008}'')', 'i4 = ANY(''{207,208,1207}'')', 'i2 = ANY(''{57,-93,58}'')']);
+----
+all equal
+
+# Keys are whole by default and recheck only for NULL's stored form, zeros: the least integer, the nil uuid.
+query T
+SELECT fk_recheck('u = ''00000000-0000-0000-0000-000000000007'' AND i4 = 207');
+----
+30 returned, 0 removed by the recheck
+
+query T
+SELECT fk_recheck('i2 = 57') || ', ' || fk_same('i2 = 57');
+----
+98 returned, 0 removed by the recheck, true
+
+query T
+SELECT fk_recheck('i2 = -32768') || ', ' || fk_same('i2 = -32768');
+----
+0 returned, 300 removed by the recheck, true
+
+query T
+SELECT fk_recheck('i4 = 4294967503::int8') || ', ' || fk_same('i4 = 4294967503::int8');
+----
+0 returned, 0 removed by the recheck, true
+
+query T
+SELECT fk_same('i4 = 207::int8 AND i2 = 57::int4');
+----
+t
+
+query T
+SELECT fk_same('i2 = 70000');
+----
+t
+
+query T
+SELECT fk_same('i4 = NULL');
+----
+t
+
+query T
+SELECT string_agg(n::text, ',' ORDER BY n) FROM unnest(ARRAY[1, 10, 33, 200, 5000]) n
+WHERE fk_same(format('i4 = ANY(ARRAY(SELECT x FROM generate_series(0, %s, 2) x))', 2 * n - 2))
+  AND fk_same(format('u = ANY(ARRAY(SELECT (''00000000-0000-0000-0000-'' || lpad((x * 3)::text, 12, ''0''))::uuid FROM generate_series(0, %s) x))', n - 1));
+----
+1,10,33,200,5000
+
+statement ok
+INSERT INTO fk (id, u, i4, v) SELECT i, ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid, i % 1000,
+  ARRAY[(i % 97) / 97.0, (i % 89) / 89.0, (i % 83) / 83.0]::real[]::vector FROM generate_series(30001, 31000) i;
+
+statement ok
+UPDATE fk SET i4 = 5000, i2 = 5 WHERE id % 1000 = 207;
+
+statement ok
+DELETE FROM fk WHERE id % 1000 = 208;
+
+query T
+SELECT fk_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = ANY(''{207,208,5000}'')', 'i2 = 5']);
+----
+all equal
+
+query T
+SELECT fk_recheck('i4 = 5000');
+----
+31 returned, 0 removed by the recheck
+
+statement ok
+VACUUM fk;
+
+query T
+SELECT fk_subsets(ARRAY['u = ''00000000-0000-0000-0000-000000000007''', 'i4 = ANY(''{207,208,5000}'')', 'i2 = 5']);
+----
+all equal
+
+statement ok
+ALTER TABLE fk ALTER COLUMN i4 DROP NOT NULL;
+
+statement ok
+INSERT INTO fk (id, u, i4, v) SELECT i, ('00000000-0000-0000-0000-' || lpad((i % 50)::text, 12, '0'))::uuid, NULL,
+  ARRAY[0.5, 0.5, 0.5]::real[]::vector FROM generate_series(31001, 31010) i;
+
+query T
+SELECT fk_recheck('i4 = -2147483648');
+----
+0 returned, 10 removed by the recheck
+
+query T
+SELECT fk_recheck('i4 = 5000') || ', ' || fk_same('i4 = 5000') || ', ' || fk_same('i4 = ANY(''{-2147483648,5000}'')');
+----
+31 returned, 0 removed by the recheck, true, true
+
+query T
+SELECT fk_same('u = ''00000000-0000-0000-0000-000000000000''') AND fk_same('i2 = ANY(''{-32768,57}'')');
+----
+t
+
+statement ok
+UPDATE fk SET i4 = id % 1000 WHERE i4 IS NULL;
+
+statement ok
+ALTER TABLE fk ALTER COLUMN i4 SET NOT NULL;
+
+query T
+SELECT fk_recheck('i4 = 5000');
+----
+31 returned, 0 removed by the recheck
+
+statement ok
+DROP INDEX fk_whole;
+
+statement ok
+CREATE INDEX fk_hashed ON fk USING vchordrq (v vector_l2_ops, i8 int8_ops (bytes = 4), un uuid_ops (bytes = 8), i4 int4_ops (bytes = 2),
+  u uuid_ops (bytes = 2)) WITH (options = $$
+residual_quantization = true
+[build.internal]
+lists = [16]
+$$);
+
+query T
+SELECT fk_subsets(ARRAY['i8 = 7000000000000', 'un = ''00000000-0000-0000-0000-000000000003''', 'i4 = 207', 'u = ''00000000-0000-0000-0000-000000000007''']);
+----
+all equal
+
+query T
+SELECT fk_subsets(ARRAY['i8 = ANY(''{7000000000000,8000000000000}'')', 'un = ANY(''{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000005}'')', 'i4 = ANY(''{207,1}'')']);
+----
+all equal
+
+query T
+SELECT vchordrq_prewarm('fk_hashed') IS NOT NULL;
+----
+t
+
+# 1 and 52973 share a 16-bit hash.
+statement ok
+UPDATE fk SET i4 = 52973 WHERE id % 1000 = 1;
+
+query T
+SELECT fk_recheck('i4 = 1');
+----
+0 returned, 32 removed by the recheck
+
+query T
+SELECT fk_same('i4 = 52973 AND i8 IS NULL');
+----
+t
+
+query T
+SELECT fk_same('un = ''00000000-0000-0000-0000-000000000000''');
+----
+t
+
+statement ok
+DROP TABLE fk;
+
+statement ok
+DROP FUNCTION fk_same, fk_plan, fk_recheck, fk_subsets;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET vchordrq.probes;

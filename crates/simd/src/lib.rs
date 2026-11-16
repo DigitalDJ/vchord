@@ -36,6 +36,7 @@ pub mod floating_f32;
 
 pub mod bit;
 pub mod byte;
+pub mod column;
 pub mod fast_scan;
 pub mod fht;
 pub mod halfbyte;
