@@ -124,7 +124,7 @@ impl SearchBuilder for DefaultBuilder {
         if !opfamily.valid_cosine_query(&vector) {
             return Box::new(std::iter::empty());
         }
-        let reranking = (options.io_rerank, options.prefilter);
+        let reranking = (options.io_rerank, options.prefilter, options.table);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -255,12 +255,13 @@ impl SearchBuilder for DefaultBuilder {
 }
 
 /// Reranks `candidates` by exact distance, reading vectors from the index or the table as it was
-/// built; with `prefilter`, rows the table's quals reject are dropped first.
+/// built; with `prefilter`, rows the table's quals reject are dropped first. The table pages of
+/// rows about to be returned are read ahead unless reranking or the prefilter has read them.
 fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    (io, prefilter): (Io, bool),
+    (io, prefilter, table): (Io, bool, TablePrefetch),
     mut fetcher: impl Fetcher + 'b,
     opfamily: Opfamily,
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
@@ -297,27 +298,27 @@ where
     match (io, prefilter) {
         (Io::Plain, false) => {
             let prefetcher = PlainPrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Plain, true) => {
             let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Simple, false) => {
             let prefetcher = SimplePrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
         }
         (Io::Simple, true) => {
             let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Stream, false) => {
             let prefetcher = StreamPrefetcher::new(index, candidates, hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
         }
         (Io::Stream, true) => {
             let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
     }
 }

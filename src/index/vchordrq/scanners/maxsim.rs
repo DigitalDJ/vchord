@@ -345,7 +345,7 @@ fn split<'b, O: Operator, P>(
 where
     P: Prefetcher<'b, Item = MaxsimCandidate<'b>>,
 {
-    let mut reranker = rerank_index::<O, _, _, _>(vector, prefetcher);
+    let mut reranker = rerank_index::<O, _, _, _>(vector, prefetcher, ());
     let mut accu = reranker.by_ref().take(refine as _).collect::<Vec<_>>();
     let (rest, reranked) = reranker.finish();
     accu.extend(reranked.map(|(Reverse(distance), AlwaysEqual(payload))| (distance, payload)));

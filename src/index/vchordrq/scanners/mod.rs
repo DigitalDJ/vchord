@@ -46,6 +46,7 @@ pub struct SearchOptions {
     pub io_search: Io,
     pub io_rerank: Io,
     pub prefilter: bool,
+    pub table: crate::index::fetcher::TablePrefetch,
 }
 
 /// An opfamily's own vector type, taken out of an `OwnedVector`.

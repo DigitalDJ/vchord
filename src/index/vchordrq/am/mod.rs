@@ -734,6 +734,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             io_search: gucs::vchordrq_io_search(),
             io_rerank: gucs::vchordrq_io_rerank(),
             prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
+            table: TablePrefetch::new(scan),
         };
         let fetcher = {
             let hack = scanner.hack;
