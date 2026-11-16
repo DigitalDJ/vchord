@@ -28,6 +28,11 @@ mod default;
 mod maxsim;
 
 use crate::index::scanners::Io;
+use simd::f16;
+use vchordrq::types::OwnedVector;
+use vector::rabitq4::Rabitq4Owned;
+use vector::rabitq8::Rabitq8Owned;
+use vector::vect::VectOwned;
 
 pub use default::DefaultBuilder;
 pub use maxsim::MaxsimBuilder;
@@ -41,4 +46,45 @@ pub struct SearchOptions {
     pub io_search: Io,
     pub io_rerank: Io,
     pub prefilter: bool,
+}
+
+/// An opfamily's own vector type, taken out of an `OwnedVector`.
+pub trait FromOwned {
+    fn from_owned(vector: OwnedVector) -> Self;
+}
+
+impl FromOwned for VectOwned<f32> {
+    fn from_owned(vector: OwnedVector) -> Self {
+        let OwnedVector::Vecf32(vector) = vector else {
+            unreachable!()
+        };
+        vector
+    }
+}
+
+impl FromOwned for VectOwned<f16> {
+    fn from_owned(vector: OwnedVector) -> Self {
+        let OwnedVector::Vecf16(vector) = vector else {
+            unreachable!()
+        };
+        vector
+    }
+}
+
+impl FromOwned for Rabitq8Owned {
+    fn from_owned(vector: OwnedVector) -> Self {
+        let OwnedVector::Rabitq8(vector) = vector else {
+            unreachable!()
+        };
+        vector
+    }
+}
+
+impl FromOwned for Rabitq4Owned {
+    fn from_owned(vector: OwnedVector) -> Self {
+        let OwnedVector::Rabitq4(vector) = vector else {
+            unreachable!()
+        };
+        vector
+    }
 }

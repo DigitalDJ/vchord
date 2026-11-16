@@ -571,6 +571,8 @@ impl<'b> Sequence for Candidates<'b> {
 }
 
 /// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
+// Inlined into each scanner arm, which compiles the halfvec search to fewer instructions.
+#[inline(always)]
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: Rc<O::Vector>,

@@ -11,7 +11,7 @@ use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::dispatch::*;
 use crate::index::vchordrq::opclass::Opfamily;
-use crate::index::vchordrq::scanners::SearchOptions;
+use crate::index::vchordrq::scanners::{FromOwned, SearchOptions};
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
 use index::bump::Bump;
@@ -21,10 +21,12 @@ use index::prefetcher::*;
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use index_accessor::{Dot, L2S};
 use simd::f16;
+use std::borrow::Borrow;
 use std::num::NonZero;
 use std::rc::Rc;
+use vchordrq::operator::Operator;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordrq::{RerankMethod, default_search, how, rerank_heap, rerank_index};
+use vchordrq::{Candidates, RerankMethod, default_search, how, rerank_heap, rerank_index};
 use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
@@ -84,7 +86,7 @@ impl SearchBuilder for DefaultBuilder {
         self,
         index: &'b R,
         options: SearchOptions,
-        mut fetcher: impl Fetcher + 'b,
+        fetcher: impl Fetcher + 'b,
         bump: &'b impl Bump,
         recorder: impl Recorder,
     ) -> Box<dyn Iterator<Item = (f32, [u16; 3], bool)> + 'b>
@@ -122,921 +124,100 @@ impl SearchBuilder for DefaultBuilder {
         if !opfamily.valid_cosine_query(&vector) {
             return Box::new(std::iter::empty());
         }
-        let rerank_hints = Hints::default().full(false);
-        let f = move |(distance, payload)| (opfamily.output(distance), payload);
+        let reranking = (options.io_rerank, options.prefilter);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<VectOwned<f32>, L2S>;
-                    let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
+                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let sequence = prefetched!(
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf32(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf32(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
-                    let unprojected = if let OwnedVector::Vecf32(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
+                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let sequence = prefetched!(
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf32(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf32(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<VectOwned<f16>, L2S>;
-                    let unprojected = if let OwnedVector::Vecf16(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
+                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let sequence = prefetched!(
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf16(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf16(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
-                    let unprojected = if let OwnedVector::Vecf16(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
+                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
                     let projected = RandomProject::project(unprojected.as_borrowed());
-                    let sequence = prefetched!(
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf16(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw = if let OwnedVector::Vecf16(vector) = maybe_vector.unwrap()
-                                {
-                                    vector
-                                } else {
-                                    unreachable!()
-                                };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq8, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<Rabitq8Owned, L2S>;
-                    let unprojected = if let OwnedVector::Rabitq8(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
-                    let unprojected = Rc::new(unprojected);
-                    let sequence = prefetched!(
+                    let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq8(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq8(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq8, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<Rabitq8Owned, Dot>;
-                    let unprojected = if let OwnedVector::Rabitq8(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
-                    let unprojected = Rc::new(unprojected);
-                    let sequence = prefetched!(
+                    let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq8(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq8(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq4, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<Rabitq4Owned, L2S>;
-                    let unprojected = if let OwnedVector::Rabitq4(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
-                    let unprojected = Rc::new(unprojected);
-                    let sequence = prefetched!(
+                    let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq4(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq4(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq4, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<Rabitq4Owned, Dot>;
-                    let unprojected = if let OwnedVector::Rabitq4(vector) = vector.clone() {
-                        vector
-                    } else {
-                        unreachable!()
-                    };
-                    let unprojected = Rc::new(unprojected);
-                    let sequence = prefetched!(
+                    let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
                         index,
                         options.io_search,
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let method = how(index);
-                    match (method, options.io_rerank, options.prefilter) {
-                        (RerankMethod::Index, Io::Plain, false) => {
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Plain, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, false) => {
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Simple, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = SimplePrefetcher::new(index, sequence);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, false) => {
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Index, Io::Stream, true) => {
-                            let predicate =
-                                id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-                                    let (key, _) = pointer_to_kv(*pointer);
-                                    let Some(mut tuple) = fetcher.fetch(key) else {
-                                        return false;
-                                    };
-                                    tuple.filter()
-                                });
-                            let sequence = filter(sequence, predicate);
-                            let prefetcher = StreamPrefetcher::new(index, sequence, rerank_hints);
-                            Box::new(rerank_index::<Op, _, _, _>(unprojected, prefetcher).map(f))
-                        }
-                        (RerankMethod::Heap, _, false) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq4(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                        (RerankMethod::Heap, _, true) => {
-                            let fetch = move |payload| {
-                                let (key, _) = pointer_to_kv(payload);
-                                let mut tuple = fetcher.fetch(key)?;
-                                if !tuple.filter() {
-                                    return None;
-                                }
-                                let (datums, is_nulls) = tuple.build();
-                                let datum = (!is_nulls[0]).then_some(datums[0]);
-                                let maybe_vector =
-                                    unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-                                let raw =
-                                    if let OwnedVector::Rabitq4(vector) = maybe_vector.unwrap() {
-                                        vector
-                                    } else {
-                                        unreachable!()
-                                    };
-                                Some(raw)
-                            };
-                            let prefetcher = PlainPrefetcher::new(index, sequence);
-                            Box::new(
-                                rerank_heap::<Op, _, _, _>(unprojected, prefetcher, fetch).map(f),
-                            )
-                        }
-                    }
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
             };
         // `<=`: the index's distance may round up to the radius where the operator's is under it.
@@ -1070,6 +251,74 @@ impl SearchBuilder for DefaultBuilder {
             let (key, _) = pointer_to_kv(pointer);
             (distance, key, recheck)
         }))
+    }
+}
+
+/// Reranks `candidates` by exact distance, reading vectors from the index or the table as it was
+/// built; with `prefilter`, rows the table's quals reject are dropped first.
+fn rerank<'b, R, O>(
+    index: &'b R,
+    candidates: Candidates<'b>,
+    vector: impl Borrow<O::Vector> + 'b,
+    (io, prefilter): (Io, bool),
+    mut fetcher: impl Fetcher + 'b,
+    opfamily: Opfamily,
+) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
+where
+    R: RelationRead + RelationPrefetch + RelationReadStream,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+    O: Operator,
+    O::Vector: FromOwned,
+{
+    let f = move |(distance, payload)| (opfamily.output(distance), payload);
+    if let RerankMethod::Heap = how(index) {
+        let fetch = move |payload| {
+            let (key, _) = pointer_to_kv(payload);
+            let mut tuple = fetcher.fetch(key)?;
+            if prefilter && !tuple.filter() {
+                return None;
+            }
+            let (datums, is_nulls) = tuple.build();
+            let datum = (!is_nulls[0]).then_some(datums[0]);
+            let vector = unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
+            Some(O::Vector::from_owned(vector.unwrap()))
+        };
+        let prefetcher = PlainPrefetcher::new(index, candidates);
+        return Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f));
+    }
+    let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
+        let (key, _) = pointer_to_kv(*pointer);
+        let Some(mut tuple) = fetcher.fetch(key) else {
+            return false;
+        };
+        tuple.filter()
+    });
+    let hints = Hints::default().full(false);
+    match (io, prefilter) {
+        (Io::Plain, false) => {
+            let prefetcher = PlainPrefetcher::new(index, candidates);
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
+        (Io::Plain, true) => {
+            let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
+        (Io::Simple, false) => {
+            let prefetcher = SimplePrefetcher::new(index, candidates);
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
+        (Io::Simple, true) => {
+            let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
+        (Io::Stream, false) => {
+            let prefetcher = StreamPrefetcher::new(index, candidates, hints);
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
+        (Io::Stream, true) => {
+            let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher).map(f))
+        }
     }
 }
 
