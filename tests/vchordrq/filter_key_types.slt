@@ -77,7 +77,9 @@ CREATE FUNCTION ft_check() RETURNS text LANGUAGE sql AS $$
     'f4 < 0.1::float8', 'f4 >= 0.1::float8', 'f4 = 0.1::float8', 'f4 > 1e300::float8', 'f4 < -1e300::float8',
     'f4 = ''NaN''::float8', 'f4 > 841.47096::float8',
     'f8 > 0', 'f8 = ''infinity''', 'f8 >= ''NaN''', 'f8 < 0.1::float4', 'f8 = ''-0''::float4',
-    'm = ''ok''', 'm = ANY(''{sad,happy}'')', 'm IS NULL',
+    'm = ''ok''', 'm = ANY(''{sad,happy}'')', 'm IS NULL', 'm < ''ok''', 'm <= ''ok''', 'm > ''ok''', 'm >= ''ok''',
+    'm < ''sad''', 'm <= ''sad''', 'm >= ''sad''', 'm > ''happy''', 'm <= ''happy''', 'm BETWEEN ''sad'' AND ''ok''',
+    'm BETWEEN ''happy'' AND ''sad''', 'm > ''sad'' AND m < ''happy''', 'm < ANY(''{sad,happy}'')', 'm >= ''ok'' AND m <> ''happy''',
     'd > ''2001-01-01'' AND ts < ''2010-06-01'' AND f4 > 0 AND m = ''sad'''
   ]) c WHERE NOT ft_same(c)
 $$;
@@ -146,6 +148,242 @@ SELECT ft_recheck('ts < ''2010-06-02''::date'), ft_recheck('f4 < 0.1::float8'), 
 ----
 f f f t t f
 
+query TTT
+SELECT ft_recheck('m < ''ok'''), ft_recheck('m BETWEEN ''sad'' AND ''happy'''), ft_recheck('m >= ''ok'' AND m < ANY(''{happy}'')');
+----
+f f f
+
+# An enum range is the set of the type's values in it, by its order when the scan starts: values added later,
+# with OIDs out of that order, and a renumbered order count.
+statement ok
+CREATE FUNCTION ft_enum() RETURNS text LANGUAGE sql AS $$
+  SELECT coalesce(string_agg(c, '; '), 'all equal') FROM unnest(ARRAY[
+    'm < ''ok''', 'm <= ''meh''', 'm > ''meh''', 'm >= ''meh''', 'm = ''meh''', 'm < ''sad''', 'm <= ''blue''',
+    'm < ''blue''', 'm > ''elated''', 'm >= ''elated''', 'm BETWEEN ''meh20'' AND ''meh''', 'm > ''meh9'' AND m <= ''ok''',
+    'm BETWEEN ''blue'' AND ''elated''', 'm < ANY(''{meh15,blue}'')', 'm > ''meh30'' AND m < ''meh29''', 'm IS NULL',
+    'm IS NOT NULL AND m < ''meh''', 'm < ''happy'' AND d < ''2001-01-01'''
+  ]) c WHERE NOT ft_same(c)
+$$;
+
+statement ok
+CREATE FUNCTION ft_index_cond(statement text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || statement INTO plan;
+  RETURN jsonb_path_query_first(plan, '$.** ? (@."Index Name" == "ft_v")."Index Cond"') #>> '{}';
+END
+$$;
+
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+statement ok
+PREPARE ft_lt(ft_mood) AS SELECT array_agg(id ORDER BY id) IS NOT DISTINCT FROM
+  (SELECT array_agg(id ORDER BY id) FROM ft WHERE (m < $1) IS TRUE), count(*) FILTER (WHERE m::text LIKE 'meh%')
+FROM (SELECT id, m FROM ft WHERE m < $1 ORDER BY v <-> '[0.5,0.5,0.5]') s;
+
+query TT
+SELECT ft_index_cond('EXECUTE ft_lt(''ok'')'), ft_index_cond('SELECT id FROM ft WHERE m < ''ok'' ORDER BY v <-> ''[0.5,0.5,0.5]''');
+----
+(m < $1) (m < 'ok'::ft_mood)
+
+query TI
+EXECUTE ft_lt('ok');
+----
+t 0
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh' BEFORE 'ok';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'elated' AFTER 'happy';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'blue' BEFORE 'sad';
+
+statement ok
+INSERT INTO ft (id, d, m, v) SELECT i + 20000, date '2000-01-01' + i,
+  (ARRAY['meh', 'elated', 'blue', NULL]::ft_mood[])[1 + i % 4], ARRAY[sin(2 * i), cos(i), 0.5]::real[]::vector
+FROM generate_series(1, 400) i;
+
+query TI
+EXECUTE ft_lt('ok');
+----
+t 100
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh1' BEFORE 'meh';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh2' BEFORE 'meh1';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh3' BEFORE 'meh2';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh4' BEFORE 'meh3';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh5' BEFORE 'meh4';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh6' BEFORE 'meh5';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh7' BEFORE 'meh6';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh8' BEFORE 'meh7';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh9' BEFORE 'meh8';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh10' BEFORE 'meh9';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh11' BEFORE 'meh10';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh12' BEFORE 'meh11';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh13' BEFORE 'meh12';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh14' BEFORE 'meh13';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh15' BEFORE 'meh14';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh16' BEFORE 'meh15';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh17' BEFORE 'meh16';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh18' BEFORE 'meh17';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh19' BEFORE 'meh18';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh20' BEFORE 'meh19';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh21' BEFORE 'meh20';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh22' BEFORE 'meh21';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh23' BEFORE 'meh22';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh24' BEFORE 'meh23';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh25' BEFORE 'meh24';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh26' BEFORE 'meh25';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh27' BEFORE 'meh26';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh28' BEFORE 'meh27';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh29' BEFORE 'meh28';
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'meh30' BEFORE 'meh29';
+
+# the order is renumbered
+query R
+SELECT enumsortorder FROM pg_enum WHERE enumtypid = 'ft_mood'::regtype AND enumlabel IN ('blue', 'sad') ORDER BY 1;
+----
+1
+2
+
+statement ok
+INSERT INTO ft (id, d, m, v) SELECT i + 30000, date '2000-01-01' - i, ('meh' || 1 + i % 30)::ft_mood,
+  ARRAY[cos(3 * i), 0.5, sin(i)]::real[]::vector
+FROM generate_series(1, 600) i;
+
+query TI
+EXECUTE ft_lt('ok');
+----
+t 700
+
+query T
+SELECT ft_enum();
+----
+all equal
+
+statement ok
+VACUUM ft;
+
+query T
+SELECT ft_enum();
+----
+all equal
+
+query TI
+EXECUTE ft_lt('meh10');
+----
+t 400
+
+# the enum key leading, with block summaries
+statement ok
+DROP INDEX ft_v;
+
+statement ok
+CREATE INDEX ft_v ON ft USING vchordrq (v vector_l2_ops, m, d) WITH (options = $$
+residual_quantization = true
+zone_maps = 2
+[build.internal]
+lists = [4]
+$$);
+
+query T
+SELECT ft_enum();
+----
+all equal
+
+statement ok
+ALTER TYPE ft_mood ADD VALUE 'calm' AFTER 'meh30';
+
+statement ok
+INSERT INTO ft (id, d, m, v) SELECT i + 40000, date '2000-01-01', 'calm', ARRAY[0.5, sin(i), cos(i)]::real[]::vector
+FROM generate_series(1, 50) i;
+
+query TI
+EXECUTE ft_lt('meh29');
+----
+t 20
+
+query T
+SELECT ft_enum();
+----
+all equal
+
+statement ok
+VACUUM ft;
+
+query T
+SELECT ft_enum();
+----
+all equal
+
+statement ok
+DEALLOCATE ft_lt;
+
+statement ok
+RESET plan_cache_mode;
+
 statement ok
 DROP TABLE ft;
 
@@ -153,7 +391,7 @@ statement ok
 DROP TYPE ft_mood;
 
 statement ok
-DROP FUNCTION ft_same, ft_check, ft_recheck;
+DROP FUNCTION ft_same, ft_check, ft_recheck, ft_enum, ft_index_cond;
 
 statement ok
 RESET enable_seqscan;

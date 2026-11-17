@@ -159,14 +159,15 @@ enum Bound {
     Above,
 }
 
+const LESS: u16 = pg_sys::BTLessStrategyNumber as u16;
+const LESS_EQUAL: u16 = pg_sys::BTLessEqualStrategyNumber as u16;
+const EQUAL: u16 = pg_sys::BTEqualStrategyNumber as u16;
+const GREATER_EQUAL: u16 = pg_sys::BTGreaterEqualStrategyNumber as u16;
+const GREATER: u16 = pg_sys::BTGreaterStrategyNumber as u16;
+
 /// The stored forms, up to `max`, that a scan key of `strategy` accepts against `bound`.
 fn interval(strategy: u16, bound: Bound, max: u128) -> Option<[u128; 2]> {
     use Bound::*;
-    const LESS: u16 = pg_sys::BTLessStrategyNumber as u16;
-    const LESS_EQUAL: u16 = pg_sys::BTLessEqualStrategyNumber as u16;
-    const EQUAL: u16 = pg_sys::BTEqualStrategyNumber as u16;
-    const GREATER_EQUAL: u16 = pg_sys::BTGreaterEqualStrategyNumber as u16;
-    const GREATER: u16 = pg_sys::BTGreaterStrategyNumber as u16;
     match (strategy, bound) {
         (LESS, At(x)) => x.checked_sub(1).map(|x| [0, x]),
         (LESS_EQUAL, At(x)) | (LESS | LESS_EQUAL, After(x) | Within(_, x)) => Some([0, x]),
@@ -326,11 +327,16 @@ impl<'a> FilterKeys<'a> {
         }
         let mut exact = true;
         let mut accepts = |datum| {
+            if column == Type::Enum && scan_key.sk_strategy != EQUAL {
+                return unsafe { self.enum_values(i, datum, scan_key.sk_strategy) };
+            }
             // the right type of the operator, which differs for `int4 = int8`
             let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
             let bound = unsafe { ty.bound(datum, column, key) };
             exact &= !matches!(bound, Bound::Within(..));
             interval(scan_key.sk_strategy, bound, key.max())
+                .into_iter()
+                .collect()
         };
         let values = unsafe { values(scan_key, &mut accepts) };
         Condition {
@@ -339,15 +345,45 @@ impl<'a> FilterKeys<'a> {
             exact,
         }
     }
+
+    /// The values of the enum of filter key column `i` that a range of `strategy` accepts against
+    /// `value`, by the type's order when the scan starts: their OIDs, which the rows store.
+    unsafe fn enum_values(&self, i: usize, value: Datum, strategy: u16) -> Vec<[u128; 2]> {
+        unsafe {
+            let ty = pg_sys::get_atttype((*self.index_relation).rd_id, i as i16 + 2);
+            let cache = pg_sys::lookup_type_cache(ty, 0);
+            let id = pg_sys::SysCacheIdentifier::ENUMTYPOIDNAME as _;
+            let list = pg_sys::SearchSysCacheList(id, 1, ty.into(), Datum::null(), Datum::null());
+            let members = (*list).members.as_slice((*list).n_members as usize);
+            let value = pg_sys::Oid::from(value.value() as u32);
+            let accepted = (members.iter())
+                .map(|&x| {
+                    (*pg_sys::GETSTRUCT(&raw mut (*x).tuple).cast::<pg_sys::FormData_pg_enum>()).oid
+                })
+                .filter(|&x| {
+                    let order = pg_sys::compare_values_of_enum(cache, x, value);
+                    match strategy {
+                        LESS => order < 0,
+                        LESS_EQUAL => order <= 0,
+                        GREATER_EQUAL => order >= 0,
+                        _ => order > 0,
+                    }
+                })
+                .map(|x| [x.to_u32() as u128; 2])
+                .collect();
+            pg_sys::ReleaseCatCacheList(list);
+            accepted
+        }
+    }
 }
 
 /// The stored forms a scan key accepts, by what `accepts` makes of its constant or of each element.
 unsafe fn values(
     scan_key: &pg_sys::ScanKeyData,
-    accepts: &mut impl FnMut(Datum) -> Option<[u128; 2]>,
+    accepts: &mut impl FnMut(Datum) -> Vec<[u128; 2]>,
 ) -> Intervals {
     if scan_key.sk_flags & pg_sys::SK_SEARCHARRAY as i32 == 0 {
-        return Intervals::new(accepts(scan_key.sk_argument).into_iter().collect());
+        return Intervals::new(accepts(scan_key.sk_argument));
     }
     unsafe {
         let datum = scan_key.sk_argument.cast_mut_ptr::<pg_sys::varlena>();
@@ -370,7 +406,7 @@ unsafe fn values(
         );
         let accepted = (0..n as usize)
             .filter(|&i| !nulls.add(i).read())
-            .filter_map(|i| accepts(elements.add(i).read()))
+            .flat_map(|i| accepts(elements.add(i).read()))
             .collect::<Vec<_>>();
         pg_sys::pfree(elements.cast());
         pg_sys::pfree(nulls.cast());
