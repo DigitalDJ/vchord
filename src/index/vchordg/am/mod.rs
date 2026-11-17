@@ -15,7 +15,6 @@ use crate::index::storage::PostgresRelation;
 use crate::index::vchordg::opclass::opfamily;
 use crate::index::vchordg::scanners::*;
 use crate::recorder::DefaultRecorder;
-use pgrx::datum::Internal;
 use pgrx::pg_sys::Datum;
 use std::cell::LazyCell;
 use std::ffi::CStr;
@@ -122,15 +121,7 @@ pub fn init() {
     });
 }
 
-#[pgrx::pg_extern(sql = "")]
-fn _vchordg_amhandler(_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> Internal {
-    type T = pgrx::pg_sys::IndexAmRoutine;
-    unsafe {
-        let index_am_routine = pgrx::pg_sys::palloc0(size_of::<T>()) as *mut T;
-        index_am_routine.write(AM_HANDLER);
-        Internal::from(Some(Datum::from(index_am_routine)))
-    }
-}
+crate::index::am_handler!(_vchordg_amhandler_wrapper, AM_HANDLER);
 
 const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     let mut am_routine = unsafe { std::mem::zeroed::<pgrx::pg_sys::IndexAmRoutine>() };
