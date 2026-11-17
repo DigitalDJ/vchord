@@ -10,7 +10,9 @@
 
 use crate::index::storage::PostgresRelation;
 use pgrx::pg_sys::{self, BuiltinOid, Datum};
-use vchordrq::keys::{Key, Keys, Width, fold, hash_int, hash_uuid, raw_int};
+use vchordrq::keys::{
+    Intervals, Key, Keys, Summary, Width, fold, hash_int, hash_uuid, raw_int, raw_uuid,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
@@ -48,7 +50,7 @@ impl Type {
                 Some(if key.hashed {
                     fold(hash_uuid(bytes), key.width) as u128
                 } else {
-                    u128::from_le_bytes(*bytes)
+                    raw_uuid(bytes)
                 })
             }
             Self::Int2 | Self::Int4 | Self::Int8 => {
@@ -116,13 +118,17 @@ pub unsafe fn options(relopts: pgrx::Internal, ty: Type) {
     }
 }
 
-/// The filter keys of an index being built, by the parameters of their operator classes.
-pub unsafe fn of_options(index_relation: pg_sys::Relation) -> Keys {
+/// The filter keys of an index being built; `zone_maps`: how many leading keys get block bounds.
+pub unsafe fn of_options(index_relation: pg_sys::Relation, zone_maps: usize) -> Keys {
     let options = unsafe { pg_sys::RelationGetIndexAttOptions(index_relation, false) };
     Keys::new(unsafe { types(index_relation) }.enumerate().map(|(i, ty)| {
         let bytes = unsafe { (*(*options.add(i + 1)).cast::<Options>()).bytes };
         let width = Width::of_bytes(bytes as usize).unwrap();
-        (width, width != ty.width())
+        (
+            width,
+            width != ty.width(),
+            (i < zone_maps).then_some(Summary::Bounds),
+        )
     }))
 }
 
@@ -187,17 +193,17 @@ impl<'a> FilterKeys<'a> {
         columns
     }
 
-    /// The stored keys that a scan key on filter key column `i` accepts, sorted and deduplicated.
-    pub unsafe fn of_scan_key(&self, i: usize, scan_key: &pg_sys::ScanKeyData) -> Vec<u128> {
+    /// The stored forms that a scan key on filter key column `i` accepts.
+    pub unsafe fn of_scan_key(&self, i: usize, scan_key: &pg_sys::ScanKeyData) -> Intervals {
         if scan_key.sk_flags & pg_sys::SK_ISNULL as i32 != 0 {
-            return Vec::new();
+            return Intervals::points(Vec::new());
         }
         let (column, key) = (self.ty(i), &self.keys.as_slice()[i]);
         // the right type of the operator, which differs for `int4 = int8`
         let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
         if scan_key.sk_flags & pg_sys::SK_SEARCHARRAY as i32 == 0 {
             let stored = unsafe { ty.stored(scan_key.sk_argument, key) };
-            return stored.into_iter().collect();
+            return Intervals::points(stored.into_iter().collect());
         }
         unsafe {
             let datum = scan_key.sk_argument.cast_mut_ptr::<pg_sys::varlena>();
@@ -218,18 +224,16 @@ impl<'a> FilterKeys<'a> {
                 &mut nulls,
                 &mut n,
             );
-            let mut stored = (0..n as usize)
+            let stored = (0..n as usize)
                 .filter(|&i| !nulls.add(i).read())
                 .filter_map(|i| ty.stored(elements.add(i).read(), key))
                 .collect::<Vec<_>>();
-            stored.sort_unstable();
-            stored.dedup();
             pg_sys::pfree(elements.cast());
             pg_sys::pfree(nulls.cast());
             if array.cast() != datum {
                 pg_sys::pfree(array.cast());
             }
-            stored
+            Intervals::points(stored)
         }
     }
 }

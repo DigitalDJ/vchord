@@ -23,6 +23,10 @@ pub struct VchordrqIndexOptions {
     #[serde(default = "VchordrqIndexOptions::default_degree_of_parallelism")]
     #[validate(range(min = 1, max = 256))]
     pub degree_of_parallelism: u32,
+    /// How many leading filter keys every frozen block keeps its least and greatest value of.
+    #[serde(default = "VchordrqIndexOptions::default_zone_maps")]
+    #[validate(range(max = 32))]
+    pub zone_maps: u32,
 }
 
 impl VchordrqIndexOptions {
@@ -35,6 +39,9 @@ impl VchordrqIndexOptions {
     fn default_degree_of_parallelism() -> u32 {
         32
     }
+    fn default_zone_maps() -> u32 {
+        2
+    }
 }
 
 impl Default for VchordrqIndexOptions {
@@ -43,6 +50,7 @@ impl Default for VchordrqIndexOptions {
             residual_quantization: Self::default_residual_quantization(),
             rerank_in_table: Self::default_rerank_in_table(),
             degree_of_parallelism: Self::default_degree_of_parallelism(),
+            zone_maps: Self::default_zone_maps(),
         }
     }
 }

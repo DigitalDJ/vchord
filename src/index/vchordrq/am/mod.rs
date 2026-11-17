@@ -669,20 +669,18 @@ pub unsafe extern "C-unwind" fn amrescan(
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
         drop(scanner.scanning.take());
         scanner.bump.reset();
-        // Per filter key column, the stored keys that all scan keys on it accept.
+        // Per filter key column, the stored forms that all scan keys on it accept.
         let constrained = keys.iter().any(|key| key.sk_attno >= 2);
         let filter = constrained.then(|| {
             let filter_keys = FilterKeys::of_index((*scan).indexRelation);
-            let mut sets = vec![None::<Vec<u128>>; filter_keys.keys.as_slice().len()];
+            let mut sets =
+                vec![None::<vchordrq::keys::Intervals>; filter_keys.keys.as_slice().len()];
             for key in keys.iter().filter(|key| key.sk_attno >= 2) {
                 let i = key.sk_attno as usize - 2;
                 let accepted = filter_keys.of_scan_key(i, key);
                 sets[i] = Some(match sets[i].take() {
                     None => accepted,
-                    Some(mut set) => {
-                        set.retain(|x| accepted.binary_search(x).is_ok());
-                        set
-                    }
+                    Some(set) => set.intersect(&accepted),
                 });
             }
             vchordrq::keys::KeyFilter::new(filter_keys.keys, sets)

@@ -16,7 +16,7 @@ pub type Tag = u64;
 const MAGIC: Tag = Tag::from_ne_bytes(*b"vchordrq");
 const VERSION: u64 = 1001;
 /// Binaries that accept only `VERSION` refuse keyed indexes.
-const VERSION_KEYED: u64 = 1002;
+const VERSION_KEYED: u64 = 1003;
 
 #[inline(always)]
 fn tag(source: &[u8]) -> Tag {
@@ -658,8 +658,7 @@ struct DirectoryTupleHeader1 {
     _padding_0: [Padding; 4],
 }
 
-/// Page ids (`_0`, `_1`), then in keyed indexes the layout (`_2`): per page its first block, with
-/// `tape::CONTINUED`; per block its first-key range.
+/// Page ids (`_0`, `_1`), then with zone maps the layout (`_2`): [`crate::tape::Layout`].
 #[derive(Debug, Clone)]
 pub enum DirectoryTuple {
     _0 { elements: Vec<u32> },
@@ -1679,10 +1678,10 @@ mod tests {
         };
         assert_eq!(read(&unkeyed, n), (3, None));
         assert_eq!(read(&keyed, k), (3, Some(vec![5, 0, 3])));
-        let mut unknown = unkeyed.clone();
-        unknown[1] = 1003;
+        let mut unknown = keyed.clone();
+        unknown[1] = VERSION_KEYED + 1;
         let result =
-            std::panic::catch_unwind(|| MetaTuple::deserialize_ref(&unknown.as_bytes()[..n]).dim());
+            std::panic::catch_unwind(|| MetaTuple::deserialize_ref(&unknown.as_bytes()[..k]).dim());
         assert!(result.is_err());
     }
 }

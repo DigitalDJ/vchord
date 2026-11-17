@@ -107,7 +107,7 @@ SELECT fs_check();
 ----
 t
 
-# Lists too large for maintenance_work_mem are written unsorted.
+# Lists too large for maintenance_work_mem are written as sorted runs.
 statement ok
 INSERT INTO fs SELECT id + 10000, owner, v FROM fs;
 
@@ -189,7 +189,7 @@ SELECT count(*) FROM (SELECT id FROM fs1 WHERE owner = 8 ORDER BY v <-> (SELECT 
 ----
 0
 
-# The order and ranges are the first key's; a later key alone still reads every block.
+# Rows sort by every key in turn; blocks keep zone maps of the leading `zone_maps` keys.
 statement ok
 DROP INDEX fs_v;
 
@@ -219,10 +219,52 @@ SELECT fs_same('grp = 3') AND fs_same('grp = ANY(''{1,4}'')') AND fs_same('owner
 t
 
 statement ok
+DROP INDEX fs_two;
+
+statement error error while validating options
+CREATE INDEX ON fs USING vchordrq (v halfvec_l2_ops, grp) WITH (options = 'zone_maps = 33');
+
+statement ok
+CREATE FUNCTION fs_three() RETURNS boolean LANGUAGE sql AS $$
+  SELECT fs_same('grp = 3') AND fs_same('grp = 3 AND owner = 17') AND fs_same('owner = 2000')
+    AND fs_same('owner = ANY(''{3,17,1000}'') AND id = ANY(''{5,6,7,1000,2000}'')')
+    AND fs_same('grp = ANY(''{0,4}'') AND id = 4321') AND fs_same('id = 77')
+$$;
+
+statement ok
+CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_ops (bytes = 2)) WITH (options = $$
+residual_quantization = true
+zone_maps = 1
+[build.internal]
+lists = [8]
+$$);
+
+query T
+SELECT fs_three();
+----
+t
+
+statement ok
+DROP INDEX fs_three;
+
+statement ok
+CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_ops (bytes = 2)) WITH (options = $$
+residual_quantization = true
+zone_maps = 0
+[build.internal]
+lists = [8]
+$$);
+
+query T
+SELECT fs_three();
+----
+t
+
+statement ok
 DROP TABLE fs, fs1, fs_q;
 
 statement ok
-DROP FUNCTION fs_check, fs_same;
+DROP FUNCTION fs_check, fs_same, fs_three;
 
 statement ok
 RESET enable_seqscan;
