@@ -11,7 +11,7 @@
 use crate::index::storage::PostgresRelation;
 use pgrx::pg_sys::{self, BuiltinOid, Datum};
 use vchordrq::keys::{
-    Intervals, Key, Keys, Summary, Width, fold, hash_int, hash_uuid, raw_int, raw_uuid,
+    Condition, Intervals, Key, Keys, Summary, Width, fold, hash_int, hash_uuid, raw_int, raw_uuid,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,12 +206,14 @@ impl<'a> FilterKeys<'a> {
         Type::of_oid(oid).unwrap()
     }
 
-    /// The row's columns; a NULL is stored as zeros.
+    /// The row's columns: a NULL is stored as zeros and marked in the NULL mask.
     pub unsafe fn row(&self, values: *const Datum, is_null: *const bool) -> Vec<u8> {
         let mut columns = Vec::with_capacity(self.keys.columns());
+        let mut nulls = 0_u32;
         for (i, key) in self.keys.as_slice().iter().enumerate() {
             let stored = unsafe {
                 if is_null.add(i + 1).read() {
+                    nulls |= 1 << i;
                     0
                 } else {
                     match self.ty(i).bound(values.add(i + 1).read(), key) {
@@ -222,15 +224,27 @@ impl<'a> FilterKeys<'a> {
             };
             columns.extend_from_slice(&stored.to_le_bytes()[..key.width.bytes()]);
         }
+        if !self.keys.is_empty() {
+            columns.extend_from_slice(&nulls.to_le_bytes());
+        }
         columns
     }
 
     /// What a scan key on filter key column `i` accepts; with `ANY(array)`, what an element does.
-    pub unsafe fn of_scan_key(&self, i: usize, scan_key: &pg_sys::ScanKeyData) -> Intervals {
-        if scan_key.sk_flags & pg_sys::SK_ISNULL as i32 != 0 {
-            return Intervals::new(Vec::new());
-        }
+    pub unsafe fn of_scan_key(&self, i: usize, scan_key: &pg_sys::ScanKeyData) -> Condition {
         let (column, key) = (self.ty(i), &self.keys.as_slice()[i]);
+        let flag = |x: u32| scan_key.sk_flags & x as i32 != 0;
+        let null = flag(pg_sys::SK_SEARCHNULL);
+        if flag(pg_sys::SK_ISNULL) {
+            let values = flag(pg_sys::SK_SEARCHNOTNULL).then_some([0, key.max()]);
+            let values = Intervals::new(values.into_iter().collect());
+            return Condition { values, null };
+        }
+        let values = unsafe { self.values(column, key, scan_key) };
+        Condition { values, null }
+    }
+
+    unsafe fn values(&self, column: Type, key: &Key, scan_key: &pg_sys::ScanKeyData) -> Intervals {
         // the right type of the operator, which differs for `int4 = int8`
         let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
         let accepts = |datum| {

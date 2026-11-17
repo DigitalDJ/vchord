@@ -1,4 +1,4 @@
-# Range conditions on filter keys return the heap's rows, before and after maintenance.
+# Ranges and NULL tests on filter keys return the heap's rows, before and after maintenance.
 
 statement ok
 CREATE TABLE fr (id int PRIMARY KEY, a int2, b int4, c int8, u uuid, v vector(3));
@@ -53,7 +53,8 @@ CREATE FUNCTION fr_check() RETURNS text LANGUAGE sql AS $$
     'u >= ''80000000-0000-0000-0000-000000000000''', 'u < ''00000000-0000-0000-0000-000000000001''',
     'u BETWEEN ''40000000-0000-0000-0000-000000000000'' AND ''4fffffff-ffff-ffff-ffff-ffffffffffff''',
     'a < 0 AND b BETWEEN -100 AND 100', 'b < 0 AND c > 0 AND u > ''c0000000-0000-0000-0000-000000000000''',
-    'a = 1 AND b > 0'
+    'a = 1 AND b > 0', 'a IS NULL', 'a IS NOT NULL', 'a IS NULL AND b < 0', 'u IS NULL', 'u IS NOT NULL AND a > 0',
+    'b IS NULL AND c IS NULL', 'b IS NOT NULL AND b IS NULL'
   ]) c WHERE NOT fr_same(c)
 $$;
 
@@ -62,7 +63,7 @@ SELECT fr_check();
 ----
 all equal
 
-# the least int2 and the zero uuid are stored as NULLs are: such conditions are rechecked
+# the least int2 and the nil uuid are stored as zeros, as NULLs are, and told apart by the NULL mask
 query T
 SELECT bool_and(r) FROM (
   SELECT (SELECT count(*) FROM (SELECT id FROM fr WHERE a <= -32768 ORDER BY v <-> '[0.5,0.5,0.5]') s)

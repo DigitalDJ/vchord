@@ -328,7 +328,7 @@ INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
   ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
 FROM generate_series(1, 20) i;
 
-statement error filter keys of 224 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
+statement error filter keys of 228 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
 CREATE INDEX ON fw USING vchordrq (v vector_l2_ops, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14);
 
 statement ok
@@ -407,7 +407,7 @@ SELECT fk_subsets(ARRAY['u = ANY(''{00000000-0000-0000-0000-000000000007,0000000
 ----
 all equal
 
-# Keys are whole by default and recheck only for NULL's stored form, zeros: the least integer, the nil uuid.
+# Whole keys need no recheck: the NULL mask tells a NULL from a stored form of zeros.
 query T
 SELECT fk_recheck('u = ''00000000-0000-0000-0000-000000000007'' AND i4 = 207');
 ----
@@ -421,7 +421,12 @@ SELECT fk_recheck('i2 = 57') || ', ' || fk_same('i2 = 57');
 query T
 SELECT fk_recheck('i2 = -32768') || ', ' || fk_same('i2 = -32768');
 ----
-0 returned, 300 removed by the recheck, true
+0 returned, 0 removed by the recheck, true
+
+query T
+SELECT fk_recheck('i2 IS NULL') || ', ' || fk_same('i2 IS NULL') || ', ' || fk_same('i2 IS NOT NULL AND i4 = 207');
+----
+300 returned, 0 removed by the recheck, true, true
 
 query T
 SELECT fk_recheck('i4 = 4294967503::int8') || ', ' || fk_same('i4 = 4294967503::int8');
@@ -486,9 +491,9 @@ INSERT INTO fk (id, u, i4, v) SELECT i, ('00000000-0000-0000-0000-' || lpad((i %
   ARRAY[0.5, 0.5, 0.5]::real[]::vector FROM generate_series(31001, 31010) i;
 
 query T
-SELECT fk_recheck('i4 = -2147483648');
+SELECT fk_recheck('i4 = -2147483648') || ', ' || fk_recheck('i4 IS NULL');
 ----
-0 returned, 10 removed by the recheck
+0 returned, 0 removed by the recheck, 10 returned, 0 removed by the recheck
 
 query T
 SELECT fk_recheck('i4 = 5000') || ', ' || fk_same('i4 = 5000') || ', ' || fk_same('i4 = ANY(''{-2147483648,5000}'')');

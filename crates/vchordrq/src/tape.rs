@@ -681,12 +681,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::{Intervals, KeyFilter, Keys, Summary, Width};
+    use crate::keys::{Condition, Intervals, KeyFilter, Keys, Summary, Width};
 
     fn filter(points: Vec<u64>) -> KeyFilter {
         let keys = Keys::new([(Width::W8, false, Some(Summary::Bounds))]);
-        let set = Intervals::points(points.into_iter().map(u128::from).collect());
-        KeyFilter::new(&keys, vec![Some(set)]).unwrap()
+        let values = Intervals::points(points.into_iter().map(u128::from).collect());
+        KeyFilter::new(
+            &keys,
+            vec![Some(Condition {
+                values,
+                null: false,
+            })],
+        )
+        .unwrap()
     }
 
     /// Per page, its tuples as (block, whether the block's last), and the blocks' zone maps.

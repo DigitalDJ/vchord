@@ -215,9 +215,10 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     am_routine.amsupport = 2;
     am_routine.amoptsprocnum = 2;
     am_routine.amcanorderbyop = true;
-    // A filter key column: its `=` and `= ANY(array)` quals become scan keys.
+    // A filter key column: its comparisons, `op ANY(array)` and `IS [NOT] NULL` become scan keys.
     am_routine.amcanmulticol = true;
     am_routine.amsearcharray = true;
+    am_routine.amsearchnulls = true;
 
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     {
@@ -469,7 +470,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     }
 }
 
-/// A clause on the vector column that gives a vector: a sphere, not an array of spheres.
+/// A clause on the vector column that gives one vector: a sphere, not an array or a NULL test.
 unsafe fn has_vector_clause(path: *mut pgrx::pg_sys::IndexPath) -> bool {
     use pgrx::pg_sys::{IndexClause, NodeTag, RestrictInfo};
     unsafe {
@@ -479,7 +480,10 @@ unsafe fn has_vector_clause(path: *mut pgrx::pg_sys::IndexPath) -> bool {
                 (*clause).indexcol == 0
                     && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
                         .iter_ptr()
-                        .all(|qual| (*(*qual).clause).type_ != NodeTag::T_ScalarArrayOpExpr)
+                        .all(|qual| {
+                            let tag = (*(*qual).clause).type_;
+                            tag != NodeTag::T_ScalarArrayOpExpr && tag != NodeTag::T_NullTest
+                        })
             })
     }
 }
@@ -503,7 +507,7 @@ unsafe fn filter_key_selectivity(
             };
             for qual in pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals).iter_ptr() {
                 quals.push(qual);
-                if key.hashed {
+                if key.hashed && (*(*qual).clause).type_ != NodeTag::T_NullTest {
                     let expr = (*qual).clause;
                     let values = if (*expr).type_ == NodeTag::T_ScalarArrayOpExpr {
                         let args = (*expr.cast::<ScalarArrayOpExpr>()).args;
@@ -682,10 +686,17 @@ pub unsafe extern "C-unwind" fn amrescan(
         } else {
             &[]
         };
+        use pgrx::pg_sys::{SK_SEARCHARRAY, SK_SEARCHNOTNULL, SK_SEARCHNULL};
+        let null_test = |key: &pgrx::pg_sys::ScanKeyData| {
+            key.sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL) as i32 != 0
+        };
         // An array of spheres gives no search vector: the recheck takes it, as a NULL sphere.
         let is_vector_key = |key: &pgrx::pg_sys::ScanKeyData| {
-            key.sk_attno == 1 && key.sk_flags & pgrx::pg_sys::SK_SEARCHARRAY as i32 == 0
+            key.sk_attno == 1 && key.sk_flags & SK_SEARCHARRAY as i32 == 0 && !null_test(key)
         };
+        // NULL vectors are not indexed.
+        let null_vector =
+            (keys.iter()).any(|key| key.sk_attno == 1 && key.sk_flags & SK_SEARCHNULL as i32 != 0);
         if (*scan).numberOfOrderBys == 0 && !keys.iter().any(is_vector_key) {
             pgrx::error!(
                 "vector search with no WHERE clause and no ORDER BY clause is not supported"
@@ -699,7 +710,7 @@ pub unsafe extern "C-unwind" fn amrescan(
         let filter = constrained.then(|| {
             let filter_keys = FilterKeys::of_index((*scan).indexRelation);
             let mut sets =
-                vec![None::<vchordrq::keys::Intervals>; filter_keys.keys.as_slice().len()];
+                vec![None::<vchordrq::keys::Condition>; filter_keys.keys.as_slice().len()];
             for key in keys.iter().filter(|key| key.sk_attno >= 2) {
                 let i = key.sk_attno as usize - 2;
                 let accepted = filter_keys.of_scan_key(i, key);
@@ -710,16 +721,13 @@ pub unsafe extern "C-unwind" fn amrescan(
             }
             vchordrq::keys::KeyFilter::new(filter_keys.keys, sets)
         });
-        let filter = match filter {
-            None => None,
-            Some(Some(filter)) => Some(filter),
-            Some(None) => {
-                scanner.scanning = Some(LazyCell::new(Box::new(|| -> Iter {
-                    Box::new(std::iter::empty())
-                })));
-                return;
-            }
-        };
+        if null_vector || matches!(filter, Some(None)) {
+            scanner.scanning = Some(LazyCell::new(Box::new(|| -> Iter {
+                Box::new(std::iter::empty())
+            })));
+            return;
+        }
+        let filter = filter.flatten();
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
         let probes = gucs::vchordrq_probes((*scan).indexRelation);
@@ -798,7 +806,10 @@ pub unsafe extern "C-unwind" fn amrescan(
                     let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                for key in keys.iter().filter(|key| key.sk_attno == 1) {
+                for key in keys
+                    .iter()
+                    .filter(|key| key.sk_attno == 1 && !null_test(key))
+                {
                     let is_null = (key.sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     let value = (is_vector_key(key) && !is_null).then_some(key.sk_argument);
                     builder.add(key.sk_strategy, value);
@@ -820,11 +831,9 @@ pub unsafe extern "C-unwind" fn amrescan(
                     let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                for i in 0..(*scan).numberOfKeys {
-                    let data = (*scan).keyData.add(i as usize);
-                    let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
-                    builder.add((*data).sk_strategy, (!is_null).then_some(value));
+                for key in keys.iter().filter(|key| !null_test(key)) {
+                    let is_null = (key.sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    builder.add(key.sk_strategy, (!is_null).then_some(key.sk_argument));
                 }
                 LazyCell::new(Box::new(move || {
                     // only do this since `PostgresRelation` has no destructor
