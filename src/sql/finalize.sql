@@ -496,7 +496,9 @@ CREATE OPERATOR FAMILY halfvec_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY rabitq8_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY rabitq4_maxsim_ops USING vchordrq;
 CREATE OPERATOR FAMILY uuid_ops USING vchordrq;
+CREATE OPERATOR FAMILY uuid_hash_ops USING vchordrq;
 CREATE OPERATOR FAMILY integer_ops USING vchordrq;
+CREATE OPERATOR FAMILY integer_hash_ops USING vchordrq;
 CREATE OPERATOR FAMILY vector_l2_ops USING vchordg;
 CREATE OPERATOR FAMILY vector_ip_ops USING vchordg;
 CREATE OPERATOR FAMILY vector_cosine_ops USING vchordg;
@@ -604,38 +606,92 @@ CREATE OPERATOR CLASS rabitq4_maxsim_ops
     OPERATOR 3 @# (rabitq4[], rabitq4[]) FOR ORDER BY float_ops,
     FUNCTION 1 _vchordrq_support_rabitq4_maxsim_ops();
 
--- Filter key columns store the key itself; put the most selective first. The
--- optional `bytes`, as in `key uuid_ops (bytes = 4)`, stores a hash of that
--- width instead: smaller blocks and slightly faster scans, but PostgreSQL
--- rechecks the key on the returned rows and different keys can share a hash.
+-- Filter keys: `*_ops` take = and ranges, most selective first; `*_hash_ops` only =.
 
 CREATE OPERATOR CLASS uuid_ops
     DEFAULT FOR TYPE uuid USING vchordrq FAMILY uuid_ops AS
-    OPERATOR 1 = (uuid, uuid),
-    FUNCTION 2 _vchordrq_uuid_options(internal);
+    OPERATOR 1 < (uuid, uuid),
+    OPERATOR 2 <= (uuid, uuid),
+    OPERATOR 3 = (uuid, uuid),
+    OPERATOR 4 >= (uuid, uuid),
+    OPERATOR 5 > (uuid, uuid);
+
+CREATE OPERATOR CLASS uuid_hash_ops
+    FOR TYPE uuid USING vchordrq FAMILY uuid_hash_ops AS
+    OPERATOR 3 = (uuid, uuid),
+    FUNCTION 2 _vchordrq_uuid_hash_options(internal);
 
 CREATE OPERATOR CLASS int2_ops
     DEFAULT FOR TYPE int2 USING vchordrq FAMILY integer_ops AS
-    OPERATOR 1 = (int2, int2),
-    FUNCTION 2 _vchordrq_int2_options(internal);
+    OPERATOR 1 < (int2, int2),
+    OPERATOR 2 <= (int2, int2),
+    OPERATOR 3 = (int2, int2),
+    OPERATOR 4 >= (int2, int2),
+    OPERATOR 5 > (int2, int2);
 
 CREATE OPERATOR CLASS int4_ops
     DEFAULT FOR TYPE int4 USING vchordrq FAMILY integer_ops AS
-    OPERATOR 1 = (int4, int4),
-    FUNCTION 2 _vchordrq_int4_options(internal);
+    OPERATOR 1 < (int4, int4),
+    OPERATOR 2 <= (int4, int4),
+    OPERATOR 3 = (int4, int4),
+    OPERATOR 4 >= (int4, int4),
+    OPERATOR 5 > (int4, int4);
 
 CREATE OPERATOR CLASS int8_ops
     DEFAULT FOR TYPE int8 USING vchordrq FAMILY integer_ops AS
-    OPERATOR 1 = (int8, int8),
-    FUNCTION 2 _vchordrq_int8_options(internal);
+    OPERATOR 1 < (int8, int8),
+    OPERATOR 2 <= (int8, int8),
+    OPERATOR 3 = (int8, int8),
+    OPERATOR 4 >= (int8, int8),
+    OPERATOR 5 > (int8, int8);
 
 ALTER OPERATOR FAMILY integer_ops USING vchordrq ADD
-    OPERATOR 1 = (int2, int4),
-    OPERATOR 1 = (int2, int8),
-    OPERATOR 1 = (int4, int2),
-    OPERATOR 1 = (int4, int8),
-    OPERATOR 1 = (int8, int2),
-    OPERATOR 1 = (int8, int4);
+    OPERATOR 1 < (int2, int4),
+    OPERATOR 2 <= (int2, int4),
+    OPERATOR 3 = (int2, int4),
+    OPERATOR 4 >= (int2, int4),
+    OPERATOR 5 > (int2, int4),
+    OPERATOR 1 < (int2, int8),
+    OPERATOR 2 <= (int2, int8),
+    OPERATOR 3 = (int2, int8),
+    OPERATOR 4 >= (int2, int8),
+    OPERATOR 5 > (int2, int8),
+    OPERATOR 1 < (int4, int2),
+    OPERATOR 2 <= (int4, int2),
+    OPERATOR 3 = (int4, int2),
+    OPERATOR 4 >= (int4, int2),
+    OPERATOR 5 > (int4, int2),
+    OPERATOR 1 < (int4, int8),
+    OPERATOR 2 <= (int4, int8),
+    OPERATOR 3 = (int4, int8),
+    OPERATOR 4 >= (int4, int8),
+    OPERATOR 5 > (int4, int8),
+    OPERATOR 1 < (int8, int2),
+    OPERATOR 2 <= (int8, int2),
+    OPERATOR 3 = (int8, int2),
+    OPERATOR 4 >= (int8, int2),
+    OPERATOR 5 > (int8, int2),
+    OPERATOR 1 < (int8, int4),
+    OPERATOR 2 <= (int8, int4),
+    OPERATOR 3 = (int8, int4),
+    OPERATOR 4 >= (int8, int4),
+    OPERATOR 5 > (int8, int4);
+
+CREATE OPERATOR CLASS int4_hash_ops
+    FOR TYPE int4 USING vchordrq FAMILY integer_hash_ops AS
+    OPERATOR 3 = (int4, int4),
+    FUNCTION 2 _vchordrq_int4_hash_options(internal);
+
+CREATE OPERATOR CLASS int8_hash_ops
+    FOR TYPE int8 USING vchordrq FAMILY integer_hash_ops AS
+    OPERATOR 3 = (int8, int8),
+    FUNCTION 2 _vchordrq_int8_hash_options(internal);
+
+ALTER OPERATOR FAMILY integer_hash_ops USING vchordrq ADD
+    OPERATOR 3 = (int4, int2),
+    OPERATOR 3 = (int4, int8),
+    OPERATOR 3 = (int8, int2),
+    OPERATOR 3 = (int8, int4);
 
 CREATE OPERATOR CLASS vector_l2_ops
     FOR TYPE vector USING vchordg FAMILY vector_l2_ops AS

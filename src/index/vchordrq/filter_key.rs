@@ -42,12 +42,12 @@ impl Type {
         }
     }
 
-    /// The stored form of `datum` (of type `self`) under `key`; `None` if no row can hold it.
-    unsafe fn stored(self, datum: Datum, key: &Key) -> Option<u128> {
+    /// Where `datum`, of type `self`, lies among the stored forms of `key`.
+    unsafe fn bound(self, datum: Datum, key: &Key) -> Bound {
         match self {
             Self::Uuid => {
                 let bytes = unsafe { &*datum.cast_mut_ptr::<[u8; 16]>() };
-                Some(if key.hashed {
+                Bound::At(if key.hashed {
                     fold(hash_uuid(bytes), key.width) as u128
                 } else {
                     raw_uuid(bytes)
@@ -59,13 +59,43 @@ impl Type {
                     Self::Int4 => datum.value() as i32 as i64,
                     _ => datum.value() as i64,
                 };
-                Some(if key.hashed {
-                    fold(hash_int(x), key.width) as u128
-                } else {
-                    raw_int(x, key.width)? as u128
-                })
+                if key.hashed {
+                    return Bound::At(fold(hash_int(x), key.width) as u128);
+                }
+                match raw_int(x, key.width) {
+                    Some(stored) => Bound::At(stored as u128),
+                    None if x < 0 => Bound::Below,
+                    None => Bound::Above,
+                }
             }
         }
+    }
+}
+
+/// Where a constant lies among the stored forms of a key, which order like the key.
+#[derive(Debug, Clone, Copy)]
+enum Bound {
+    Below,
+    At(u128),
+    Above,
+}
+
+/// The stored forms, up to `max`, that a scan key of `strategy` accepts against `bound`.
+fn interval(strategy: u16, bound: Bound, max: u128) -> Option<[u128; 2]> {
+    use Bound::*;
+    const LESS: u16 = pg_sys::BTLessStrategyNumber as u16;
+    const LESS_EQUAL: u16 = pg_sys::BTLessEqualStrategyNumber as u16;
+    const EQUAL: u16 = pg_sys::BTEqualStrategyNumber as u16;
+    const GREATER_EQUAL: u16 = pg_sys::BTGreaterEqualStrategyNumber as u16;
+    const GREATER: u16 = pg_sys::BTGreaterStrategyNumber as u16;
+    match (strategy, bound) {
+        (LESS, At(x)) => x.checked_sub(1).map(|x| [0, x]),
+        (LESS_EQUAL, At(x)) => Some([0, x]),
+        (EQUAL, At(x)) => Some([x, x]),
+        (GREATER_EQUAL, At(x)) => Some([x, max]),
+        (GREATER, At(x)) => (x < max).then(|| [x + 1, max]),
+        (LESS | LESS_EQUAL, Above) | (GREATER_EQUAL | GREATER, Below) => Some([0, max]),
+        _ => None,
     }
 }
 
@@ -92,12 +122,13 @@ unsafe extern "C-unwind" fn validate(
 ) {
     let bytes = unsafe { (*parsed.cast::<Options>()).bytes };
     if Width::of_bytes(bytes as usize).is_none() {
-        pgrx::error!("invalid value for option \"bytes\": {bytes}, not 2, 4, 8 or 16");
+        pgrx::error!("invalid value for option \"bytes\": {bytes}, not 2, 4 or 8");
     }
 }
 
-/// The options support function of a filter key column of type `ty`.
+/// The options support function of a `*_hash_ops` filter key column: `bytes`, at most half the key.
 pub unsafe fn options(relopts: pgrx::Internal, ty: Type) {
+    let most = ty.width().bytes() / 2;
     unsafe {
         let relopts = relopts
             .unwrap()
@@ -107,11 +138,10 @@ pub unsafe fn options(relopts: pgrx::Internal, ty: Type) {
         pg_sys::add_local_int_reloption(
             relopts,
             c"bytes".as_ptr(),
-            c"bytes that a row stores of the key: the key itself by default, a hash of it if fewer"
-                .as_ptr(),
-            ty.width().bytes() as _,
+            c"bytes of the hash that a row stores of the key".as_ptr(),
+            most.min(4) as _,
             2,
-            ty.width().bytes() as _,
+            most as _,
             std::mem::offset_of!(Options, bytes) as _,
         );
         pg_sys::register_reloptions_validator(relopts, Some(validate));
@@ -122,11 +152,11 @@ pub unsafe fn options(relopts: pgrx::Internal, ty: Type) {
 pub unsafe fn of_options(index_relation: pg_sys::Relation, zone_maps: usize) -> Keys {
     let options = unsafe { pg_sys::RelationGetIndexAttOptions(index_relation, false) };
     Keys::new(unsafe { types(index_relation) }.enumerate().map(|(i, ty)| {
-        let bytes = unsafe { (*(*options.add(i + 1)).cast::<Options>()).bytes };
-        let width = Width::of_bytes(bytes as usize).unwrap();
+        let hash = unsafe { options.add(i + 1).read().cast::<Options>().as_ref() };
+        let width = hash.map_or(ty.width(), |x| Width::of_bytes(x.bytes as usize).unwrap());
         (
             width,
-            width != ty.width(),
+            hash.is_some(),
             (i < zone_maps).then_some(Summary::Bounds),
         )
     }))
@@ -184,8 +214,10 @@ impl<'a> FilterKeys<'a> {
                 if is_null.add(i + 1).read() {
                     0
                 } else {
-                    let stored = self.ty(i).stored(values.add(i + 1).read(), key);
-                    stored.expect("a key out of the range of its own type")
+                    match self.ty(i).bound(values.add(i + 1).read(), key) {
+                        Bound::At(stored) => stored,
+                        _ => unreachable!("a key out of the range of its own type"),
+                    }
                 }
             };
             columns.extend_from_slice(&stored.to_le_bytes()[..key.width.bytes()]);
@@ -193,17 +225,23 @@ impl<'a> FilterKeys<'a> {
         columns
     }
 
-    /// The stored forms that a scan key on filter key column `i` accepts.
+    /// What a scan key on filter key column `i` accepts; with `ANY(array)`, what an element does.
     pub unsafe fn of_scan_key(&self, i: usize, scan_key: &pg_sys::ScanKeyData) -> Intervals {
         if scan_key.sk_flags & pg_sys::SK_ISNULL as i32 != 0 {
-            return Intervals::points(Vec::new());
+            return Intervals::new(Vec::new());
         }
         let (column, key) = (self.ty(i), &self.keys.as_slice()[i]);
         // the right type of the operator, which differs for `int4 = int8`
         let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
+        let accepts = |datum| {
+            interval(
+                scan_key.sk_strategy,
+                unsafe { ty.bound(datum, key) },
+                key.max(),
+            )
+        };
         if scan_key.sk_flags & pg_sys::SK_SEARCHARRAY as i32 == 0 {
-            let stored = unsafe { ty.stored(scan_key.sk_argument, key) };
-            return Intervals::points(stored.into_iter().collect());
+            return Intervals::new(accepts(scan_key.sk_argument).into_iter().collect());
         }
         unsafe {
             let datum = scan_key.sk_argument.cast_mut_ptr::<pg_sys::varlena>();
@@ -224,16 +262,16 @@ impl<'a> FilterKeys<'a> {
                 &mut nulls,
                 &mut n,
             );
-            let stored = (0..n as usize)
+            let accepted = (0..n as usize)
                 .filter(|&i| !nulls.add(i).read())
-                .filter_map(|i| ty.stored(elements.add(i).read(), key))
+                .filter_map(|i| accepts(elements.add(i).read()))
                 .collect::<Vec<_>>();
             pg_sys::pfree(elements.cast());
             pg_sys::pfree(nulls.cast());
             if array.cast() != datum {
                 pg_sys::pfree(array.cast());
             }
-            Intervals::points(stored)
+            Intervals::new(accepted)
         }
     }
 }

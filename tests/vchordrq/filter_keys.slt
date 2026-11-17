@@ -42,7 +42,7 @@ statement ok
 ALTER TABLE fk SET (parallel_workers = 2);
 
 statement ok
-CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner uuid_hash_ops (bytes = 2)) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [32]
@@ -55,7 +55,7 @@ statement ok
 ALTER TABLE fk RESET (parallel_workers);
 
 query T
-SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes=''2''))%';
+SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner uuid_hash_ops (bytes=''2''))%';
 ----
 t
 
@@ -278,7 +278,7 @@ t
 statement ok
 ROLLBACK;
 
-statement error operator class "uuid_ops" does not accept data type text
+statement error operator class "uuid_hash_ops" does not accept data type text
 ALTER TABLE fk ALTER COLUMN owner TYPE text USING owner::text;
 
 statement ok
@@ -287,26 +287,29 @@ DROP INDEX fk_v, fk_g;
 statement ok
 RESET vchordrq.probes;
 
-statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+statement error invalid value for option "bytes": 3, not 2, 4 or 8
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 3));
+
+statement error operator class public.uuid_ops has no options
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 4));
 
 statement error value 4 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i2 int2_ops (bytes = 4));
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i4 int4_hash_ops (bytes = 4));
 
-statement error value 8 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i4 int4_ops (bytes = 8));
+statement error value 16 out of bounds for option "bytes"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 16));
 
-statement error value 32 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 32));
+statement error operator class "int2_hash_ops" does not exist for access method "vchordrq"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i2 int2_hash_ops);
 
 statement error unrecognized parameter "width"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (width = 4));
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (width = 4));
 
 statement error vector_l2_ops has no options
 CREATE INDEX ON fk USING vchordrq (v vector_l2_ops (bytes = 4), u);
 
-statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
-CREATE INDEX CONCURRENTLY fk_bad ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+statement error invalid value for option "bytes": 3, not 2, 4 or 8
+CREATE INDEX CONCURRENTLY fk_bad ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 3));
 
 query I
 SELECT count(*) FROM pg_class WHERE relname = 'fk_bad';
@@ -512,8 +515,8 @@ statement ok
 DROP INDEX fk_whole;
 
 statement ok
-CREATE INDEX fk_hashed ON fk USING vchordrq (v vector_l2_ops, i8 int8_ops (bytes = 4), un uuid_ops (bytes = 8), i4 int4_ops (bytes = 2),
-  u uuid_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fk_hashed ON fk USING vchordrq (v vector_l2_ops, i8 int8_hash_ops, un uuid_hash_ops (bytes = 8), i4 int4_hash_ops,
+  u uuid_hash_ops (bytes = 2)) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [16]

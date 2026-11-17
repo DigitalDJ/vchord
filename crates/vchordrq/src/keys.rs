@@ -110,6 +110,10 @@ impl Key {
         x[..bytes].copy_from_slice(columns.get(self.offset, bytes));
         u128::from_le_bytes(x)
     }
+    /// The greatest stored form.
+    pub const fn max(&self) -> u128 {
+        u128::MAX >> (128 - 8 * self.width.bytes())
+    }
     /// The shift of a stored form to its prefix of a word, which orders like it.
     const fn shift(&self) -> u32 {
         match self.width {
@@ -306,6 +310,7 @@ impl Intervals {
         }
         Self(merged)
     }
+    #[cfg(test)]
     pub fn points(points: Vec<u128>) -> Self {
         Self::new(points.into_iter().map(|x| [x, x]).collect())
     }
@@ -345,9 +350,25 @@ impl Intervals {
     }
 }
 
-/// The blocks of `blocks` whose bounds meet one of `set`, a bit each.
+/// Up to this many intervals are tested a word of blocks at a time, more one block at a time.
+const FEW_INTERVALS: usize = 8;
+
+/// The blocks of `blocks`, within one word, whose bounds meet one of `set`, a bit each.
 #[inline(always)]
 fn meets(set: &[[u64; 2]], mins: &[[u32; 2]], maxs: &[[u32; 2]], blocks: Range<usize>) -> u32 {
+    if set.len() <= FEW_INTERVALS {
+        // the word's bounds as a column; past its blocks, any
+        let word = |x: &[[u32; 2]]| -> [u64; 32] {
+            let x = &x[blocks.clone()];
+            std::array::from_fn(|i| x.get(i).map_or(0, |&w| wide(w).to_le()))
+        };
+        let (mins, maxs) = (word(mins), word(maxs));
+        let mask = set.iter().fold(0, |mask, &[lo, hi]| {
+            let below = u64::between(&mins, 0, hi.to_le());
+            mask | below & u64::between(&maxs, lo.to_le(), u64::MAX)
+        });
+        return mask << (blocks.start % 32);
+    }
     let (mut mask, mut i, mut last) = (0, 0, 0);
     for b in blocks {
         let (min, max) = (wide(mins[b]), wide(maxs[b]));
@@ -368,6 +389,8 @@ fn meets(set: &[[u64; 2]], mins: &[[u32; 2]], maxs: &[[u32; 2]], blocks: Range<u
 enum Values<T> {
     Few(Vec<T>),
     Many(Box<Set<T>>),
+    /// Inclusive bounds, as the column stores them.
+    Ranges(Vec<[T; 2]>),
 }
 
 impl<T: Value> Values<T> {
@@ -383,12 +406,16 @@ impl<T: Value> Values<T> {
         (false, _) => 3,
     };
 
-    /// `keys`: sorted and deduplicated, at least one.
-    fn new(keys: Vec<T>) -> Self {
-        if keys.len() <= Self::FEW {
-            Self::Few(keys)
-        } else {
-            Self::Many(Box::new(Set::new(&keys)))
+    /// `form`: a stored form as the column stores it.
+    fn new(set: &Intervals, form: impl Fn(u128) -> T) -> Self {
+        match set.as_points() {
+            Some(points) if points.len() <= Self::FEW => {
+                Self::Few(points.into_iter().map(form).collect())
+            }
+            Some(points) => Self::Many(Box::new(Set::new(
+                &points.into_iter().map(form).collect::<Vec<_>>(),
+            ))),
+            None => Self::Ranges(set.0.iter().map(|&[lo, hi]| [form(lo), form(hi)]).collect()),
         }
     }
 
@@ -397,6 +424,9 @@ impl<T: Value> Values<T> {
         match self {
             Self::Few(keys) => T::matches(column, keys),
             Self::Many(set) => set.matches(column),
+            Self::Ranges(ranges) => {
+                (ranges.iter()).fold(0, |mask, &[lo, hi]| mask | T::between(column, lo, hi))
+            }
         }
     }
 
@@ -405,6 +435,10 @@ impl<T: Value> Values<T> {
         match self {
             Self::Few(keys) => keys.contains(&x),
             Self::Many(set) => set.contains(x),
+            Self::Ranges(ranges) => {
+                let x = x.ordinal();
+                (ranges.iter()).any(|&[lo, hi]| lo.ordinal() <= x && x <= hi.ordinal())
+            }
         }
     }
 }
@@ -425,22 +459,14 @@ fn column<T: FromBytes + Immutable + KnownLayout>(columns: &[u8], offset: u16) -
 
 impl Column {
     /// Columns are little-endian on disk; compare against `to_le` forms.
-    fn new(width: Width, keys: &[u128]) -> Self {
+    fn new(width: Width, set: &Intervals) -> Self {
         match width {
-            Width::W2 => Self::U16(Values::new(
-                keys.iter().map(|&x| (x as u16).to_le()).collect(),
-            )),
-            Width::W4 => Self::U32(Values::new(
-                keys.iter().map(|&x| (x as u32).to_le()).collect(),
-            )),
-            Width::W8 => Self::U64(Values::new(
-                keys.iter().map(|&x| (x as u64).to_le()).collect(),
-            )),
-            Width::W16 => Self::U128(Values::new(
-                (keys.iter())
-                    .map(|&x| [(x as u64).to_le(), ((x >> 64) as u64).to_le()])
-                    .collect(),
-            )),
+            Width::W2 => Self::U16(Values::new(set, |x| (x as u16).to_le())),
+            Width::W4 => Self::U32(Values::new(set, |x| (x as u32).to_le())),
+            Width::W8 => Self::U64(Values::new(set, |x| (x as u64).to_le())),
+            Width::W16 => Self::U128(Values::new(set, |x| {
+                [(x as u64).to_le(), ((x >> 64) as u64).to_le()]
+            })),
         }
     }
 
@@ -490,20 +516,18 @@ impl KeyFilter {
                 return None;
             }
             filter.exact &= key.exact(&set);
+            if set.0 == [[0, key.max()]] {
+                continue;
+            }
             match key.summary {
                 Some(Summary::Bounds) => {
                     filter.blocks.push((place - 1, set.prefixes(key.shift())));
                 }
                 None => {}
             }
-            // Rows of a key that holds more than points are left to its summary and the recheck.
-            match set.as_points() {
-                Some(points) => {
-                    let column = Column::new(key.width, &points);
-                    filter.columns.push((key.offset, column));
-                }
-                None => filter.exact = false,
-            }
+            filter
+                .columns
+                .push((key.offset, Column::new(key.width, &set)));
         }
         Some(filter)
     }
@@ -702,13 +726,19 @@ mod tests {
                     .collect::<Vec<Vec<_>>>();
                 for _ in 0..16 {
                     let constrained = rand::random::<u32>() % (1 << n);
+                    // per key its points, or the interval from its least to its greatest
                     let sets = (0..n)
                         .map(|i| {
-                            let set = Intervals::points(wanted[i].clone());
+                            let (lo, hi) = (wanted[i].iter().min(), wanted[i].iter().max());
+                            let set = if rand::random::<bool>() {
+                                Intervals::points(wanted[i].clone())
+                            } else {
+                                Intervals::new(vec![[*lo.unwrap(), *hi.unwrap()]])
+                            };
                             (constrained >> i & 1 != 0).then_some(set)
                         })
                         .collect::<Vec<_>>();
-                    let filter = KeyFilter::new(keys, sets).unwrap();
+                    let filter = KeyFilter::new(keys, sets.clone()).unwrap();
                     let rows = rows(keys, &wanted);
                     let words = block(keys, &rows);
                     let columns = &words.as_bytes()[..32 * keys.columns()];
@@ -716,7 +746,7 @@ mod tests {
                     for (i, row) in rows.iter().enumerate() {
                         let expected = (0..n).all(|k| {
                             let x = stored(&keys.as_slice()[k], row);
-                            constrained >> k & 1 == 0 || wanted[k].contains(&x)
+                            constrained >> k & 1 == 0 || sets[k].as_ref().unwrap().contains(x)
                         });
                         assert_eq!(mask >> i & 1 != 0, expected);
                         assert_eq!((&filter).row(Columns::row(row)), expected);
@@ -728,9 +758,14 @@ mod tests {
             }
         }
         assert!(KeyFilter::new(&all[0], vec![Some(Intervals::points(Vec::new()))]).is_none());
-        let wide = Intervals::new(vec![[5, 9]]);
-        let filter = KeyFilter::new(&all[1], vec![None, Some(wide), None]).unwrap();
+        let every = Intervals::new(vec![[0, u16::MAX as u128]]);
+        let filter = KeyFilter::new(&all[1], vec![None, Some(every), None]).unwrap();
         assert!(!filter.exact() && (&filter).block(&[0; 32 * 22]) == u32::MAX);
+        let filter = KeyFilter::new(
+            &all[1],
+            vec![None, Some(Intervals::new(vec![[5, 9]])), None],
+        );
+        assert!(filter.unwrap().exact());
         let filter = KeyFilter::new(&all[1], vec![None, Some(Intervals::points(vec![7])), None]);
         assert!(filter.unwrap().exact());
         let filter = KeyFilter::new(

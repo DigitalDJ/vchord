@@ -200,7 +200,7 @@ statement ok
 UPDATE fs SET grp = id % 5;
 
 statement ok
-CREATE INDEX fs_two ON fs USING vchordrq (v halfvec_l2_ops, owner int8_ops (bytes = 8), grp int4_ops (bytes = 4)) WITH (options = $$
+CREATE INDEX fs_two ON fs USING vchordrq (v halfvec_l2_ops, owner int8_ops, grp int4_ops) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [8]
@@ -232,7 +232,7 @@ CREATE FUNCTION fs_three() RETURNS boolean LANGUAGE sql AS $$
 $$;
 
 statement ok
-CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_hash_ops) WITH (options = $$
 residual_quantization = true
 zone_maps = 1
 [build.internal]
@@ -248,7 +248,7 @@ statement ok
 DROP INDEX fs_three;
 
 statement ok
-CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fs_three ON fs USING vchordrq (v halfvec_l2_ops, grp, owner, id int4_hash_ops) WITH (options = $$
 residual_quantization = true
 zone_maps = 0
 [build.internal]

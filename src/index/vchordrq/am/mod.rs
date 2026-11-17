@@ -439,7 +439,8 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 .map(|limit| (limit / filtered_rows).clamp(1e-9, 1.0))
                 .unwrap_or(1.0);
             // Only rows the keys select become candidates.
-            let key_selectivity = filter_key_selectivity(root, path).clamp(1e-9, 1.0);
+            let keys = FilterKeys::of_index(relation.raw()).keys;
+            let key_selectivity = filter_key_selectivity(root, path, keys).clamp(1e-9, 1.0);
             let candidates = node_count * key_selectivity;
             let filter_selectivity = (filter_selectivity / key_selectivity).clamp(1e-9, 1.0);
             // The scan cannot process more candidates than the configured IVF
@@ -483,30 +484,54 @@ unsafe fn has_vector_clause(path: *mut pgrx::pg_sys::IndexPath) -> bool {
     }
 }
 
+/// The share of rows the filter key quals select, plus on a hashed key the hash collisions.
 unsafe fn filter_key_selectivity(
     root: *mut pgrx::pg_sys::PlannerInfo,
     path: *mut pgrx::pg_sys::IndexPath,
+    keys: &vchordrq::keys::Keys,
 ) -> f64 {
-    use pgrx::pg_sys::{IndexClause, RestrictInfo};
+    use pgrx::pg_sys::{IndexClause, NodeTag, RestrictInfo, ScalarArrayOpExpr};
     unsafe {
         let mut quals = pgrx::PgList::<RestrictInfo>::new();
+        let mut collisions = 0.0;
         for clause in pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses).iter_ptr() {
-            if (*clause).indexcol >= 1 {
-                for qual in pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals).iter_ptr() {
-                    quals.push(qual);
+            let Some(key) = keys
+                .as_slice()
+                .get(((*clause).indexcol as usize).wrapping_sub(1))
+            else {
+                continue;
+            };
+            for qual in pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals).iter_ptr() {
+                quals.push(qual);
+                if key.hashed {
+                    let expr = (*qual).clause;
+                    let values = if (*expr).type_ == NodeTag::T_ScalarArrayOpExpr {
+                        let args = (*expr.cast::<ScalarArrayOpExpr>()).args;
+                        let array = pgrx::PgList::<pgrx::pg_sys::Node>::from_pg(args).get_ptr(1);
+                        let array = array.expect("a scalar array operator with two operands");
+                        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+                        let n = pgrx::pg_sys::estimate_array_length(array);
+                        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+                        let n = pgrx::pg_sys::estimate_array_length(root, array);
+                        n as f64
+                    } else {
+                        1.0
+                    };
+                    collisions += values * (-8.0 * key.width.bytes() as f64).exp2();
                 }
             }
         }
         if quals.is_empty() {
             return 1.0;
         }
-        pgrx::pg_sys::clauselist_selectivity(
+        let selectivity = pgrx::pg_sys::clauselist_selectivity(
             root,
             quals.into_pg(),
             (*(*(*path).indexinfo).rel).relid as _,
             pgrx::pg_sys::JoinType::JOIN_INNER,
             std::ptr::null_mut(),
-        )
+        );
+        selectivity + collisions
     }
 }
 
