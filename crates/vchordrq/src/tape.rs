@@ -691,6 +691,7 @@ mod tests {
             vec![Some(Condition {
                 values,
                 null: false,
+                exact: true,
             })],
         )
         .unwrap()

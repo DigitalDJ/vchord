@@ -77,6 +77,26 @@ pub const fn raw_int(x: i64, width: Width) -> Option<u64> {
     Some((x as u64 ^ 1 << (bits - 1)) & (u64::MAX >> (64 - bits)))
 }
 
+/// A float4's bits, ordered as PostgreSQL orders float4: negative zero as zero, NaN greatest.
+pub fn raw_f32(x: f32) -> u32 {
+    let bits = if x.is_nan() { f32::NAN } else { x + 0.0 }.to_bits();
+    if bits >> 31 != 0 {
+        !bits
+    } else {
+        bits | 1 << 31
+    }
+}
+
+/// A float8's bits, ordered as PostgreSQL orders float8: negative zero as zero, NaN greatest.
+pub fn raw_f64(x: f64) -> u64 {
+    let bits = if x.is_nan() { f64::NAN } else { x + 0.0 }.to_bits();
+    if bits >> 63 != 0 {
+        !bits
+    } else {
+        bits | 1 << 63
+    }
+}
+
 /// The bytes as a big-endian integer, which orders as PostgreSQL orders uuids.
 pub const fn raw_uuid(x: &[u8; 16]) -> u128 {
     u128::from_be_bytes(*x)
@@ -545,6 +565,8 @@ impl Column {
 pub struct Condition {
     pub values: Intervals,
     pub null: bool,
+    /// Whether the values are exactly the passing ones, not more.
+    pub exact: bool,
 }
 
 impl Condition {
@@ -552,6 +574,7 @@ impl Condition {
         Self {
             values: self.values.intersect(&other.values),
             null: self.null && other.null,
+            exact: self.exact && other.exact,
         }
     }
 }
@@ -586,7 +609,12 @@ impl KeyFilter {
         let mut place = 0;
         for (key, condition) in std::iter::zip(keys.as_slice(), conditions) {
             place += key.summary.is_some() as usize;
-            let Some(Condition { values, null }) = condition else {
+            let Some(Condition {
+                values,
+                null,
+                exact,
+            }) = condition
+            else {
                 continue;
             };
             let every = values.0 == [[0, key.max()]];
@@ -596,7 +624,7 @@ impl KeyFilter {
                 _ => {}
             }
             // a hash tells only that a key may be one of the values
-            filter.exact &= !key.hashed || values.0.is_empty() || every;
+            filter.exact &= exact && (!key.hashed || values.0.is_empty() || every);
             if let (false, false, Some(Summary::Bounds)) = (every, null, key.summary) {
                 filter
                     .blocks
@@ -732,6 +760,23 @@ mod tests {
         assert_eq!(raw_int(-5, W8), Some((-5_i64 as u64) ^ 1 << 63));
         let xs = [i32::MIN as i64, -7, -1, 0, 1, 7, i32::MAX as i64];
         assert!(xs.map(|x| raw_int(x, W4).unwrap()).is_sorted());
+        let floats = [
+            f64::NEG_INFINITY,
+            -1.5,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            1e-300,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        assert!(floats.map(raw_f64).is_sorted() && raw_f64(-0.0) == raw_f64(0.0));
+        assert_eq!(
+            raw_f64(f64::from_bits(f64::NAN.to_bits() | 1 << 63)),
+            raw_f64(f64::NAN)
+        );
+        assert!(floats.map(|x| raw_f32(x as f32)).is_sorted() && raw_f32(-0.0) == raw_f32(0.0));
         let mut uuids = (0..64)
             .map(|_| rand::random::<[u8; 16]>())
             .collect::<Vec<_>>();
@@ -833,7 +878,11 @@ mod tests {
                                 _ => Intervals::new(vec![[0, keys.as_slice()[i].max()]]),
                             };
                             let null = rand::random::<bool>();
-                            (constrained >> i & 1 != 0).then_some(Condition { values, null })
+                            (constrained >> i & 1 != 0).then_some(Condition {
+                                values,
+                                null,
+                                exact: true,
+                            })
                         })
                         .collect::<Vec<_>>();
                     let filter = KeyFilter::new(keys, conditions.clone()).unwrap();
@@ -865,6 +914,7 @@ mod tests {
             Some(Condition {
                 values: Intervals::new(values),
                 null,
+                exact: true,
             })
         };
         assert!(KeyFilter::new(&all[0], vec![condition(vec![], false)]).is_none());
@@ -974,6 +1024,7 @@ mod tests {
             let condition = |values| Condition {
                 values,
                 null: false,
+                exact: true,
             };
             let sets = [
                 Some(condition(Intervals::points(

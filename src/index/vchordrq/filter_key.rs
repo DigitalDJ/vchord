@@ -11,7 +11,8 @@
 use crate::index::storage::PostgresRelation;
 use pgrx::pg_sys::{self, BuiltinOid, Datum};
 use vchordrq::keys::{
-    Condition, Intervals, Key, Keys, Summary, Width, fold, hash_int, hash_uuid, raw_int, raw_uuid,
+    Condition, Intervals, Key, Keys, Summary, Width, fold, hash_int, hash_uuid, raw_f32, raw_f64,
+    raw_int, raw_uuid,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,32 +21,64 @@ pub enum Type {
     Int2,
     Int4,
     Int8,
+    Date,
+    Timestamp,
+    Timestamptz,
+    Oid,
+    Bool,
+    Float4,
+    Float8,
+    Enum,
 }
+
+/// A day, in the unit of timestamps.
+const DAY: i64 = 86_400_000_000;
 
 impl Type {
     pub fn width(self) -> Width {
         match self {
+            Self::Int2 | Self::Bool => Width::W2,
+            Self::Int4 | Self::Date | Self::Oid | Self::Float4 | Self::Enum => Width::W4,
+            Self::Int8 | Self::Timestamp | Self::Timestamptz | Self::Float8 => Width::W8,
             Self::Uuid => Width::W16,
-            Self::Int2 => Width::W2,
-            Self::Int4 => Width::W4,
-            Self::Int8 => Width::W8,
         }
     }
 
     fn of_oid(oid: pg_sys::Oid) -> Option<Self> {
-        match BuiltinOid::from_u32(oid.to_u32()).ok()? {
-            BuiltinOid::UUIDOID => Some(Self::Uuid),
-            BuiltinOid::INT2OID => Some(Self::Int2),
-            BuiltinOid::INT4OID => Some(Self::Int4),
-            BuiltinOid::INT8OID => Some(Self::Int8),
-            _ => None,
-        }
+        use BuiltinOid::*;
+        Some(match BuiltinOid::from_u32(oid.to_u32()).ok()? {
+            UUIDOID => Self::Uuid,
+            INT2OID => Self::Int2,
+            INT4OID => Self::Int4,
+            INT8OID => Self::Int8,
+            DATEOID => Self::Date,
+            TIMESTAMPOID => Self::Timestamp,
+            TIMESTAMPTZOID => Self::Timestamptz,
+            OIDOID => Self::Oid,
+            BOOLOID => Self::Bool,
+            FLOAT4OID => Self::Float4,
+            FLOAT8OID => Self::Float8,
+            ANYENUMOID => Self::Enum,
+            _ => return None,
+        })
     }
 
-    /// Where `datum`, of type `self`, lies among the stored forms of `key`.
-    unsafe fn bound(self, datum: Datum, key: &Key) -> Bound {
-        match self {
-            Self::Uuid => {
+    /// Where `datum`, of type `self`, lies among the stored forms of `key`, of type `column`.
+    unsafe fn bound(self, datum: Datum, column: Type, key: &Key) -> Bound {
+        use Type::*;
+        let int = |x: i64| match raw_int(x, key.width) {
+            Some(stored) => Bound::At(stored as u128),
+            None if x < 0 => Bound::Below,
+            None => Bound::Above,
+        };
+        // from `x - d` to `x + d`, a day number or a time far inside the range of `key`
+        let within = |x: i64, d: i64| {
+            let raw = |x| raw_int(x, key.width).expect("a date or a time in range") as u128;
+            Bound::Within(raw(x.saturating_sub(d)), raw(x.saturating_add(d)))
+        };
+        let value = datum.value();
+        match (self, column) {
+            (Uuid, _) => {
                 let bytes = unsafe { &*datum.cast_mut_ptr::<[u8; 16]>() };
                 Bound::At(if key.hashed {
                     fold(hash_uuid(bytes), key.width) as u128
@@ -53,19 +86,61 @@ impl Type {
                     raw_uuid(bytes)
                 })
             }
-            Self::Int2 | Self::Int4 | Self::Int8 => {
+            (Int2 | Int4 | Int8, _) => {
                 let x = match self {
-                    Self::Int2 => datum.value() as i16 as i64,
-                    Self::Int4 => datum.value() as i32 as i64,
-                    _ => datum.value() as i64,
+                    Int2 => value as i16 as i64,
+                    Int4 => value as i32 as i64,
+                    _ => value as i64,
                 };
-                if key.hashed {
-                    return Bound::At(fold(hash_int(x), key.width) as u128);
+                match key.hashed {
+                    true => Bound::At(fold(hash_int(x), key.width) as u128),
+                    false => int(x),
                 }
-                match raw_int(x, key.width) {
-                    Some(stored) => Bound::At(stored as u128),
-                    None if x < 0 => Bound::Below,
-                    None => Bound::Above,
+            }
+            (Oid | Enum, _) => Bound::At(value as u32 as u128),
+            (Bool, _) => Bound::At((value != 0) as u128),
+            (Float4, Float8) => Bound::At(raw_f64(f32::from_bits(value as u32) as f64) as u128),
+            (Float4, _) => Bound::At(raw_f32(f32::from_bits(value as u32)) as u128),
+            (Float8, Float4) => {
+                let x = f64::from_bits(value as u64);
+                // the greatest float4 not above `x`
+                let below = match x as f32 {
+                    y if y as f64 > x => y.next_down(),
+                    y => y,
+                };
+                match x.is_nan() || below as f64 == x {
+                    true => Bound::At(raw_f32(x as f32) as u128),
+                    false => Bound::After(raw_f32(below) as u128),
+                }
+            }
+            (Float8, _) => Bound::At(raw_f64(f64::from_bits(value as u64)) as u128),
+            (Date, column) => {
+                let x = value as i32;
+                let infinite = x == i32::MIN || x == i32::MAX;
+                let time = match infinite {
+                    true => [i64::MIN, i64::MAX][(x > 0) as usize],
+                    // a date past every timestamp still orders below 'infinity'
+                    false => (x as i64).saturating_mul(DAY).min(i64::MAX - 1),
+                };
+                match column {
+                    Date => int(x as i64),
+                    Timestamp => int(time),
+                    _ if infinite => int(time),
+                    _ => within(time, DAY),
+                }
+            }
+            (Timestamp | Timestamptz, column) => {
+                let x = value as i64;
+                let infinite = x == i64::MIN || x == i64::MAX;
+                match column {
+                    Date if infinite => Bound::Within(0, key.max()),
+                    Date if self == Timestamptz => within(x.div_euclid(DAY), 1),
+                    Date => match x.rem_euclid(DAY) {
+                        0 => int(x / DAY),
+                        _ => Bound::After(raw_int(x.div_euclid(DAY), key.width).unwrap() as u128),
+                    },
+                    _ if column == self || infinite => int(x),
+                    _ => within(x, DAY),
                 }
             }
         }
@@ -77,6 +152,10 @@ impl Type {
 enum Bound {
     Below,
     At(u128),
+    /// Between a stored form and the next.
+    After(u128),
+    /// Somewhere from one stored form to another: the rows are rechecked.
+    Within(u128, u128),
     Above,
 }
 
@@ -90,10 +169,11 @@ fn interval(strategy: u16, bound: Bound, max: u128) -> Option<[u128; 2]> {
     const GREATER: u16 = pg_sys::BTGreaterStrategyNumber as u16;
     match (strategy, bound) {
         (LESS, At(x)) => x.checked_sub(1).map(|x| [0, x]),
-        (LESS_EQUAL, At(x)) => Some([0, x]),
+        (LESS_EQUAL, At(x)) | (LESS | LESS_EQUAL, After(x) | Within(_, x)) => Some([0, x]),
         (EQUAL, At(x)) => Some([x, x]),
-        (GREATER_EQUAL, At(x)) => Some([x, max]),
-        (GREATER, At(x)) => (x < max).then(|| [x + 1, max]),
+        (EQUAL, Within(x, y)) => Some([x, y]),
+        (GREATER_EQUAL, At(x)) | (GREATER | GREATER_EQUAL, Within(x, _)) => Some([x, max]),
+        (GREATER, At(x)) | (GREATER | GREATER_EQUAL, After(x)) => (x < max).then(|| [x + 1, max]),
         (LESS | LESS_EQUAL, Above) | (GREATER_EQUAL | GREATER, Below) => Some([0, max]),
         _ => None,
     }
@@ -216,7 +296,7 @@ impl<'a> FilterKeys<'a> {
                     nulls |= 1 << i;
                     0
                 } else {
-                    match self.ty(i).bound(values.add(i + 1).read(), key) {
+                    match self.ty(i).bound(values.add(i + 1).read(), self.ty(i), key) {
                         Bound::At(stored) => stored,
                         _ => unreachable!("a key out of the range of its own type"),
                     }
@@ -238,54 +318,65 @@ impl<'a> FilterKeys<'a> {
         if flag(pg_sys::SK_ISNULL) {
             let values = flag(pg_sys::SK_SEARCHNOTNULL).then_some([0, key.max()]);
             let values = Intervals::new(values.into_iter().collect());
-            return Condition { values, null };
+            return Condition {
+                values,
+                null,
+                exact: true,
+            };
         }
-        let values = unsafe { self.values(column, key, scan_key) };
-        Condition { values, null }
-    }
-
-    unsafe fn values(&self, column: Type, key: &Key, scan_key: &pg_sys::ScanKeyData) -> Intervals {
-        // the right type of the operator, which differs for `int4 = int8`
-        let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
-        let accepts = |datum| {
-            interval(
-                scan_key.sk_strategy,
-                unsafe { ty.bound(datum, key) },
-                key.max(),
-            )
+        let mut exact = true;
+        let mut accepts = |datum| {
+            // the right type of the operator, which differs for `int4 = int8`
+            let ty = Type::of_oid(scan_key.sk_subtype).unwrap_or(column);
+            let bound = unsafe { ty.bound(datum, column, key) };
+            exact &= !matches!(bound, Bound::Within(..));
+            interval(scan_key.sk_strategy, bound, key.max())
         };
-        if scan_key.sk_flags & pg_sys::SK_SEARCHARRAY as i32 == 0 {
-            return Intervals::new(accepts(scan_key.sk_argument).into_iter().collect());
+        let values = unsafe { values(scan_key, &mut accepts) };
+        Condition {
+            values,
+            null,
+            exact,
         }
-        unsafe {
-            let datum = scan_key.sk_argument.cast_mut_ptr::<pg_sys::varlena>();
-            let array = pg_sys::pg_detoast_datum(datum).cast::<pg_sys::ArrayType>();
-            let elemtype = (*array).elemtype;
-            let (mut typlen, mut typbyval, mut typalign) = (0, false, 0);
-            pg_sys::get_typlenbyvalalign(elemtype, &mut typlen, &mut typbyval, &mut typalign);
-            let mut elements = std::ptr::null_mut();
-            let mut nulls = std::ptr::null_mut();
-            let mut n = 0;
-            pg_sys::deconstruct_array(
-                array,
-                elemtype,
-                typlen as _,
-                typbyval,
-                typalign,
-                &mut elements,
-                &mut nulls,
-                &mut n,
-            );
-            let accepted = (0..n as usize)
-                .filter(|&i| !nulls.add(i).read())
-                .filter_map(|i| accepts(elements.add(i).read()))
-                .collect::<Vec<_>>();
-            pg_sys::pfree(elements.cast());
-            pg_sys::pfree(nulls.cast());
-            if array.cast() != datum {
-                pg_sys::pfree(array.cast());
-            }
-            Intervals::new(accepted)
+    }
+}
+
+/// The stored forms a scan key accepts, by what `accepts` makes of its constant or of each element.
+unsafe fn values(
+    scan_key: &pg_sys::ScanKeyData,
+    accepts: &mut impl FnMut(Datum) -> Option<[u128; 2]>,
+) -> Intervals {
+    if scan_key.sk_flags & pg_sys::SK_SEARCHARRAY as i32 == 0 {
+        return Intervals::new(accepts(scan_key.sk_argument).into_iter().collect());
+    }
+    unsafe {
+        let datum = scan_key.sk_argument.cast_mut_ptr::<pg_sys::varlena>();
+        let array = pg_sys::pg_detoast_datum(datum).cast::<pg_sys::ArrayType>();
+        let elemtype = (*array).elemtype;
+        let (mut typlen, mut typbyval, mut typalign) = (0, false, 0);
+        pg_sys::get_typlenbyvalalign(elemtype, &mut typlen, &mut typbyval, &mut typalign);
+        let mut elements = std::ptr::null_mut();
+        let mut nulls = std::ptr::null_mut();
+        let mut n = 0;
+        pg_sys::deconstruct_array(
+            array,
+            elemtype,
+            typlen as _,
+            typbyval,
+            typalign,
+            &mut elements,
+            &mut nulls,
+            &mut n,
+        );
+        let accepted = (0..n as usize)
+            .filter(|&i| !nulls.add(i).read())
+            .filter_map(|i| accepts(elements.add(i).read()))
+            .collect::<Vec<_>>();
+        pg_sys::pfree(elements.cast());
+        pg_sys::pfree(nulls.cast());
+        if array.cast() != datum {
+            pg_sys::pfree(array.cast());
         }
+        Intervals::new(accepted)
     }
 }
