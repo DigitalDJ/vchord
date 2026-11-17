@@ -14,6 +14,7 @@ use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use index_accessor::Accessor1;
 use std::marker::PhantomData;
 use std::num::NonZero;
+use std::ops::Range;
 
 /// Writes a new tape page by page.
 ///
@@ -220,10 +221,12 @@ pub fn read_h1_tape<'b, R, A, T>(
 
 /// Selects the rows a tape reader passes on; `()` selects every row.
 pub trait Filter: Copy {
-    /// Whether to read only the blocks that [`Filter::ranges`] selects ([`plan`]).
+    /// Whether to read only the blocks that [`Filter::meets`] selects ([`plan`]).
     fn selects_blocks(self) -> bool;
-    /// The blocks whose first-key range meets the filter.
-    fn ranges(self, ranges: &[u32; 32]) -> u32;
+    /// The blocks that may meet the filter: no other does.
+    fn span(self, summaries: Summaries<'_>) -> Range<usize>;
+    /// The blocks of `blocks`, within one word, whose summaries meet the filter, a bit each.
+    fn meets(self, summaries: Summaries<'_>, blocks: Range<usize>) -> u32;
     /// The rows of a frozen block to pass on.
     fn block(self, columns: &[u8]) -> u32;
     fn row(self, columns: Columns<'_>) -> bool;
@@ -236,7 +239,12 @@ impl Filter for () {
     }
 
     #[inline(always)]
-    fn ranges(self, _: &[u32; 32]) -> u32 {
+    fn span(self, summaries: Summaries<'_>) -> Range<usize> {
+        0..summaries.blocks()
+    }
+
+    #[inline(always)]
+    fn meets(self, _: Summaries<'_>, _: Range<usize>) -> u32 {
         u32::MAX
     }
 
@@ -372,29 +380,91 @@ pub fn read_frozen_tape<'b, R, A, T>(
 /// Marks a page's first block as begun on an earlier page.
 pub const CONTINUED: u32 = 1 << 31;
 
+/// Marks a layout whose first summary's words never decrease from block to block.
+pub const SORTED: u32 = 1 << 31;
+
+/// A summary's word, from its low and its high half.
+#[inline(always)]
+pub fn wide([lo, hi]: [u32; 2]) -> u64 {
+    lo as u64 | (hi as u64) << 32
+}
+
+/// Per summarized key, every block's first summary word, then every block's second.
+#[derive(Debug, Clone, Copy)]
+pub struct Summaries<'a> {
+    words: &'a [[u32; 2]],
+    blocks: usize,
+    sorted: bool,
+}
+
+impl<'a> Summaries<'a> {
+    pub fn new(words: &'a [u32], blocks: usize, sorted: bool) -> Self {
+        let words = words.as_chunks().0;
+        Self {
+            words,
+            blocks,
+            sorted,
+        }
+    }
+    #[inline(always)]
+    pub fn blocks(self) -> usize {
+        self.blocks
+    }
+    /// Whether the first summary's words never decrease from block to block.
+    #[inline(always)]
+    pub fn sorted(self) -> bool {
+        self.sorted
+    }
+    /// Word `i` of every block's summary of the `k`-th summarized key.
+    #[inline(always)]
+    pub fn words(self, k: usize, i: usize) -> &'a [[u32; 2]] {
+        &self.words[(2 * k + i) * self.blocks..][..self.blocks]
+    }
+}
+
 /// The page ids and the layout of a frozen tape, as its pages and tuples are read.
 #[derive(Debug, Default)]
 pub struct Layout {
     pub ids: Vec<u32>,
     firsts: Vec<u32>,
-    ranges: Vec<u32>,
+    /// Per summarized key, per block, its summary.
+    summaries: Vec<Vec<[u64; 2]>>,
+    blocks: u32,
     continued: bool,
 }
 
 impl Layout {
+    pub fn new(summaries: usize) -> Self {
+        Self {
+            summaries: vec![Vec::new(); summaries],
+            ..Default::default()
+        }
+    }
     pub fn page(&mut self, id: u32) {
         let continued = if self.continued { CONTINUED } else { 0 };
         self.ids.push(id);
-        self.firsts.push(self.ranges.len() as u32 | continued);
+        self.firsts.push(self.blocks | continued);
     }
-    /// A block's last part with its range, or `None` for a part before it.
-    pub fn tuple(&mut self, range: Option<u32>) {
-        self.continued = range.is_none();
-        self.ranges.extend(range);
+    /// A block's last part with its summaries, or `None` for a part before it.
+    pub fn tuple(&mut self, summaries: Option<impl IntoIterator<Item = [u64; 2]>>) {
+        self.continued = summaries.is_none();
+        if let Some(summaries) = summaries {
+            std::iter::zip(&mut self.summaries, summaries).for_each(|(x, y)| x.push(y));
+            self.blocks += 1;
+        }
     }
-    /// The words that follow the page ids in the directory.
+    /// The words after the page ids: per page its first block, the block count, then the summaries.
     pub fn words(&self) -> Vec<u32> {
-        [self.firsts.as_slice(), self.ranges.as_slice()].concat()
+        let sorted = (self.summaries.first())
+            .is_some_and(|x| x.is_sorted_by(|a, b| a[0] <= b[0] && a[1] <= b[1]));
+        let mut words = self.firsts.clone();
+        words.push(self.blocks | if sorted { SORTED } else { 0 });
+        for summaries in &self.summaries {
+            let word =
+                |i: usize| (summaries.iter()).flat_map(move |x| [x[i] as u32, (x[i] >> 32) as u32]);
+            words.extend(word(0).chain(word(1)));
+        }
+        words
     }
 }
 
@@ -445,27 +515,32 @@ where
 /// The pages to read and their selected blocks, or `None` to read every page.
 fn plan(words: &mut [u32], pages: usize, filter: impl Filter) -> Option<usize> {
     let (ids, layout) = words.split_at_mut(pages);
-    let (firsts, ranges) = layout.split_at_mut_checked(pages)?;
-    let blocks = ranges.len();
-    let masks = select_blocks(filter, ranges);
+    let (firsts, rest) = layout.split_at_mut_checked(pages)?;
+    let &header = rest.first()?;
+    let blocks = (header & !SORTED) as usize;
+    let masks = select_blocks(filter, rest, blocks, header & SORTED != 0);
     if masks.iter().map(|x| x.count_ones() as usize).sum::<usize>() == blocks {
         return None;
     }
     Some(select_pages(ids, firsts, masks, blocks))
 }
 
-/// Replaces the ranges with the bitmask of the blocks `filter` selects, a word per 32 blocks.
-fn select_blocks(filter: impl Filter, ranges: &mut [u32]) -> &[u32] {
-    let n = ranges.len().div_ceil(32);
+/// Replaces the block count and the summaries with the bitmask of the blocks `filter` selects.
+fn select_blocks(filter: impl Filter, rest: &mut [u32], blocks: usize, sorted: bool) -> &[u32] {
+    let span = filter.span(Summaries::new(&rest[1..], blocks, sorted));
+    let n = blocks.div_ceil(32);
     for i in 0..n {
-        // word `i` is written once the chunk `i` that holds it is read
-        let chunk = &ranges[32 * i..ranges.len().min(32 * (i + 1))];
-        let len = chunk.len();
-        let mut padded = [crate::keys::EMPTY_RANGE; 32];
-        padded[..len].copy_from_slice(chunk);
-        ranges[i] = filter.ranges(&padded) & u32::MAX >> (32 - len);
+        let word = span.start.max(32 * i)..span.end.min(32 * i + 32);
+        let mask = if word.is_empty() {
+            0
+        } else {
+            let bits = u32::MAX >> (32 - word.len()) << (word.start % 32);
+            filter.meets(Summaries::new(&rest[1..], blocks, sorted), word) & bits
+        };
+        // word `i` is written once its blocks are read; later blocks' summaries lie past it
+        rest[i] = mask;
     }
-    &ranges[..n]
+    &rest[..n]
 }
 
 /// Keeps the pages that hold a selected block's part, in place; returns how many.
@@ -606,16 +681,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keys::KeyFilter;
+    use crate::keys::{Condition, Intervals, KeyFilter, Keys, Summary, Width};
 
-    fn filter(keys: Vec<u16>) -> KeyFilter {
-        let set = keys.into_iter().map(u128::from).collect();
-        let keys = crate::keys::Keys::new([(crate::keys::Width::W2, true)]);
-        KeyFilter::new(&keys, vec![Some(set)]).unwrap()
+    fn filter(points: Vec<u64>) -> KeyFilter {
+        let keys = Keys::new([(Width::W8, false, Some(Summary::Bounds))]);
+        let values = Intervals::points(points.into_iter().map(u128::from).collect());
+        KeyFilter::new(
+            &keys,
+            vec![Some(Condition {
+                values,
+                null: false,
+                exact: true,
+            })],
+        )
+        .unwrap()
     }
 
-    /// Per page, its tuples as (block, whether the block's last), and the blocks' sorted ranges.
-    fn tape() -> (Vec<Vec<(usize, bool)>>, Vec<u32>) {
+    /// Per page, its tuples as (block, whether the block's last), and the blocks' zone maps.
+    fn tape(sorted: bool) -> (Vec<Vec<(usize, bool)>>, Vec<[u64; 2]>) {
         let blocks = rand::random::<u32>() as usize % 100;
         let mut pages = vec![Vec::new()];
         for j in 0..blocks {
@@ -627,22 +710,24 @@ mod tests {
                 pages.last_mut().unwrap().push((j, k == n - 1));
             }
         }
-        let mut tags = (0..2 * blocks)
-            .map(|_| rand::random::<u16>() % 1000)
+        let mut bounds = (0..2 * blocks)
+            .map(|_| rand::random::<u64>() % 1000)
             .collect::<Vec<_>>();
-        tags.sort_unstable();
-        let ranges = (0..blocks)
-            .map(|j| tags[2 * j] as u32 | (tags[2 * j + 1] as u32) << 16)
+        if sorted {
+            bounds.sort_unstable();
+        }
+        let zones = (bounds.chunks(2))
+            .map(|x| [x[0].min(x[1]), x[0].max(x[1])])
             .collect();
-        (pages, ranges)
+        (pages, zones)
     }
 
-    fn directory(pages: &[Vec<(usize, bool)>], ranges: &[u32], layout: bool) -> Vec<u32> {
-        let mut x = Layout::default();
+    fn directory(pages: &[Vec<(usize, bool)>], zones: &[[u64; 2]], layout: bool) -> Vec<u32> {
+        let mut x = Layout::new(1);
         for (i, page) in pages.iter().enumerate() {
             x.page(7000 + i as u32);
             for &(j, last) in page {
-                x.tuple(last.then(|| ranges[j]));
+                x.tuple(last.then(|| [zones[j]]));
             }
         }
         let mut words = x.ids.clone();
@@ -654,29 +739,29 @@ mod tests {
 
     #[test]
     fn layout() {
-        for _ in 0..256 {
-            let (pages, ranges) = tape();
-            let wanted = (0..1 + rand::random::<u32>() % 4)
-                .map(|_| rand::random::<u16>() % 1000)
+        for i in 0..512 {
+            let (pages, zones) = tape(i % 2 == 0);
+            let wanted = (0..1 + rand::random::<u32>() % 12)
+                .map(|_| rand::random::<u64>() % 1000)
                 .collect::<Vec<_>>();
             let filter = filter(wanted.clone());
-            let meets = |r: u32| {
-                let (min, max) = (r as u16, (r >> 16) as u16);
-                wanted.iter().any(|&t| min <= t && t <= max)
-            };
-            let mut words = directory(&pages, &ranges, true);
+            let meets = |[min, max]: [u64; 2]| wanted.iter().any(|&t| min <= t && t <= max);
+            let mut words = directory(&pages, &zones, true);
             let n = pages.len();
+            if i % 2 == 0 {
+                assert!(words[2 * n] & SORTED != 0);
+            }
             let Some(kept) = plan(&mut words, n, &filter) else {
-                assert!(ranges.iter().all(|&r| meets(r)));
+                assert!(zones.iter().all(|&r| meets(r)));
                 continue;
             };
             let (ids, layout) = words.split_at(n);
             let (firsts, masks) = layout.split_at(n);
-            for (j, &r) in ranges.iter().enumerate() {
+            for (j, &r) in zones.iter().enumerate() {
                 assert_eq!(masks[j / 32] >> (j % 32) & 1 != 0, meets(r));
             }
             let expected = (0..n)
-                .filter(|&i| pages[i].iter().any(|&(j, _)| meets(ranges[j])))
+                .filter(|&i| pages[i].iter().any(|&(j, _)| meets(zones[j])))
                 .map(|i| 7000 + i as u32)
                 .collect::<Vec<_>>();
             assert_eq!(&ids[..kept], expected);
@@ -693,13 +778,13 @@ mod tests {
     #[test]
     fn layout_all() {
         for _ in 0..64 {
-            let (pages, ranges) = tape();
+            let (pages, zones) = tape(true);
             let n = pages.len();
-            let some = filter(vec![rand::random::<u16>() % 1000]);
-            let mut words = directory(&pages, &ranges, false);
+            let some = filter(vec![rand::random::<u64>() % 1000]);
+            let mut words = directory(&pages, &zones, false);
             assert_eq!(plan(&mut words, n, &some), None);
             let all = filter((0..1000).collect());
-            let mut words = directory(&pages, &ranges, true);
+            let mut words = directory(&pages, &zones, true);
             assert_eq!(plan(&mut words, n, &all), None);
         }
     }

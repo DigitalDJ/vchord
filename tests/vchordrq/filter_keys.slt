@@ -42,7 +42,7 @@ statement ok
 ALTER TABLE fk SET (parallel_workers = 2);
 
 statement ok
-CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fk_v ON fk USING vchordrq (v vector_l2_ops, owner uuid_hash_ops (bytes = 2)) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [32]
@@ -55,7 +55,7 @@ statement ok
 ALTER TABLE fk RESET (parallel_workers);
 
 query T
-SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner uuid_ops (bytes=''2''))%';
+SELECT pg_get_indexdef('fk_v'::regclass) LIKE '%USING vchordrq (v vector_l2_ops, owner uuid_hash_ops (bytes=''2''))%';
 ----
 t
 
@@ -278,7 +278,7 @@ t
 statement ok
 ROLLBACK;
 
-statement error operator class "uuid_ops" does not accept data type text
+statement error operator class "uuid_hash_ops" does not accept data type text
 ALTER TABLE fk ALTER COLUMN owner TYPE text USING owner::text;
 
 statement ok
@@ -287,26 +287,29 @@ DROP INDEX fk_v, fk_g;
 statement ok
 RESET vchordrq.probes;
 
-statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+statement error invalid value for option "bytes": 3, not 2, 4 or 8
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 3));
+
+statement error operator class public.uuid_ops has no options
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 4));
 
 statement error value 4 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i2 int2_ops (bytes = 4));
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i4 int4_hash_ops (bytes = 4));
 
-statement error value 8 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i4 int4_ops (bytes = 8));
+statement error value 16 out of bounds for option "bytes"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 16));
 
-statement error value 32 out of bounds for option "bytes"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 32));
+statement error operator class "int2_hash_ops" does not exist for access method "vchordrq"
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, i2 int2_hash_ops);
 
 statement error unrecognized parameter "width"
-CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (width = 4));
+CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (width = 4));
 
 statement error vector_l2_ops has no options
 CREATE INDEX ON fk USING vchordrq (v vector_l2_ops (bytes = 4), u);
 
-statement error invalid value for option "bytes": 3, not 2, 4, 8 or 16
-CREATE INDEX CONCURRENTLY fk_bad ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 3));
+statement error invalid value for option "bytes": 3, not 2, 4 or 8
+CREATE INDEX CONCURRENTLY fk_bad ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 3));
 
 query I
 SELECT count(*) FROM pg_class WHERE relname = 'fk_bad';
@@ -325,7 +328,7 @@ INSERT INTO fw SELECT i, ARRAY[i % 7, i % 11, i % 13]::real[]::vector,
   ('00000000-0000-0000-0000-' || lpad((i % 9)::text, 12, '0'))::uuid, gen_random_uuid()
 FROM generate_series(1, 20) i;
 
-statement error filter keys of 224 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
+statement error filter keys of 228 bytes per row do not fit: an index of 3 dimensions holds at most 220 bytes per row
 CREATE INDEX ON fw USING vchordrq (v vector_l2_ops, k1, k2, k3, k4, k5, k6, k7, k8, k9, k10, k11, k12, k13, k14);
 
 statement ok
@@ -404,7 +407,7 @@ SELECT fk_subsets(ARRAY['u = ANY(''{00000000-0000-0000-0000-000000000007,0000000
 ----
 all equal
 
-# Keys are whole by default and recheck only for NULL's stored form, zeros: the least integer, the nil uuid.
+# Whole keys need no recheck: the NULL mask tells a NULL from a stored form of zeros.
 query T
 SELECT fk_recheck('u = ''00000000-0000-0000-0000-000000000007'' AND i4 = 207');
 ----
@@ -418,7 +421,12 @@ SELECT fk_recheck('i2 = 57') || ', ' || fk_same('i2 = 57');
 query T
 SELECT fk_recheck('i2 = -32768') || ', ' || fk_same('i2 = -32768');
 ----
-0 returned, 300 removed by the recheck, true
+0 returned, 0 removed by the recheck, true
+
+query T
+SELECT fk_recheck('i2 IS NULL') || ', ' || fk_same('i2 IS NULL') || ', ' || fk_same('i2 IS NOT NULL AND i4 = 207');
+----
+300 returned, 0 removed by the recheck, true, true
 
 query T
 SELECT fk_recheck('i4 = 4294967503::int8') || ', ' || fk_same('i4 = 4294967503::int8');
@@ -483,9 +491,9 @@ INSERT INTO fk (id, u, i4, v) SELECT i, ('00000000-0000-0000-0000-' || lpad((i %
   ARRAY[0.5, 0.5, 0.5]::real[]::vector FROM generate_series(31001, 31010) i;
 
 query T
-SELECT fk_recheck('i4 = -2147483648');
+SELECT fk_recheck('i4 = -2147483648') || ', ' || fk_recheck('i4 IS NULL');
 ----
-0 returned, 10 removed by the recheck
+0 returned, 0 removed by the recheck, 10 returned, 0 removed by the recheck
 
 query T
 SELECT fk_recheck('i4 = 5000') || ', ' || fk_same('i4 = 5000') || ', ' || fk_same('i4 = ANY(''{-2147483648,5000}'')');
@@ -512,8 +520,8 @@ statement ok
 DROP INDEX fk_whole;
 
 statement ok
-CREATE INDEX fk_hashed ON fk USING vchordrq (v vector_l2_ops, i8 int8_ops (bytes = 4), un uuid_ops (bytes = 8), i4 int4_ops (bytes = 2),
-  u uuid_ops (bytes = 2)) WITH (options = $$
+CREATE INDEX fk_hashed ON fk USING vchordrq (v vector_l2_ops, i8 int8_hash_ops, un uuid_hash_ops (bytes = 8), i4 int4_hash_ops,
+  u uuid_hash_ops (bytes = 2)) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [16]

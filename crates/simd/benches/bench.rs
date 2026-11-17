@@ -206,38 +206,28 @@ fn column_matches(c: &mut Criterion) {
     column_bench(c, "u128", rand::random::<[u64; 2]>);
 }
 
-fn column_meets(c: &mut Criterion) {
-    use rand::RngExt;
-    let mut rng = rand::rng();
-    let ranges = std::array::from_fn::<u32, 32, _>(|_| {
-        let min = rng.random::<u16>();
-        min as u32 | (min.saturating_add(rng.random::<u8>() as u16) as u32) << 16
+fn column_between_bench<T: simd::column::Value>(
+    c: &mut Criterion,
+    name: &str,
+    random: impl Fn() -> T,
+) {
+    let column = std::array::from_fn::<T, 32, _>(|_| random());
+    let (x, y) = (random(), random());
+    let (lo, hi) = if x.ordinal() <= y.ordinal() {
+        (x, y)
+    } else {
+        (y, x)
+    };
+    c.bench_function(&format!("column::between::{name}"), |b| {
+        b.iter(|| T::between(black_box(&column), lo, hi))
     });
-    let keys = (0..32).map(|_| rng.random::<u16>()).collect::<Vec<_>>();
-    for n in [1, 4, 16, 32] {
-        let keys = &keys[..n];
-        #[cfg(target_arch = "x86_64")]
-        if simd::is_cpu_detected!("v4") {
-            c.bench_function(&format!("column::meets::v4/{n}"), |b| {
-                b.iter(|| unsafe { simd::column::meets::meets_v4(&ranges, keys) })
-            });
-        }
-        #[cfg(target_arch = "x86_64")]
-        if simd::is_cpu_detected!("v3") {
-            c.bench_function(&format!("column::meets::v3/{n}"), |b| {
-                b.iter(|| unsafe { simd::column::meets::meets_v3(&ranges, keys) })
-            });
-        }
-        #[cfg(target_arch = "aarch64")]
-        if simd::is_cpu_detected!("a2") {
-            c.bench_function(&format!("column::meets::a2/{n}"), |b| {
-                b.iter(|| unsafe { simd::column::meets::meets_a2(&ranges, keys) })
-            });
-        }
-        c.bench_function(&format!("column::meets/{n}"), |b| {
-            b.iter(|| simd::column::meets(&ranges, keys))
-        });
-    }
+}
+
+fn column_between(c: &mut Criterion) {
+    column_between_bench(c, "u16", rand::random::<u16>);
+    column_between_bench(c, "u32", rand::random::<u32>);
+    column_between_bench(c, "u64", rand::random::<u64>);
+    column_between_bench(c, "u128", rand::random::<[u64; 2]>);
 }
 
 criterion_group!(
@@ -246,6 +236,6 @@ criterion_group!(
     quantize,
     byte,
     column_matches,
-    column_meets
+    column_between
 );
 criterion_main!(benches);

@@ -9,7 +9,7 @@ INSERT INTO fc_any SELECT i, i % 10, ('00000000-0000-0000-0000-' || lpad((i % 7)
 FROM generate_series(1, 5000) i;
 
 statement ok
-CREATE INDEX fc_any_v ON fc_any USING vchordrq (v vector_l2_ops, a, b uuid_ops (bytes = 16)) WITH (options = $$
+CREATE INDEX fc_any_v ON fc_any USING vchordrq (v vector_l2_ops, a, b uuid_ops) WITH (options = $$
 residual_quantization = true
 [build.internal]
 lists = [4]

@@ -223,8 +223,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     index_info: *mut pgrx::pg_sys::IndexInfo,
 ) -> *mut pgrx::pg_sys::IndexBuildResult {
     use validator::Validate;
-    let keys = unsafe { of_options(index_relation) };
-    let (vector_options, vchordrq_options) = unsafe { options(index_relation, &keys) };
+    let (vector_options, vchordrq_options, keys) = unsafe { options(index_relation) };
     if let Err(errors) = Validate::validate(&vector_options) {
         report_invalid_options(errors);
     }
@@ -994,8 +993,7 @@ unsafe fn parallel_build(
         )
     };
     let opfamily = unsafe { opfamily(index_relation) };
-    let keys = unsafe { of_options(index_relation) };
-    let keys = FilterKeys::new(index_relation, &keys);
+    let keys = unsafe { FilterKeys::of_index(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
     struct IdChooser(u32);
@@ -1279,8 +1277,7 @@ pub unsafe extern "C-unwind" fn ambuildempty(_index_relation: pgrx::pg_sys::Rela
 
 unsafe fn options(
     index_relation: pgrx::pg_sys::Relation,
-    keys: &vchordrq::keys::Keys,
-) -> (VectorOptions, VchordrqIndexingOptions) {
+) -> (VectorOptions, VchordrqIndexingOptions, vchordrq::keys::Keys) {
     let att = unsafe { &mut *(*index_relation).rd_att };
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
     let atts = unsafe { att.attrs.as_slice(att.natts as _) };
@@ -1323,6 +1320,16 @@ unsafe fn options(
         v: opfamily.vector_kind(),
         d: opfamily.distance_kind(),
     };
+    // get indexing options
+    let indexing_options = {
+        let reloption = unsafe { (*index_relation).rd_options as *const Reloption };
+        let s = unsafe { Reloption::options(reloption, c"") }.to_string_lossy();
+        match toml::from_str::<VchordrqIndexingOptions>(&s) {
+            Ok(p) => p,
+            Err(e) => pgrx::error!("failed to parse options: {}", e),
+        }
+    };
+    let keys = unsafe { of_options(index_relation, indexing_options.index.zone_maps as usize) };
     use pgrx::pg_sys::{BLCKSZ, ItemIdData, PageHeaderData};
     let freespace = BLCKSZ as usize
         - std::mem::offset_of!(PageHeaderData, pd_linp)
@@ -1339,16 +1346,7 @@ unsafe fn options(
             most
         );
     }
-    // get indexing options
-    let indexing_options = {
-        let reloption = unsafe { (*index_relation).rd_options as *const Reloption };
-        let s = unsafe { Reloption::options(reloption, c"") }.to_string_lossy();
-        match toml::from_str::<VchordrqIndexingOptions>(&s) {
-            Ok(p) => p,
-            Err(e) => pgrx::error!("failed to parse options: {}", e),
-        }
-    };
-    (vector, indexing_options)
+    (vector, indexing_options, keys)
 }
 
 fn make_default_build(

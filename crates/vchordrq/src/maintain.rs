@@ -7,7 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
-use crate::keys::Keys;
+use crate::keys::{Columns, Keys};
 use crate::operator::Operator;
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
@@ -39,7 +39,7 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
-/// `memory`: the most bytes a list may take to be sorted by its first key.
+/// `memory`: the most bytes of a list's rows that are sorted at once by their keys.
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
@@ -58,6 +58,7 @@ where
     let freepages_first = meta_tuple.freepages_first();
     let keys = Keys::of_meta(meta_tuple);
     let keyed = !keys.is_empty();
+    let summarized = keys.summaries() != 0;
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -149,18 +150,13 @@ where
 
         let mut tuples = 0_u64;
         let mut rows = Rows::new(dim as _);
-        let mut sorting = keyed;
         let mut bytes = Vec::new();
         let mut callback = id_2(|row| {
-            if sorting {
+            if keyed {
                 rows.push(row, &keys);
+                // A list larger than `memory` is written as sorted runs.
                 if rows.bytes() > memory {
-                    for i in 0..rows.len() {
-                        let (branch, columns) = rows.branch(i);
-                        tape.push(branch, columns);
-                    }
-                    rows = Rows::new(dim as _);
-                    sorting = false;
+                    rows.flush(&keys, &mut tape);
                 }
             } else {
                 let (code, delta) = row.value;
@@ -226,10 +222,7 @@ where
             &mut callback,
         );
 
-        for i in rows.sorted() {
-            let (branch, columns) = rows.branch(i as _);
-            tape.push(branch, columns);
-        }
+        rows.flush(&keys, &mut tape);
 
         let (frozen_tape, branches, columns) = tape.into_inner();
 
@@ -255,16 +248,14 @@ where
 
         let frozen_first = { frozen_tape }.first();
 
-        let mut directory = tape::Layout::default();
+        let mut directory = tape::Layout::new(keys.summaries());
         for guard in tape::by_next(index, frozen_first) {
             directory.page(guard.id());
-            if keyed {
+            if summarized {
                 for i in 1..=guard.len() {
                     let bytes = guard.get(i).expect("data corruption");
                     directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
-                        FrozenTupleReader::_0(x) => {
-                            Some(keys.range_of_block(x.payload(), x.columns()))
-                        }
+                        FrozenTupleReader::_0(x) => Some(keys.summarize(x.payload(), x.columns())),
                         FrozenTupleReader::_1(_) => None,
                     });
                 }
@@ -273,7 +264,7 @@ where
 
         let mut directory_tape = DirectoryTapeWriter::create(&hooked_index, false);
         directory_tape.push(directory.ids.as_slice());
-        if keyed {
+        if summarized {
             directory_tape.push_layout(&directory.words());
         }
         let directory_tape = directory_tape.into_inner();
@@ -369,11 +360,9 @@ struct Fixed {
     delta: f32,
     head: u16,
     payload: NonZero<u64>,
-    /// The sort key of its first key.
-    key: u16,
 }
 
-/// A keyed list's rows, packed, to be sorted by their first key.
+/// A keyed list's rows, packed, to be sorted by their keys.
 struct Rows {
     dim: usize,
     fixed: Vec<Fixed>,
@@ -406,14 +395,12 @@ impl Rows {
     fn push(&mut self, row: tape::Row<'_, (rabitq::bit::Code, f32)>, keys: &Keys) {
         let ((m, signs), delta) = row.value;
         let metadata = [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err];
-        let key = keys.sort_key(row.columns);
         let (head, payload) = (row.head, row.payload);
         self.fixed.push(Fixed {
             metadata,
             delta,
             head,
             payload,
-            key,
         });
         // a frozen code is padded to a multiple of 4 signs, with zeros
         let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
@@ -421,11 +408,21 @@ impl Rows {
         self.prefetch.extend_from_slice(row.prefetch);
         row.columns.extend(keys, &mut self.columns);
     }
-    /// The rows in the order of their first keys, stable.
-    fn sorted(&self) -> Vec<u32> {
+    /// Writes the rows in the order of their keys, stable, and clears them.
+    fn flush<R>(&mut self, keys: &Keys, tape: &mut FrozenTapeWriter<'_, R>)
+    where
+        R: RelationWrite,
+        R::Page: Page<Opaque = Opaque>,
+    {
+        let width = keys.columns();
+        let row = |i: u32| Columns::row(&self.columns[i as usize * width..][..width]);
         let mut order = (0..self.len() as u32).collect::<Vec<_>>();
-        order.sort_unstable_by_key(|&i| (self.fixed[i as usize].key, i));
-        order
+        order.sort_unstable_by(|&i, &j| keys.cmp(row(i), row(j)).then(i.cmp(&j)));
+        for i in order {
+            let (branch, columns) = self.branch(i as _);
+            tape.push(branch, columns);
+        }
+        *self = Self::new(self.dim);
     }
     fn branch(&self, i: usize) -> (Branch<NonZero<u64>>, &[u8]) {
         let Fixed {

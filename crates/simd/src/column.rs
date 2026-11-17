@@ -6,11 +6,15 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-//! The rows of a block of 32 whose value is in a set.
+//! The rows of a block whose value is in a set or a range; values order as little-endian integers.
 
 pub trait Value: Copy + Eq + Ord + Default + std::fmt::Debug + 'static {
     /// The rows whose value is one of `keys`: bit `i` is row `i`.
     fn matches(column: &[Self; 32], keys: &[Self]) -> u32;
+    /// The rows whose value lies in `lo..=hi`.
+    fn between(column: &[Self; 32], lo: Self, hi: Self) -> u32;
+    /// The unsigned integer that a stored value encodes.
+    fn ordinal(self) -> u128;
     /// The exclusive or of the value's 16-bit lanes.
     fn fold_one(self) -> u16;
     fn wide(self) -> u64;
@@ -29,6 +33,14 @@ impl Value for u16 {
     #[inline(always)]
     fn matches(column: &[Self; 32], keys: &[Self]) -> u32 {
         u16s::matches(column, keys)
+    }
+    #[inline(always)]
+    fn between(column: &[Self; 32], lo: Self, hi: Self) -> u32 {
+        u16s::between::between(column, lo, hi)
+    }
+    #[inline(always)]
+    fn ordinal(self) -> u128 {
+        u16::from_le(self) as u128
     }
     #[inline(always)]
     fn fold_one(self) -> u16 {
@@ -50,6 +62,14 @@ impl Value for u32 {
         u32s::matches(column, keys)
     }
     #[inline(always)]
+    fn between(column: &[Self; 32], lo: Self, hi: Self) -> u32 {
+        u32s::between::between(column, lo, hi)
+    }
+    #[inline(always)]
+    fn ordinal(self) -> u128 {
+        u32::from_le(self) as u128
+    }
+    #[inline(always)]
     fn fold_one(self) -> u16 {
         (self ^ self >> 16) as u16
     }
@@ -69,6 +89,14 @@ impl Value for u64 {
         u64s::matches(column, keys)
     }
     #[inline(always)]
+    fn between(column: &[Self; 32], lo: Self, hi: Self) -> u32 {
+        u64s::between::between(column, lo, hi)
+    }
+    #[inline(always)]
+    fn ordinal(self) -> u128 {
+        u64::from_le(self) as u128
+    }
+    #[inline(always)]
     fn fold_one(self) -> u16 {
         fold_u64(self)
     }
@@ -86,6 +114,14 @@ impl Value for [u64; 2] {
     #[inline(always)]
     fn matches(column: &[Self; 32], keys: &[Self]) -> u32 {
         u128s::matches(column, keys)
+    }
+    #[inline(always)]
+    fn between(column: &[Self; 32], lo: Self, hi: Self) -> u32 {
+        u128s::between::between(column, lo, hi)
+    }
+    #[inline(always)]
+    fn ordinal(self) -> u128 {
+        (u64::from_le(self[1]) as u128) << 64 | u64::from_le(self[0]) as u128
     }
     #[inline(always)]
     fn fold_one(self) -> u16 {
@@ -160,10 +196,6 @@ impl<T: Value> Set<T> {
         }
     }
 
-    pub fn bitmap(&self) -> &[u64; 1024] {
-        &self.bitmap
-    }
-
     #[inline(always)]
     pub fn contains(&self, x: T) -> bool {
         let f = x.fold_one();
@@ -232,171 +264,6 @@ pub fn matches_bitmap(keys: &[u16; 32], bitmap: &[u64; 1024]) -> u32 {
     matches_bitmap::matches_bitmap(keys, bitmap)
 }
 
-#[cfg_attr(feature = "internal", simd_macros::public)]
-mod meets {
-    #[cfg_attr(feature = "internal", simd_macros::public)]
-    #[inline]
-    #[cfg(target_arch = "x86_64")]
-    #[crate::target_cpu(enable = "v4")]
-    fn meets_v4(ranges: &[u32; 32], keys: &[u16]) -> u32 {
-        use core::arch::x86_64::*;
-        // the lanes of the ranges' `min` (`odd = 0`) or `max` (`odd = 1`) ends, in order
-        const fn halves(odd: u16) -> [u16; 32] {
-            let mut x = [0; 32];
-            let mut i = 0;
-            while i < 32 {
-                x[i] = 2 * i as u16 + odd;
-                i += 1;
-            }
-            x
-        }
-        static MIN: [u16; 32] = halves(0);
-        static MAX: [u16; 32] = halves(1);
-        let p = ranges.as_ptr();
-        let x0 = unsafe { _mm512_loadu_si512(p.cast()) };
-        let x1 = unsafe { _mm512_loadu_si512(p.add(16).cast()) };
-        let min = unsafe { _mm512_loadu_si512(MIN.as_ptr().cast()) };
-        let max = unsafe { _mm512_loadu_si512(MAX.as_ptr().cast()) };
-        let min = _mm512_permutex2var_epi16(x0, min, x1);
-        let max = _mm512_permutex2var_epi16(x0, max, x1);
-        let mut mask = 0;
-        for &key in keys {
-            let t = _mm512_set1_epi16(key as i16);
-            mask |= _mm512_mask_cmpge_epu16_mask(_mm512_cmple_epu16_mask(min, t), max, t);
-        }
-        mask
-    }
-
-    #[cfg_attr(feature = "internal", simd_macros::public)]
-    #[inline]
-    #[cfg(target_arch = "x86_64")]
-    #[crate::target_cpu(enable = "v3")]
-    fn meets_v3(ranges: &[u32; 32], keys: &[u16]) -> u32 {
-        use core::arch::x86_64::*;
-        /// The ends of 16 ranges, biased by 0x8000 so that signed compares order them.
-        #[inline]
-        #[crate::target_cpu(enable = "v3")]
-        fn narrow(p: &[u32; 16]) -> (__m256i, __m256i) {
-            let p = p.as_ptr();
-            let x0 = unsafe { _mm256_loadu_si256(p.cast()) };
-            let x1 = unsafe { _mm256_loadu_si256(p.add(8).cast()) };
-            let low = _mm256_set1_epi32(0xffff);
-            let bias = _mm256_set1_epi16(i16::MIN);
-            // per 128-bit lane: ranges 0..4 8..12 | 4..8 12..16
-            let min = _mm256_packus_epi32(_mm256_and_si256(x0, low), _mm256_and_si256(x1, low));
-            let max = _mm256_packus_epi32(_mm256_srli_epi32::<16>(x0), _mm256_srli_epi32::<16>(x1));
-            let min = _mm256_permute4x64_epi64(min, 0b11_01_10_00);
-            let max = _mm256_permute4x64_epi64(max, 0b11_01_10_00);
-            (_mm256_xor_si256(min, bias), _mm256_xor_si256(max, bias))
-        }
-
-        let (lo, hi) = ranges.split_at(16);
-        let (min0, max0) = narrow(lo.try_into().unwrap());
-        let (min1, max1) = narrow(hi.try_into().unwrap());
-        let mut miss0 = _mm256_set1_epi16(-1);
-        let mut miss1 = _mm256_set1_epi16(-1);
-        for &key in keys {
-            let t = _mm256_set1_epi16((key ^ 0x8000) as i16);
-            let out0 = _mm256_or_si256(_mm256_cmpgt_epi16(min0, t), _mm256_cmpgt_epi16(t, max0));
-            let out1 = _mm256_or_si256(_mm256_cmpgt_epi16(min1, t), _mm256_cmpgt_epi16(t, max1));
-            miss0 = _mm256_and_si256(miss0, out0);
-            miss1 = _mm256_and_si256(miss1, out1);
-        }
-        // bytes per 64-bit lane: ranges 0..8 16..24 8..16 24..32
-        let y = _mm256_packs_epi16(miss0, miss1);
-        !(_mm256_movemask_epi8(_mm256_permute4x64_epi64(y, 0b11_01_10_00)) as u32)
-    }
-
-    #[cfg_attr(feature = "internal", simd_macros::public)]
-    #[inline]
-    #[cfg(target_arch = "aarch64")]
-    #[crate::target_cpu(enable = "a2")]
-    fn meets_a2(ranges: &[u32; 32], keys: &[u16]) -> u32 {
-        use core::arch::aarch64::*;
-        let p = ranges.as_ptr().cast::<u16>();
-        let x: [uint16x8x2_t; 4] = std::array::from_fn(|i| unsafe { vld2q_u16(p.add(16 * i)) });
-        let mut y = [vdupq_n_u16(0); 4];
-        for &key in keys {
-            let t = vdupq_n_u16(key);
-            for i in 0..4 {
-                let hit = vandq_u16(vcleq_u16(x[i].0, t), vcgeq_u16(x[i].1, t));
-                y[i] = vorrq_u16(y[i], hit);
-            }
-        }
-        let bits = unsafe { vld1q_u16([1_u16, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
-        let mut mask = 0;
-        for i in 0..4 {
-            mask |= (vaddvq_u16(vandq_u16(y[i], bits)) as u32) << (8 * i);
-        }
-        mask
-    }
-
-    #[cfg(test)]
-    #[test]
-    #[cfg_attr(miri, ignore)]
-    fn kernels() {
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v4") {
-            super::check(sample, |r, k| unsafe { meets_v4(r, k) }, fallback);
-        }
-        #[cfg(target_arch = "x86_64")]
-        if crate::is_cpu_detected!("v3") {
-            super::check(sample, |r, k| unsafe { meets_v3(r, k) }, fallback);
-        }
-        #[cfg(target_arch = "aarch64")]
-        if crate::is_cpu_detected!("a2") {
-            super::check(sample, |r, k| unsafe { meets_a2(r, k) }, fallback);
-        }
-    }
-
-    #[cfg(test)]
-    fn sample() -> ([u32; 32], Vec<u16>) {
-        let ranges: [u32; 32] = std::array::from_fn(|_| {
-            let (a, b) = (rand::random::<u16>(), rand::random::<u16>());
-            let (min, max) = match rand::random::<u8>() % 4 {
-                0 => (a.max(b), a.min(b)),
-                1 => (a, a),
-                2 => (a, a.saturating_add(b % 256)),
-                _ => (a.min(b), a.max(b)),
-            };
-            min as u32 | (max as u32) << 16
-        });
-        let keys = (0..20)
-            .map(|_| {
-                let x = ranges[rand::random::<u32>() as usize % 32];
-                match rand::random::<u8>() % 4 {
-                    0 => x as u16,
-                    1 => (x >> 16) as u16,
-                    _ => rand::random(),
-                }
-            })
-            .collect();
-        (ranges, keys)
-    }
-
-    #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
-    pub fn meets(ranges: &[u32; 32], keys: &[u16]) -> u32 {
-        let mut hit = [false; 32];
-        for &key in keys {
-            for i in 0..32 {
-                let (min, max) = (ranges[i] as u16, (ranges[i] >> 16) as u16);
-                hit[i] |= min <= key && key <= max;
-            }
-        }
-        let mut mask = 0;
-        for i in 0..32 {
-            mask |= (hit[i] as u32) << i;
-        }
-        mask
-    }
-}
-
-/// The ranges, `min | max << 16`, that hold one of `keys`.
-#[inline(always)]
-pub fn meets(ranges: &[u32; 32], keys: &[u16]) -> u32 {
-    meets::meets(ranges, keys)
-}
-
 #[inline(always)]
 fn matches_portable<T: Value>(column: &[T; 32], keys: &[T]) -> u32 {
     let mut hit = [false; 32];
@@ -410,6 +277,36 @@ fn matches_portable<T: Value>(column: &[T; 32], keys: &[T]) -> u32 {
         mask |= (hit[i] as u32) << i;
     }
     mask
+}
+
+#[inline(always)]
+fn between_portable<T: Value>(column: &[T; 32], lo: T, hi: T) -> u32 {
+    let (lo, hi) = (lo.ordinal(), hi.ordinal());
+    let mut mask = 0;
+    for i in 0..32 {
+        let x = column[i].ordinal();
+        mask |= ((lo <= x && x <= hi) as u32) << i;
+    }
+    mask
+}
+
+/// Checks a range kernel against [`between_portable`].
+#[cfg(test)]
+fn check_between<T: Value>(random: impl Fn() -> T, kernel: impl Fn(&[T; 32], T, T) -> u32) {
+    for _ in 0..if cfg!(not(miri)) { 256 } else { 1 } {
+        let (column, keys) = sample(&random)();
+        let pick = || match rand::random::<u8>() % 3 {
+            0 => column[rand::random::<u32>() as usize % 32],
+            1 => keys[rand::random::<u32>() as usize % keys.len()],
+            _ => random(),
+        };
+        for _ in 0..8 {
+            let (a, b) = (pick(), pick());
+            for (lo, hi) in [(a, b), (b, a), (a, a)] {
+                assert_eq!(kernel(&column, lo, hi), between_portable(&column, lo, hi));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -472,7 +369,7 @@ mod u16s {
             y0 = _mm256_or_si256(y0, _mm256_cmpeq_epi16(x0, k));
             y1 = _mm256_or_si256(y1, _mm256_cmpeq_epi16(x1, k));
         }
-        // bytes per 64-bit lane: rows 0..8 16..24 8..16 24..32
+        // packs interleaves the halves by lane, which the permute undoes
         let y = _mm256_packs_epi16(y0, y1);
         _mm256_movemask_epi8(_mm256_permute4x64_epi64(y, 0b11_01_10_00)) as u32
     }
@@ -535,6 +432,87 @@ mod u16s {
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn matches(column: &[u16; 32], keys: &[u16]) -> u32 {
         super::matches_portable(column, keys)
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    pub mod between {
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v4")]
+        fn between_v4(column: &[u16; 32], lo: u16, hi: u16) -> u32 {
+            use core::arch::x86_64::*;
+            let x = unsafe { _mm512_loadu_si512(column.as_ptr().cast()) };
+            let ge = _mm512_cmpge_epu16_mask(x, _mm512_set1_epi16(lo as i16));
+            _mm512_mask_cmple_epu16_mask(ge, x, _mm512_set1_epi16(hi as i16))
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v3")]
+        fn between_v3(column: &[u16; 32], lo: u16, hi: u16) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            let x0 = unsafe { _mm256_loadu_si256(p.cast()) };
+            let x1 = unsafe { _mm256_loadu_si256(p.add(16).cast()) };
+            let (l, h) = (_mm256_set1_epi16(lo as i16), _mm256_set1_epi16(hi as i16));
+            // `x` is in range where raising it to `lo` and lowering it to `hi` both leave it
+            let y0 = _mm256_and_si256(
+                _mm256_cmpeq_epi16(_mm256_max_epu16(x0, l), x0),
+                _mm256_cmpeq_epi16(_mm256_min_epu16(x0, h), x0),
+            );
+            let y1 = _mm256_and_si256(
+                _mm256_cmpeq_epi16(_mm256_max_epu16(x1, l), x1),
+                _mm256_cmpeq_epi16(_mm256_min_epu16(x1, h), x1),
+            );
+            // packs interleaves the halves by lane, which the permute undoes
+            let y = _mm256_packs_epi16(y0, y1);
+            _mm256_movemask_epi8(_mm256_permute4x64_epi64(y, 0b11_01_10_00)) as u32
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "aarch64")]
+        #[crate::target_cpu(enable = "a2")]
+        fn between_a2(column: &[u16; 32], lo: u16, hi: u16) -> u32 {
+            use core::arch::aarch64::*;
+            let p = column.as_ptr();
+            let x: [uint16x8_t; 4] = std::array::from_fn(|i| unsafe { vld1q_u16(p.add(8 * i)) });
+            let (l, h) = (vdupq_n_u16(lo), vdupq_n_u16(hi));
+            let bits = unsafe { vld1q_u16([1_u16, 2, 4, 8, 16, 32, 64, 128].as_ptr()) };
+            let mut mask = 0;
+            for i in 0..4 {
+                let y = vandq_u16(vcgeq_u16(x[i], l), vcleq_u16(x[i], h));
+                mask |= (vaddvq_u16(vandq_u16(y, bits)) as u32) << (8 * i);
+            }
+            mask
+        }
+
+        #[cfg(test)]
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn kernels() {
+            use super::super::check_between;
+            let random = rand::random::<u16>;
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v4") {
+                check_between(random, |c, l, h| unsafe { between_v4(c, l, h) });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v3") {
+                check_between(random, |c, l, h| unsafe { between_v3(c, l, h) });
+            }
+            #[cfg(target_arch = "aarch64")]
+            if crate::is_cpu_detected!("a2") {
+                check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
+            }
+        }
+
+        #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+        pub fn between(column: &[u16; 32], lo: u16, hi: u16) -> u32 {
+            super::super::between_portable(column, lo, hi)
+        }
     }
 }
 
@@ -639,6 +617,88 @@ mod u32s {
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn matches(column: &[u32; 32], keys: &[u32]) -> u32 {
         super::matches_portable(column, keys)
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    pub mod between {
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v4")]
+        fn between_v4(column: &[u32; 32], lo: u32, hi: u32) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            let x0 = unsafe { _mm512_loadu_si512(p.cast()) };
+            let x1 = unsafe { _mm512_loadu_si512(p.add(16).cast()) };
+            let (l, h) = (_mm512_set1_epi32(lo as i32), _mm512_set1_epi32(hi as i32));
+            let m0 = _mm512_mask_cmple_epu32_mask(_mm512_cmpge_epu32_mask(x0, l), x0, h);
+            let m1 = _mm512_mask_cmple_epu32_mask(_mm512_cmpge_epu32_mask(x1, l), x1, h);
+            m0 as u32 | (m1 as u32) << 16
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v3")]
+        fn between_v3(column: &[u32; 32], lo: u32, hi: u32) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            let (l, h) = (_mm256_set1_epi32(lo as i32), _mm256_set1_epi32(hi as i32));
+            let mut mask = 0;
+            for i in 0..4 {
+                let x = unsafe { _mm256_loadu_si256(p.add(8 * i).cast()) };
+                // `x` is in range where raising it to `lo` and lowering it to `hi` both leave it
+                let y = _mm256_and_si256(
+                    _mm256_cmpeq_epi32(_mm256_max_epu32(x, l), x),
+                    _mm256_cmpeq_epi32(_mm256_min_epu32(x, h), x),
+                );
+                mask |= (_mm256_movemask_ps(_mm256_castsi256_ps(y)) as u32) << (8 * i);
+            }
+            mask
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "aarch64")]
+        #[crate::target_cpu(enable = "a2")]
+        fn between_a2(column: &[u32; 32], lo: u32, hi: u32) -> u32 {
+            use core::arch::aarch64::*;
+            let p = column.as_ptr();
+            let (l, h) = (vdupq_n_u32(lo), vdupq_n_u32(hi));
+            let bits = unsafe { vld1q_u32([1_u32, 2, 4, 8].as_ptr()) };
+            let mut mask = 0;
+            for i in 0..8 {
+                let x = unsafe { vld1q_u32(p.add(4 * i)) };
+                let y = vandq_u32(vcgeq_u32(x, l), vcleq_u32(x, h));
+                mask |= vaddvq_u32(vandq_u32(y, bits)) << (4 * i);
+            }
+            mask
+        }
+
+        #[cfg(test)]
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn kernels() {
+            use super::super::check_between;
+            let random = rand::random::<u32>;
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v4") {
+                check_between(random, |c, l, h| unsafe { between_v4(c, l, h) });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v3") {
+                check_between(random, |c, l, h| unsafe { between_v3(c, l, h) });
+            }
+            #[cfg(target_arch = "aarch64")]
+            if crate::is_cpu_detected!("a2") {
+                check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
+            }
+        }
+
+        #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+        pub fn between(column: &[u32; 32], lo: u32, hi: u32) -> u32 {
+            super::super::between_portable(column, lo, hi)
+        }
     }
 }
 
@@ -745,6 +805,91 @@ mod u64s {
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn matches(column: &[u64; 32], keys: &[u64]) -> u32 {
         super::matches_portable(column, keys)
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    pub mod between {
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v4")]
+        fn between_v4(column: &[u64; 32], lo: u64, hi: u64) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            let (l, h) = (_mm512_set1_epi64(lo as i64), _mm512_set1_epi64(hi as i64));
+            let mut m = [0_u8; 4];
+            for i in 0..4 {
+                let x = unsafe { _mm512_loadu_si512(p.add(8 * i).cast()) };
+                m[i] = _mm512_mask_cmple_epu64_mask(_mm512_cmpge_epu64_mask(x, l), x, h);
+            }
+            u32::from_le_bytes(m)
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v3")]
+        fn between_v3(column: &[u64; 32], lo: u64, hi: u64) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            // biased by the sign bit, so that signed compares order them
+            let bias = _mm256_set1_epi64x(i64::MIN);
+            let l = _mm256_set1_epi64x((lo ^ 1 << 63) as i64);
+            let h = _mm256_set1_epi64x((hi ^ 1 << 63) as i64);
+            let mut mask = 0;
+            for i in 0..8 {
+                let x = _mm256_xor_si256(unsafe { _mm256_loadu_si256(p.add(4 * i).cast()) }, bias);
+                let out = _mm256_or_si256(_mm256_cmpgt_epi64(l, x), _mm256_cmpgt_epi64(x, h));
+                mask |= ((!_mm256_movemask_pd(_mm256_castsi256_pd(out)) & 0xf) as u32) << (4 * i);
+            }
+            mask
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "aarch64")]
+        #[crate::target_cpu(enable = "a2")]
+        fn between_a2(column: &[u64; 32], lo: u64, hi: u64) -> u32 {
+            use core::arch::aarch64::*;
+            let p = column.as_ptr();
+            let (l, h) = (vdupq_n_u64(lo), vdupq_n_u64(hi));
+            let bits = unsafe { vld1q_u32([1_u32, 2, 4, 8].as_ptr()) };
+            let mut mask = 0;
+            for i in 0..8 {
+                let y = |j: usize| {
+                    let x = unsafe { vld1q_u64(p.add(4 * i + 2 * j)) };
+                    vmovn_u64(vandq_u64(vcgeq_u64(x, l), vcleq_u64(x, h)))
+                };
+                let rows = vcombine_u32(y(0), y(1));
+                mask |= vaddvq_u32(vandq_u32(rows, bits)) << (4 * i);
+            }
+            mask
+        }
+
+        #[cfg(test)]
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn kernels() {
+            use super::super::check_between;
+            let random = rand::random::<u64>;
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v4") {
+                check_between(random, |c, l, h| unsafe { between_v4(c, l, h) });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v3") {
+                check_between(random, |c, l, h| unsafe { between_v3(c, l, h) });
+            }
+            #[cfg(target_arch = "aarch64")]
+            if crate::is_cpu_detected!("a2") {
+                check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
+            }
+        }
+
+        #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+        pub fn between(column: &[u64; 32], lo: u64, hi: u64) -> u32 {
+            super::super::between_portable(column, lo, hi)
+        }
     }
 }
 
@@ -893,6 +1038,142 @@ mod u128s {
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
     pub fn matches(column: &[[u64; 2]; 32], keys: &[[u64; 2]]) -> u32 {
         super::matches_portable(column, keys)
+    }
+
+    #[cfg_attr(feature = "internal", simd_macros::public)]
+    pub mod between {
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v4")]
+        fn between_v4(column: &[[u64; 2]; 32], lo: [u64; 2], hi: [u64; 2]) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            let even = _mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14);
+            let odd = _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15);
+            let [l0, l1, h0, h1] =
+                [lo[0], lo[1], hi[0], hi[1]].map(|x| _mm512_set1_epi64(x as i64));
+            let mut m = [0_u8; 4];
+            for i in 0..4 {
+                let a = unsafe { _mm512_loadu_si512(p.add(8 * i).cast()) };
+                let b = unsafe { _mm512_loadu_si512(p.add(8 * i + 4).cast()) };
+                // the rows' low and high words
+                let (x0, x1) = (
+                    _mm512_permutex2var_epi64(a, even, b),
+                    _mm512_permutex2var_epi64(a, odd, b),
+                );
+                let ge = _mm512_cmpgt_epu64_mask(x1, l1)
+                    | _mm512_mask_cmpge_epu64_mask(_mm512_cmpeq_epi64_mask(x1, l1), x0, l0);
+                let le = _mm512_cmplt_epu64_mask(x1, h1)
+                    | _mm512_mask_cmple_epu64_mask(_mm512_cmpeq_epi64_mask(x1, h1), x0, h0);
+                m[i] = ge & le;
+            }
+            u32::from_le_bytes(m)
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "x86_64")]
+        #[crate::target_cpu(enable = "v3")]
+        fn between_v3(column: &[[u64; 2]; 32], lo: [u64; 2], hi: [u64; 2]) -> u32 {
+            use core::arch::x86_64::*;
+            let p = column.as_ptr();
+            // biased by the sign bit, so that signed compares order them
+            let bias = _mm256_set1_epi64x(i64::MIN);
+            let [l0, l1, h0, h1] =
+                [lo[0], lo[1], hi[0], hi[1]].map(|x| _mm256_set1_epi64x((x ^ 1 << 63) as i64));
+            let mut mask = 0;
+            for i in 0..8 {
+                let a = unsafe { _mm256_loadu_si256(p.add(4 * i).cast()) };
+                let b = unsafe { _mm256_loadu_si256(p.add(4 * i + 2).cast()) };
+                // the rows' low and high words, the middle two rows swapped
+                let x0 = _mm256_xor_si256(_mm256_unpacklo_epi64(a, b), bias);
+                let x1 = _mm256_xor_si256(_mm256_unpackhi_epi64(a, b), bias);
+                // below `lo` or above `hi`, by the high word and then the low word
+                let below = _mm256_or_si256(
+                    _mm256_cmpgt_epi64(l1, x1),
+                    _mm256_and_si256(_mm256_cmpeq_epi64(x1, l1), _mm256_cmpgt_epi64(l0, x0)),
+                );
+                let above = _mm256_or_si256(
+                    _mm256_cmpgt_epi64(x1, h1),
+                    _mm256_and_si256(_mm256_cmpeq_epi64(x1, h1), _mm256_cmpgt_epi64(x0, h0)),
+                );
+                let m = !_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(below, above)))
+                    as u32
+                    & 0xf;
+                let m = (m & 0b1001) | (m & 0b0010) << 1 | (m & 0b0100) >> 1;
+                mask |= m << (4 * i);
+            }
+            mask
+        }
+
+        #[cfg_attr(feature = "internal", simd_macros::public)]
+        #[inline]
+        #[cfg(target_arch = "aarch64")]
+        #[crate::target_cpu(enable = "a2")]
+        fn between_a2(column: &[[u64; 2]; 32], lo: [u64; 2], hi: [u64; 2]) -> u32 {
+            use core::arch::aarch64::*;
+            let p = column.as_ptr().cast::<u64>();
+            let [l0, l1, h0, h1] = [lo[0], lo[1], hi[0], hi[1]].map(|x| vdupq_n_u64(x));
+            let bits = unsafe { vld1q_u32([1_u32, 2, 4, 8].as_ptr()) };
+            let mut mask = 0;
+            for i in 0..8 {
+                let y = |j: usize| {
+                    // the rows' low and high words
+                    let x = unsafe { vld2q_u64(p.add(8 * i + 4 * j)) };
+                    let ge = vorrq_u64(
+                        vcgtq_u64(x.1, l1),
+                        vandq_u64(vceqq_u64(x.1, l1), vcgeq_u64(x.0, l0)),
+                    );
+                    let le = vorrq_u64(
+                        vcltq_u64(x.1, h1),
+                        vandq_u64(vceqq_u64(x.1, h1), vcleq_u64(x.0, h0)),
+                    );
+                    vmovn_u64(vandq_u64(ge, le))
+                };
+                let rows = vcombine_u32(y(0), y(1));
+                mask |= vaddvq_u32(vandq_u32(rows, bits)) << (4 * i);
+            }
+            mask
+        }
+
+        #[cfg(test)]
+        #[test]
+        #[cfg_attr(miri, ignore)]
+        fn kernels() {
+            use super::super::check_between;
+            let random = || {
+                let lo = rand::random::<u64>();
+                [
+                    lo,
+                    if rand::random::<bool>() {
+                        lo
+                    } else {
+                        rand::random()
+                    },
+                ]
+            };
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v4") {
+                check_between(random, |c, l, h| unsafe { between_v4(c, l, h) });
+            }
+            #[cfg(target_arch = "x86_64")]
+            if crate::is_cpu_detected!("v3") {
+                check_between(random, |c, l, h| unsafe { between_v3(c, l, h) });
+            }
+            #[cfg(target_arch = "aarch64")]
+            if crate::is_cpu_detected!("a2") {
+                check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
+            }
+            // the high word decides first, then the low word
+            let column = std::array::from_fn(|i| [u64::MAX - i as u64, i as u64]);
+            assert_eq!(between(&column, [u64::MAX - 3, 3], [0, 7]), 0b0111_1000);
+        }
+
+        #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
+        pub fn between(column: &[[u64; 2]; 32], lo: [u64; 2], hi: [u64; 2]) -> u32 {
+            super::super::between_portable(column, lo, hi)
+        }
     }
 }
 
