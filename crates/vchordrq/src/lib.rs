@@ -38,7 +38,7 @@ pub use consume::consume;
 pub use cost::cost;
 pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
-pub use maintain::{MaintainChooser, maintain};
+pub use maintain::{MaintainChooser, Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{Table, how, rerank_heap, rerank_index};
 pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};

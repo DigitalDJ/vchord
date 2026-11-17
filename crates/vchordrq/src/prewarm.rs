@@ -109,6 +109,7 @@ where
             }
             tape::read_appendable_tape::<R, _>(
                 by_next(index, jump_tuple.appendable_first()).inspect(|_| counter += 1),
+                0,
                 |_, _, _| (),
                 (),
                 id_2(|_| {

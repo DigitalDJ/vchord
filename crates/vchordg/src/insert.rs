@@ -642,7 +642,7 @@ mod tests {
     }
     #[test]
     fn full_insertion_conflicts_return_error_then_vacuum_recovers() {
-        use crate::test_support::MakePlainPrefetcher;
+        use index::test_support::MakePlainPrefetcher;
         use vector::vect::VectBorrowed;
         let r = crate::test_support::graph(&[(true, &[])], 4);
         r.inject.set(true);
@@ -666,7 +666,7 @@ mod tests {
     }
     #[test]
     fn missing_start_vertex_is_corruption_not_a_conflict() {
-        use crate::test_support::MakePlainPrefetcher;
+        use index::test_support::MakePlainPrefetcher;
         use vector::vect::VectBorrowed;
         let r = crate::test_support::graph(&[(true, &[])], 4);
         // The start vertex is never freed; its slot disappearing is damage.

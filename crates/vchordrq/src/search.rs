@@ -377,6 +377,7 @@ where
             }
             tape::read_appendable_tape::<R, _>(
                 by_next(&ahead, jump_tuple.appendable_first()),
+                0,
                 O::binary_access(&lut.1, residual),
                 filter,
                 &mut callback,

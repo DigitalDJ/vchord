@@ -1128,7 +1128,8 @@ unsafe fn parallel_build(
         n: unsafe { (*vchordrqshared).nparticipants as usize },
         k: order as usize,
     };
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, check);
+    let pending = vchordrq::Pending::default();
+    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, &pending, check);
 
     sync_2();
 }
@@ -1263,7 +1264,8 @@ unsafe fn sequential_build(
     let index = unsafe { PostgresRelation::new(index_relation) };
 
     let mut chooser = ChooseAll;
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, check);
+    let pending = vchordrq::Pending::default();
+    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, &pending, check);
 
     sync_2();
 

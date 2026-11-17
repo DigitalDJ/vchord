@@ -112,6 +112,9 @@ impl<O> MemoryRelation<O> {
         let pages = pages.into_iter().map(|x| Box::new(RefCell::new(x)));
         Self(RefCell::new(pages.collect()))
     }
+    pub fn pages(&self) -> u32 {
+        self.0.borrow().len() as u32
+    }
     pub fn page(&self, id: u32) -> &RefCell<MemoryPage<O>> {
         let page: *const RefCell<MemoryPage<O>> = &*self.0.borrow()[id as usize];
         // Safety: the box lives as long as the relation
@@ -156,4 +159,27 @@ impl<O: Opaque> RelationWrite for MemoryRelation<O> {
         None
     }
     fn commit_pair(&self, _: Self::WriteGuard<'_>, _: Self::WriteGuard<'_>) {}
+}
+
+/// A plain prefetcher family, for tests.
+pub struct MakePlainPrefetcher<'b, R> {
+    pub index: &'b R,
+}
+
+impl<'b, R: RelationRead + 'b> crate::prefetcher::PrefetcherSequenceFamily<'b, R>
+    for MakePlainPrefetcher<'b, R>
+{
+    type P<S: crate::prefetcher::Sequence>
+        = crate::prefetcher::PlainPrefetcher<'b, R, S>
+    where
+        S::Item: crate::fetch::Fetch<'b>;
+    fn prefetch<S: crate::prefetcher::Sequence>(&mut self, seq: S) -> Self::P<S>
+    where
+        S::Item: crate::fetch::Fetch<'b>,
+    {
+        crate::prefetcher::PlainPrefetcher::new(self.index, seq)
+    }
+    fn is_not_plain(&self) -> bool {
+        false
+    }
 }
