@@ -206,5 +206,36 @@ fn column_matches(c: &mut Criterion) {
     column_bench(c, "u128", rand::random::<[u64; 2]>);
 }
 
-criterion_group!(benches, floating, quantize, byte, column_matches);
+fn column_between_bench<T: simd::column::Value>(
+    c: &mut Criterion,
+    name: &str,
+    random: impl Fn() -> T,
+) {
+    let column = std::array::from_fn::<T, 32, _>(|_| random());
+    let (x, y) = (random(), random());
+    let (lo, hi) = if x.ordinal() <= y.ordinal() {
+        (x, y)
+    } else {
+        (y, x)
+    };
+    c.bench_function(&format!("column::between::{name}"), |b| {
+        b.iter(|| T::between(black_box(&column), lo, hi))
+    });
+}
+
+fn column_between(c: &mut Criterion) {
+    column_between_bench(c, "u16", rand::random::<u16>);
+    column_between_bench(c, "u32", rand::random::<u32>);
+    column_between_bench(c, "u64", rand::random::<u64>);
+    column_between_bench(c, "u128", rand::random::<[u64; 2]>);
+}
+
+criterion_group!(
+    benches,
+    floating,
+    quantize,
+    byte,
+    column_matches,
+    column_between
+);
 criterion_main!(benches);
