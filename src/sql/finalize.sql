@@ -611,7 +611,7 @@ CREATE OPERATOR CLASS rabitq4_maxsim_ops
     OPERATOR 3 @# (rabitq4[], rabitq4[]) FOR ORDER BY float_ops,
     FUNCTION 1 _vchordrq_support_rabitq4_maxsim_ops();
 
--- Filter keys: `*_ops` take = and ranges (`enum_ops` =), most selective first; `*_hash_ops` only =.
+-- Filter keys: `*_ops` take = and ranges, most selective first; `*_hash_ops` only =.
 
 CREATE OPERATOR CLASS uuid_ops
     DEFAULT FOR TYPE uuid USING vchordrq FAMILY uuid_ops AS
@@ -800,7 +800,11 @@ CREATE OPERATOR CLASS bool_ops
 
 CREATE OPERATOR CLASS enum_ops
     DEFAULT FOR TYPE anyenum USING vchordrq FAMILY enum_ops AS
-    OPERATOR 3 = (anyenum, anyenum);
+    OPERATOR 1 < (anyenum, anyenum),
+    OPERATOR 2 <= (anyenum, anyenum),
+    OPERATOR 3 = (anyenum, anyenum),
+    OPERATOR 4 >= (anyenum, anyenum),
+    OPERATOR 5 > (anyenum, anyenum);
 
 CREATE OPERATOR CLASS vector_l2_ops
     FOR TYPE vector USING vchordg FAMILY vector_l2_ops AS
