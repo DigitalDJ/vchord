@@ -209,8 +209,7 @@ impl<'a> Rabitq4Borrowed<'a> {
         self.sum_of_x2
     }
 
-    /// Whether the encoded vector has a direction: its squared norm is
-    /// positive and finite. See `VectBorrowed::direction_norm`.
+    /// Whether the encoded vector has a direction: its squared norm is positive and finite.
     #[inline(always)]
     pub fn has_direction(&self) -> bool {
         self.sum_of_x2 > 0.0 && self.sum_of_x2.is_finite()
@@ -347,16 +346,6 @@ impl VectorBorrowed for Rabitq4Borrowed<'_> {
     }
 
     #[inline(always)]
-    fn operator_hamming(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
-    #[inline(always)]
-    fn operator_jaccard(self, _: Self) -> Distance {
-        unimplemented!()
-    }
-
-    #[inline(always)]
     fn function_normalize(&self) -> Rabitq4Owned {
         // See `VectBorrowed::function_normalize`: a zero vector stays zero
         // instead of pretending to be the unit vector its middle code encodes.
@@ -371,30 +360,6 @@ impl VectorBorrowed for Rabitq4Borrowed<'_> {
             sum_of_abs_x: self.sum_of_abs_x / self.sum_of_x2.sqrt(),
             packed_code: self.packed_code.to_owned(),
         }
-    }
-
-    fn operator_add(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_sub(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_mul(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_and(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_or(&self, _: Self) -> Self::Owned {
-        unimplemented!()
-    }
-
-    fn operator_xor(&self, _: Self) -> Self::Owned {
-        unimplemented!()
     }
 }
 

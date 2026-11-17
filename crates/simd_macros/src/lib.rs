@@ -98,6 +98,7 @@ pub fn multiversion(
     let output = sig.output.clone();
     let mut versions = quote::quote! {};
     let mut cold = quote::quote! {};
+    let mut list = quote::quote! {};
     for version in attr.versions {
         let attrs = version.attrs.clone();
         let target = version.target.clone();
@@ -123,15 +124,20 @@ pub fn multiversion(
                 fn #name < #generics_params > (#inputs) #output #generics_where { #block }
             });
         }
-        cold.extend(quote::quote! {
+        let detected = quote::quote! {
             #(#attrs)*
             #[cfg(target_arch = #target_arch)]
-            if crate::is_cpu_detected!(#target_cpu) #(&& crate::is_feature_detected!(#additional_target_features))* {
-                let ptr = unsafe { std::mem::transmute::<unsafe fn(#inputs) #output, fn(#inputs) #output>(#name) };
+            if crate::is_cpu_detected!(#target_cpu) #(&& crate::is_feature_detected!(#additional_target_features))*
+        };
+        let ptr = quote::quote! { unsafe { std::mem::transmute::<unsafe fn(#inputs) #output, fn(#inputs) #output>(#name) } };
+        cold.extend(quote::quote! {
+            #detected {
+                let ptr = #ptr;
                 CACHE.store(ptr as *mut (), core::sync::atomic::Ordering::Relaxed);
                 return ptr;
             }
         });
+        list.extend(quote::quote! { #detected { r.push((#target, #ptr)); } });
     }
     cold.extend(quote::quote! {
         let ptr = unsafe { std::mem::transmute::<unsafe fn(#inputs) #output, fn(#inputs) #output>(fallback)} ;
@@ -141,6 +147,14 @@ pub fn multiversion(
     quote::quote! {
         #versions
         fn fallback < #generics_params > (#inputs) #output #generics_where { #block }
+        /// The fallback and every version this CPU can run, by target.
+        #[cfg(any(test, feature = "internal"))]
+        #[allow(dead_code, clippy::type_complexity)]
+        pub fn implementations() -> Vec<(&'static str, fn(#inputs) #output)> {
+            let mut r: Vec<(&'static str, fn(#inputs) #output)> = vec![("fallback", fallback)];
+            #list
+            r
+        }
         #[must_use]
         pub(crate) fn pointer() -> fn(#inputs) #output {
             static CACHE: core::sync::atomic::AtomicPtr<()> = core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());

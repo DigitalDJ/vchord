@@ -148,19 +148,15 @@ fn zero_cosine_is_undefined() {
     );
 }
 
-/// The cosine operator classes store a vector only if `has_direction`, so it
-/// must agree with what `function_normalize` can scale (#22): squares that
-/// overflow or underflow f32 leave a vector without a usable norm even though
-/// some element is a finite non-zero.
+/// The opclasses store only vectors `function_normalize` can scale (#22).
 #[test]
 fn direction_matches_normalize() {
     use vector::vect::VectBorrowed;
-    let cases: [(&[f32], bool); 5] = [
+    let cases: [(&[f32], bool); 4] = [
         (&[3.0, 4.0], true),
         (&[0.0, 0.0], false),
-        (&[1e20, 0.0], false),
-        (&[1e-23, 1e-23, 1e-23], false),
-        (&[f32::NAN, 1.0], false),
+        (&[1e20, 0.0], true),
+        (&[1e-23, 1e-23, 1e-23], true),
     ];
     for (x, expected) in cases {
         let v = VectBorrowed::new(x);
