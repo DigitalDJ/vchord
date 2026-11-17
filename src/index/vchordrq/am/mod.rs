@@ -17,7 +17,6 @@ use crate::index::vchordrq::filter_key::FilterKeys;
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::scanners::*;
 use crate::recorder::DefaultRecorder;
-use pgrx::datum::Internal;
 use pgrx::pg_sys::Datum;
 use rand::RngExt;
 use std::cell::LazyCell;
@@ -205,15 +204,7 @@ pub fn init() {
     });
 }
 
-#[pgrx::pg_extern(sql = "")]
-fn _vchordrq_amhandler(_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> Internal {
-    type T = pgrx::pg_sys::IndexAmRoutine;
-    unsafe {
-        let index_am_routine = pgrx::pg_sys::palloc0(size_of::<T>()) as *mut T;
-        index_am_routine.write(AM_HANDLER);
-        Internal::from(Some(Datum::from(index_am_routine)))
-    }
-}
+crate::index::am_handler!(_vchordrq_amhandler_wrapper, AM_HANDLER);
 
 const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     let mut am_routine = unsafe { std::mem::zeroed::<pgrx::pg_sys::IndexAmRoutine>() };

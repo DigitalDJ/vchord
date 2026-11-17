@@ -42,6 +42,43 @@ fn check_for_interrupts() {
 /// structural exclusion (#32).
 pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
 
+/// A handler's C entry points without pgrx's guard: the planner calls it per operator class member.
+macro_rules! am_handler {
+    ($name:ident, $routine:expr) => {
+        paste::paste! {
+            #[unsafe(no_mangle)]
+            #[doc(hidden)]
+            pub extern "C" fn [<pg_finfo_ $name>]() -> &'static pgrx::pg_sys::Pg_finfo_record {
+                &pgrx::pg_sys::Pg_finfo_record { api_version: 1 }
+            }
+            #[unsafe(no_mangle)]
+            #[doc(hidden)]
+            pub extern "C" fn $name(_: pgrx::pg_sys::FunctionCallInfo) -> pgrx::pg_sys::Datum {
+                unsafe { crate::index::am_routine(&$routine) }
+            }
+        }
+    };
+}
+pub(crate) use am_handler;
+
+/// A handler's result: the routine itself where PostgreSQL takes it as static, else a copy it frees.
+#[inline(always)]
+pub unsafe fn am_routine(routine: &'static pgrx::pg_sys::IndexAmRoutine) -> pgrx::pg_sys::Datum {
+    #[cfg(feature = "pg19")]
+    let routine = std::ptr::from_ref(routine).cast_mut();
+    #[cfg(not(feature = "pg19"))]
+    let routine = unsafe {
+        unsafe extern "C" {
+            fn palloc(size: usize) -> *mut std::ffi::c_void;
+        }
+        let copy = palloc(size_of::<pgrx::pg_sys::IndexAmRoutine>())
+            .cast::<pgrx::pg_sys::IndexAmRoutine>();
+        copy.copy_from_nonoverlapping(routine, 1);
+        copy
+    };
+    pgrx::pg_sys::Datum::from(routine)
+}
+
 /// Switches `CurrentMemoryContext` and restores it when dropped, including
 /// during unwinding.
 pub struct MemoryContextSwitch(pgrx::pg_sys::MemoryContext);
