@@ -137,6 +137,12 @@ where
             columns: Vec::new(),
         }
     }
+    pub fn last(&self) -> u32 {
+        self.tape.last()
+    }
+    pub fn unlock(&mut self) {
+        self.tape.unlock();
+    }
     /// `columns`: the branch's, as an appendable tuple stores them.
     pub fn push(&mut self, branch: Branch<NonZero<u64>>, columns: &[u8]) {
         self.branches.push(branch);

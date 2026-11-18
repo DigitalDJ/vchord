@@ -208,24 +208,3 @@ pub(crate) fn graph(vertices: &[(bool, &[u16])], m: u32) -> TestRelation {
     pages.extend(vector_pages);
     TestRelation::new(pages, false)
 }
-
-pub(crate) struct MakePlainPrefetcher<'b, R> {
-    pub index: &'b R,
-}
-impl<'b, R: RelationRead + 'b> index::prefetcher::PrefetcherSequenceFamily<'b, R>
-    for MakePlainPrefetcher<'b, R>
-{
-    type P<S: index::prefetcher::Sequence>
-        = index::prefetcher::PlainPrefetcher<'b, R, S>
-    where
-        S::Item: index::fetch::Fetch<'b>;
-    fn prefetch<S: index::prefetcher::Sequence>(&mut self, seq: S) -> Self::P<S>
-    where
-        S::Item: index::fetch::Fetch<'b>,
-    {
-        index::prefetcher::PlainPrefetcher::new(self.index, seq)
-    }
-    fn is_not_plain(&self) -> bool {
-        false
-    }
-}

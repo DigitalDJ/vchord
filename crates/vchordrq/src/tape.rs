@@ -28,7 +28,9 @@ pub struct TapeWriter<'a, R, T>
 where
     R: RelationWrite + 'a,
 {
-    head: R::WriteGuard<'a>,
+    /// The last page, unless unlocked.
+    head: Option<R::WriteGuard<'a>>,
+    last: u32,
     first: u32,
     index: &'a R,
     tracking_freespace: bool,
@@ -51,7 +53,8 @@ where
         head.get_opaque_mut().skip = head.id();
         let first = head.id();
         Self {
-            head,
+            head: Some(head),
+            last: first,
             first,
             index,
             tracking_freespace,
@@ -61,11 +64,22 @@ where
     pub fn first(&self) -> u32 {
         self.first
     }
-    pub fn freespace(&self) -> u16 {
-        self.head.freespace()
+    pub fn last(&self) -> u32 {
+        self.last
+    }
+    /// Unlocks the last page; the next write locks it again.
+    pub fn unlock(&mut self) {
+        self.head = None;
+    }
+    fn head(&mut self) -> &mut R::WriteGuard<'a> {
+        self.head
+            .get_or_insert_with(|| self.index.write(self.last, self.tracking_freespace))
+    }
+    pub fn freespace(&mut self) -> u16 {
+        self.head().freespace()
     }
     pub fn tape_move(&mut self) {
-        if self.head.len() == 0 {
+        if self.head().len() == 0 {
             panic!("implementation: a clear page cannot accommodate a single tuple");
         }
         let next = self.index.extend(
@@ -75,8 +89,9 @@ where
             },
             self.tracking_freespace,
         );
-        self.head.get_opaque_mut().next = next.id();
-        self.head = next;
+        self.head().get_opaque_mut().next = next.id();
+        self.last = next.id();
+        self.head = Some(next);
     }
 }
 
@@ -88,20 +103,12 @@ where
 {
     pub fn push(&mut self, x: T) -> (u32, u16) {
         let bytes = T::serialize(&x);
-        if let Some(i) = self.head.alloc(&bytes) {
-            (self.head.id(), i)
+        if let Some(i) = self.head().alloc(&bytes) {
+            (self.last, i)
         } else {
-            let next = self.index.extend(
-                Opaque {
-                    next: u32::MAX,
-                    skip: u32::MAX,
-                },
-                self.tracking_freespace,
-            );
-            self.head.get_opaque_mut().next = next.id();
-            self.head = next;
-            if let Some(i) = self.head.alloc(&bytes) {
-                (self.head.id(), i)
+            self.tape_move();
+            if let Some(i) = self.head().alloc(&bytes) {
+                (self.last, i)
             } else {
                 panic!("implementation: a free page cannot accommodate a single tuple")
             }
@@ -109,8 +116,8 @@ where
     }
     pub fn tape_put(&mut self, x: T) -> (u32, u16) {
         let bytes = T::serialize(&x);
-        if let Some(i) = self.head.alloc(&bytes) {
-            (self.head.id(), i)
+        if let Some(i) = self.head().alloc(&bytes) {
+            (self.last, i)
         } else {
             panic!("implementation: a free page cannot accommodate a single tuple")
         }
@@ -563,8 +570,10 @@ fn select_pages(ids: &mut [u32], firsts: &mut [u32], masks: &[u32], blocks: usiz
     kept
 }
 
+/// `skip`: how many tuples of the first page are read already.
 pub fn read_appendable_tape<'b, R, T>(
     iter: impl Iterator<Item = R::ReadGuard<'b>>,
+    mut skip: u16,
     mut access: impl for<'a> FnMut([f32; 4], &'a [u64], f32) -> T,
     filter: impl Filter,
     mut callback: impl for<'a> FnMut(Row<'a, T>),
@@ -572,7 +581,7 @@ pub fn read_appendable_tape<'b, R, T>(
     R: RelationRead + 'b,
 {
     for guard in iter {
-        for i in 1..=guard.len() {
+        for i in std::mem::take(&mut skip) + 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
             let tuple = AppendableTuple::deserialize_ref(bytes);
             let columns = Columns::row(tuple.columns());

@@ -140,6 +140,7 @@ pub fn maintain<R>(
     opfamily: Opfamily,
     index: &R,
     chooser: &mut impl MaintainChooser,
+    pending: &vchordrq::Pending,
     check: impl Fn(),
 ) -> u64
 where
@@ -147,7 +148,7 @@ where
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-    // what a keyed list may take to be sorted: maintenance memory, as a vacuum reads it
+    // what a list's rows may take to be sorted: maintenance memory, as a vacuum reads it
     let memory = unsafe {
         use pgrx::pg_sys::{BackendType, MyBackendType, autovacuum_work_mem, maintenance_work_mem};
         if MyBackendType == BackendType::B_AUTOVAC_WORKER && autovacuum_work_mem != -1 {
@@ -164,6 +165,7 @@ where
                 make_h0_plain_prefetcher,
                 chooser,
                 memory,
+                pending,
                 check,
             )
         }
@@ -173,6 +175,7 @@ where
                 make_h0_plain_prefetcher,
                 chooser,
                 memory,
+                pending,
                 check,
             )
         }
@@ -182,6 +185,7 @@ where
                 make_h0_plain_prefetcher,
                 chooser,
                 memory,
+                pending,
                 check,
             )
         }
@@ -191,6 +195,7 @@ where
                 make_h0_plain_prefetcher,
                 chooser,
                 memory,
+                pending,
                 check,
             )
         }
@@ -199,6 +204,7 @@ where
             make_h0_plain_prefetcher,
             chooser,
             memory,
+            pending,
             check,
         ),
         (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq8Owned, Dot>>(
@@ -206,6 +212,7 @@ where
             make_h0_plain_prefetcher,
             chooser,
             memory,
+            pending,
             check,
         ),
         (VectorKind::Rabitq4, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq4Owned, L2S>>(
@@ -213,6 +220,7 @@ where
             make_h0_plain_prefetcher,
             chooser,
             memory,
+            pending,
             check,
         ),
         (VectorKind::Rabitq4, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq4Owned, Dot>>(
@@ -220,6 +228,7 @@ where
             make_h0_plain_prefetcher,
             chooser,
             memory,
+            pending,
             check,
         ),
     };

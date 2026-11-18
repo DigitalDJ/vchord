@@ -39,12 +39,51 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
+/// The pages a maintain holds unpublished or not yet freed: a list's new ones, then its old ones.
+#[derive(Default)]
+pub struct Pending(RefCell<Vec<u32>>);
+
+impl Pending {
+    /// Frees them, where the maintain holding them locks no page, as in its `check`.
+    pub fn give_back<R: RelationRead + RelationWrite>(&self, index: &R)
+    where
+        R::Page: Page<Opaque = Opaque>,
+    {
+        let meta_guard = index.read(0);
+        let meta_bytes = meta_guard.get(1).expect("data corruption");
+        let freepages_first = MetaTuple::deserialize_ref(meta_bytes).freepages_first();
+        drop(meta_guard);
+        self.free(index, freepages_first, || ());
+    }
+    fn free<R: RelationWrite>(
+        &self,
+        index: &R,
+        freepages_first: u32,
+        mut between: impl FnMut(),
+    ) -> usize
+    where
+        R::Page: Page<Opaque = Opaque>,
+    {
+        let mut n = 0;
+        loop {
+            let Some(id) = self.0.borrow_mut().pop() else {
+                return n;
+            };
+            freepages::free(index, freepages_first, id);
+            n += 1;
+            between();
+        }
+    }
+}
+
 /// `memory`: the most bytes of a list's rows that are sorted at once by their keys.
+/// `check`: a delay point, where maintain locks no page and `pending` may be given back.
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
     chooser: &mut impl MaintainChooser,
     memory: usize,
+    pending: &Pending,
     check: impl Fn(),
 ) -> Maintain
 where
@@ -57,13 +96,22 @@ where
     let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
     let keys = Keys::of_meta(meta_tuple);
-    let keyed = !keys.is_empty();
     let summarized = keys.summaries() != 0;
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
 
     drop(meta_guard);
+
+    struct Buffers {
+        number_of_formerly_allocated_pages: usize,
+        number_of_freshly_allocated_pages: usize,
+    }
+
+    let buffers = RefCell::new(Buffers {
+        number_of_formerly_allocated_pages: 0,
+        number_of_freshly_allocated_pages: 0,
+    });
 
     let step = |state: State| {
         let mut results = Vec::new();
@@ -73,8 +121,7 @@ where
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| results.push(first),
             );
-            // `check` sleeps for cost-based delay and checks interrupts, which
-            // LWLocks hold off: call it only where no buffer lock is held (#30).
+            // `check` may sleep or serve interrupts, which LWLocks hold off: never under a buffer lock (#30)
             check();
         }
         results
@@ -84,16 +131,22 @@ where
         state = step(state);
     }
 
-    struct Buffers {
-        pages: Vec<u32>,
-        number_of_formerly_allocated_pages: usize,
-        number_of_freshly_allocated_pages: usize,
-    }
-
-    let buffers = RefCell::new(Buffers {
-        pages: Vec::new(),
-        number_of_formerly_allocated_pages: 0,
-        number_of_freshly_allocated_pages: 0,
+    let hooked_index = RelationHooked(index, {
+        id_3(|index: &R, opaque: Opaque, tracking_freespace: bool| {
+            let mut buffers = buffers.borrow_mut();
+            let guard = if !tracking_freespace
+                && let Some(mut guard) = freepages::alloc(index, freepages_first)
+            {
+                buffers.number_of_formerly_allocated_pages += 1;
+                guard.clear(opaque);
+                guard
+            } else {
+                buffers.number_of_freshly_allocated_pages += 1;
+                index.extend(opaque, tracking_freespace)
+            };
+            pending.0.borrow_mut().push(guard.id());
+            guard
+        })
     });
 
     let mut number_of_tuples = 0_u64;
@@ -113,76 +166,52 @@ where
             continue;
         }
 
-        let mut jump_guard = index.write(first, false);
-        let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
-        let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
+        // only a maintain moves a list's tapes, and no other visits this list: they stay until the swap
+        let (directory_first, appendable_first) = {
+            let jump_guard = index.read(first);
+            let jump_bytes = jump_guard.get(1).expect("data corruption");
+            let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+            (jump_tuple.directory_first(), jump_tuple.appendable_first())
+        };
 
-        let hooked_index = RelationHooked(index, {
-            id_3(|index: &R, opaque: Opaque, tracking_freespace: bool| {
-                if !tracking_freespace {
-                    let mut buffers = buffers.borrow_mut();
-                    if let Some(id) = buffers.pages.pop() {
-                        drop(buffers);
-                        let mut guard = index.write(id, false);
-                        guard.clear(opaque);
-                        guard
-                    } else if let Some(mut guard) = freepages::alloc(index, freepages_first) {
-                        buffers.number_of_formerly_allocated_pages += 1;
-                        drop(buffers);
-                        guard.clear(opaque);
-                        guard
-                    } else {
-                        buffers.number_of_freshly_allocated_pages += 1;
-                        drop(buffers);
-                        index.extend(opaque, false)
-                    }
-                } else {
-                    index.extend(opaque, true)
-                }
-            })
-        });
-
-        let mut tape = FrozenTapeWriter::create(&hooked_index, &keys, false);
-
-        let mut trace_directory = Vec::new();
-        let mut trace_forzen = Vec::new();
-        let mut trace_appendable = Vec::new();
-
+        let mut trace = Vec::new();
         let mut tuples = 0_u64;
-        let mut rows = Rows::new(dim as _);
-        let mut bytes = Vec::new();
-        let mut callback = id_2(|row| {
-            if keyed {
-                rows.push(row, &keys);
-                // A list larger than `memory` is written as sorted runs.
-                if rows.bytes() > memory {
-                    rows.flush(&keys, &mut tape);
-                }
-            } else {
-                let (code, delta) = row.value;
-                let branch = Branch {
-                    code,
-                    delta,
-                    prefetch: row.prefetch.to_vec(),
-                    head: row.head,
-                    norm: 0.0,
-                    extra: row.payload,
-                };
-                bytes.clear();
-                row.columns.extend(&keys, &mut bytes);
-                tape.push(branch, &bytes);
-            }
+        let rows = RefCell::new(Rows::new(dim as _));
+        let mut push = id_2(|row| {
+            rows.borrow_mut().push(row, &keys);
             tuples += 1;
         });
+        // at each page the frozen tape moves on to, it is unlocked for `check`
+        let freeze = |tape: &mut FrozenTapeWriter<'_, _>, branch, columns: &[u8]| {
+            let last = tape.last();
+            tape.push(branch, columns);
+            if tape.last() != last {
+                tape.unlock();
+                check();
+            }
+        };
+        let mut tape = FrozenTapeWriter::create(&hooked_index, &keys, false);
+        let mut between = || {
+            // a list larger than `memory` is written as sorted runs
+            if rows.borrow().bytes() > memory {
+                rows.borrow_mut()
+                    .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
+            }
+            tape.unlock();
+            check();
+        };
         let pages = tape::read_directory_words::<R>(
-            tape::by_next(index, *jump_tuple.directory_first())
-                .inspect(|guard| trace_directory.push(guard.id())),
+            paced(tape::by_next(index, directory_first), &mut between)
+                .inspect(|guard| trace.push(guard.id())),
             &mut words,
             true,
         );
         tape::read_frozen_tape::<R, _, _>(
-            tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied())
-                .inspect(|guard| trace_forzen.push(guard.id())),
+            paced(
+                tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied()),
+                &mut between,
+            )
+            .inspect(|guard| trace.push(guard.id())),
             tape::All,
             || {
                 FunctionalAccessor::new(
@@ -212,44 +241,20 @@ where
                 )
             },
             (),
-            &mut callback,
+            &mut push,
         );
-        tape::read_appendable_tape::<R, _>(
-            tape::by_next(index, *jump_tuple.appendable_first())
-                .inspect(|guard| trace_appendable.push(guard.id())),
-            |metadata, elements, delta| (unpack_code(metadata, elements, dim as _), delta),
-            (),
-            &mut callback,
-        );
+        // the appendable tape in passes, each through the tail it starts with: into the sort, then copied
+        let mut at = (appendable_first, 0);
+        trace.push(appendable_first);
+        let mut pass = read_appendable(index, &mut at, &mut trace, &mut between, &mut push, dim);
 
-        rows.flush(&keys, &mut tape);
-
+        rows.borrow_mut()
+            .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
         let (frozen_tape, branches, columns) = tape.into_inner();
-
-        let mut appendable_tape = tape::TapeWriter::create(&hooked_index, false);
-
-        let width = keys.columns();
-        for (i, branch) in branches.into_iter().enumerate() {
-            appendable_tape.push(AppendableTuple {
-                metadata: [
-                    branch.code.0.dis_u_2,
-                    branch.code.0.factor_cnt,
-                    branch.code.0.factor_ip,
-                    branch.code.0.factor_err,
-                ],
-                elements: rabitq::bit::binary::pack_code(&branch.code.1),
-                delta: branch.delta,
-                prefetch: branch.prefetch,
-                head: branch.head,
-                payload: Some(branch.extra),
-                columns: columns[i * width..][..width].to_vec(),
-            });
-        }
-
         let frozen_first = { frozen_tape }.first();
 
         let mut directory = tape::Layout::new(keys.summaries());
-        for guard in tape::by_next(index, frozen_first) {
+        for guard in paced(tape::by_next(index, frozen_first), &check) {
             directory.page(guard.id());
             if summarized {
                 for i in 1..=guard.len() {
@@ -267,44 +272,125 @@ where
         if summarized {
             directory_tape.push_layout(&directory.words());
         }
-        let directory_tape = directory_tape.into_inner();
+        let directory_first = { directory_tape.into_inner() }.first();
 
-        *jump_tuple.directory_first() = { directory_tape }.first();
+        let mut appendable_tape = tape::TapeWriter::create(&hooked_index, false);
+        let width = keys.columns();
+        for (i, branch) in branches.into_iter().enumerate() {
+            appendable_tape.push(appendable(branch, &columns[i * width..][..width]));
+        }
+        let copy = |tape: &mut tape::TapeWriter<_, _>| {
+            rows.borrow_mut().flush(&keys, |branch, columns| {
+                tape.push(appendable(branch, columns));
+            });
+        };
+        // another pass only while they shrink: the lock waits for what is appended during the last
+        loop {
+            let n = read_appendable(
+                index,
+                &mut at,
+                &mut trace,
+                || {
+                    copy(&mut appendable_tape);
+                    appendable_tape.unlock();
+                    check();
+                },
+                &mut push,
+                dim,
+            );
+            if n >= pass {
+                break;
+            }
+            pass = n;
+        }
+        copy(&mut appendable_tape);
+        appendable_tape.unlock();
+
+        // inserts append under the jump page's share lock, so none is under way
+        let mut jump_guard = index.write(first, false);
+        read_appendable(index, &mut at, &mut trace, || (), &mut push, dim);
+        copy(&mut appendable_tape);
+        let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
+        let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
+        *jump_tuple.directory_first() = directory_first;
         *jump_tuple.frozen_first() = frozen_first;
         *jump_tuple.appendable_first() = { appendable_tape }.first();
         *jump_tuple.tuples() = tuples;
         number_of_tuples += tuples;
 
-        // Publish the new tapes (dropping the guard WAL-logs the jump page),
-        // then free this list's retired pages right away instead of keeping
-        // them in memory until every list is done, so a cancellation at the
-        // `check` below cannot lose them (#30). Later lists allocate them
-        // back from the free list.
+        // dropping the guard publishes the new tapes; readers of the old ones hold its share lock
         drop(jump_guard);
-
-        for id in trace_directory
-            .into_iter()
-            .chain(trace_forzen)
-            .chain(trace_appendable)
-        {
-            freepages::free(index, freepages_first, id);
-            number_of_freed_pages += 1;
-        }
-        check();
+        *pending.0.borrow_mut() = trace;
+        number_of_freed_pages += pending.free(index, freepages_first, &check);
     }
 
     let buffers = RefCell::into_inner(buffers);
-    for id in buffers.pages.iter().copied() {
-        freepages::free(index, freepages_first, id);
-        number_of_freed_pages += 1;
-        check();
-    }
 
     Maintain {
         number_of_formerly_allocated_pages: buffers.number_of_formerly_allocated_pages,
         number_of_freshly_allocated_pages: buffers.number_of_freshly_allocated_pages,
         number_of_freed_pages,
         number_of_tuples,
+    }
+}
+
+/// `pages`, with `between` run before each is read.
+fn paced<I: Iterator>(mut pages: I, mut between: impl FnMut()) -> impl Iterator<Item = I::Item> {
+    std::iter::from_fn(move || {
+        between();
+        pages.next()
+    })
+}
+
+/// Reads the appendable tape on from `at`, a page and its tuples read, through the tail it starts with; returns its pages.
+fn read_appendable<'b, R: RelationRead + 'b>(
+    index: &'b R,
+    at: &mut (u32, u16),
+    trace: &mut Vec<u32>,
+    mut between: impl FnMut(),
+    callback: impl for<'a> FnMut(tape::Row<'a, (rabitq::bit::Code, f32)>),
+    dim: u32,
+) -> usize
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let tail = tape::by_next(index, at.0).last().expect("a page").id();
+    let (first, skip) = *at;
+    let mut pages = 0;
+    let mut next = Some(first);
+    let guards = std::iter::from_fn(|| {
+        let id = next?;
+        if pages != 0 {
+            between();
+            trace.push(id);
+        }
+        let guard = index.read(id);
+        next = (id != tail).then(|| guard.get_opaque().next);
+        *at = (id, guard.len());
+        pages += 1;
+        Some(guard)
+    });
+    let access =
+        |metadata, elements: &[u64], delta| (unpack_code(metadata, elements, dim as _), delta);
+    tape::read_appendable_tape::<R, _>(guards, skip, access, (), callback);
+    pages
+}
+
+/// A row as an appendable tuple stores it.
+fn appendable(branch: Branch<NonZero<u64>>, columns: &[u8]) -> AppendableTuple {
+    AppendableTuple {
+        metadata: [
+            branch.code.0.dis_u_2,
+            branch.code.0.factor_cnt,
+            branch.code.0.factor_ip,
+            branch.code.0.factor_err,
+        ],
+        elements: rabitq::bit::binary::pack_code(&branch.code.1),
+        delta: branch.delta,
+        prefetch: branch.prefetch,
+        head: branch.head,
+        payload: Some(branch.extra),
+        columns: columns.to_vec(),
     }
 }
 
@@ -353,7 +439,7 @@ where
     Some(frozen + appendable)
 }
 
-/// A keyed list's row, but for its signs, pages and columns.
+/// A list's row, but for its signs, pages and columns.
 #[derive(Clone, Copy)]
 struct Fixed {
     metadata: [f32; 4],
@@ -362,7 +448,7 @@ struct Fixed {
     payload: NonZero<u64>,
 }
 
-/// A keyed list's rows, packed, to be sorted by their keys.
+/// A list's rows, packed, to be sorted by their keys.
 struct Rows {
     dim: usize,
     fixed: Vec<Fixed>,
@@ -408,19 +494,15 @@ impl Rows {
         self.prefetch.extend_from_slice(row.prefetch);
         row.columns.extend(keys, &mut self.columns);
     }
-    /// Writes the rows in the order of their keys, stable, and clears them.
-    fn flush<R>(&mut self, keys: &Keys, tape: &mut FrozenTapeWriter<'_, R>)
-    where
-        R: RelationWrite,
-        R::Page: Page<Opaque = Opaque>,
-    {
+    /// Writes the rows to `sink` in the order of their keys, stable, and clears them.
+    fn flush(&mut self, keys: &Keys, mut sink: impl FnMut(Branch<NonZero<u64>>, &[u8])) {
         let width = keys.columns();
         let row = |i: u32| Columns::row(&self.columns[i as usize * width..][..width]);
         let mut order = (0..self.len() as u32).collect::<Vec<_>>();
         order.sort_unstable_by(|&i, &j| keys.cmp(row(i), row(j)).then(i.cmp(&j)));
         for i in order {
             let (branch, columns) = self.branch(i as _);
-            tape.push(branch, columns);
+            sink(branch, columns);
         }
         *self = Self::new(self.dim);
     }
@@ -517,5 +599,221 @@ where
 
     fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>> {
         self.0.search(freespace)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::{Summary, Width};
+    use crate::operator::Op;
+    use crate::types::{DistanceKind, Structure, VchordrqIndexOptions, VectorKind, VectorOptions};
+    use index::test_support::{MakePlainPrefetcher, MemoryRelation};
+    use index_accessor::L2S;
+    use std::cell::Cell;
+    use std::panic::AssertUnwindSafe;
+    use vector::vect::VectOwned;
+
+    type M = MemoryRelation<Opaque>;
+    type O = Op<VectOwned<f32>, L2S>;
+    const DIM: usize = 100;
+
+    struct All;
+
+    impl MaintainChooser for All {
+        fn choose(&mut self, _: usize) -> bool {
+            true
+        }
+    }
+
+    fn keys() -> [Keys; 2] {
+        [
+            Keys::new([]),
+            Keys::new([(Width::W8, false, Some(Summary::Bounds))]),
+        ]
+    }
+
+    fn meta(relation: &M) -> (u32, u32) {
+        let guard = relation.read(0);
+        let meta = MetaTuple::deserialize_ref(guard.get(1).unwrap());
+        (meta.first(), meta.freepages_first())
+    }
+
+    /// One list as a build writes it, with rows 1 to `n` appended; returns its jump page.
+    fn index(relation: &M, keys: &Keys, n: u64) -> u32 {
+        let (dim, v, d) = (DIM as _, VectorKind::Vecf32, DistanceKind::L2S);
+        let options = VchordrqIndexOptions {
+            degree_of_parallelism: 1,
+            ..Default::default()
+        };
+        let centroids = vec![VectOwned::new(vec![0.0; DIM])];
+        let structure = Structure {
+            centroids,
+            children: vec![Vec::new()],
+        };
+        crate::build::<_, O>(
+            VectorOptions { dim, v, d },
+            options,
+            keys,
+            relation,
+            vec![structure],
+        );
+        let first = meta(relation).0;
+        (1..=n).for_each(|payload| append(relation, keys, first, payload));
+        first
+    }
+
+    /// As an insert appends, under the jump page's share lock.
+    fn append(relation: &M, keys: &Keys, first: u32, payload: u64) {
+        let key = (payload % 13).to_le_bytes();
+        let tuple = AppendableTuple {
+            metadata: [1.0; 4],
+            delta: 0.0,
+            payload: NonZero::new(payload),
+            prefetch: vec![7],
+            head: 0,
+            elements: vec![payload; DIM.div_ceil(64)],
+            columns: if keys.is_empty() {
+                Vec::new()
+            } else {
+                [&key[..], &[0; 4]].concat()
+            },
+        };
+        let jump_guard = relation.read(first);
+        let appendable_first =
+            JumpTuple::deserialize_ref(jump_guard.get(1).unwrap()).appendable_first();
+        let bytes = AppendableTuple::serialize(&tuple);
+        tape::append(
+            relation,
+            appendable_first,
+            &bytes,
+            false,
+            Some(meta(relation).1),
+        );
+    }
+
+    /// The list's payloads, sorted, its tuple count, and the pages neither in its tapes nor free.
+    fn list(relation: &M, first: u32) -> (Vec<u64>, u64, u32) {
+        let jump_guard = relation.read(first);
+        let jump_tuple = JumpTuple::deserialize_ref(jump_guard.get(1).unwrap());
+        let (mut payloads, mut pages) = (Vec::new(), 0);
+        let accessor = || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _]));
+        pages += tape::by_next(relation, jump_tuple.directory_first()).count() as u32;
+        let frozen = tape::by_next(relation, jump_tuple.frozen_first()).inspect(|_| pages += 1);
+        tape::read_frozen_tape::<M, _, _>(frozen, tape::All, accessor, (), |row| {
+            payloads.push(row.payload.get())
+        });
+        let appendable =
+            tape::by_next(relation, jump_tuple.appendable_first()).inspect(|_| pages += 1);
+        tape::read_appendable_tape::<M, _>(
+            appendable,
+            0,
+            |_, _, _| (),
+            (),
+            |row| payloads.push(row.payload.get()),
+        );
+        let mut guard = relation.write(meta(relation).1, false);
+        let mut id = *FreepagesTuple::deserialize_mut(guard.get_mut(1).unwrap()).first();
+        drop(guard);
+        while id != u32::MAX {
+            pages += 1;
+            id = relation.read(id).get_opaque().next;
+        }
+        payloads.sort_unstable();
+        (payloads, jump_tuple.tuples(), relation.pages() - pages)
+    }
+
+    #[test]
+    fn appended_meanwhile() {
+        // `burst` rows at every delay point until the swap: with 120 they outpace each pass
+        for (keys, memory, burst) in keys()
+            .into_iter()
+            .flat_map(|k| [(1 << 12, 1), (1 << 30, 1), (1 << 30, 120)].map(|(m, b)| (k, m, b)))
+        {
+            let relation = M::new([]);
+            let first = index(&relation, &keys, 3000);
+            let (next, calls, old) = (Cell::new(3001), Cell::new(0), Cell::new(0));
+            let check = || {
+                for id in 0..relation.pages() {
+                    assert!(
+                        relation.page(id).try_borrow_mut().is_ok(),
+                        "page {id} is locked"
+                    );
+                }
+                calls.set(calls.get() + 1);
+                assert!(calls.get() < 100_000, "maintain does not end");
+                let jump_guard = relation.read(first);
+                let jump_tuple = JumpTuple::deserialize_ref(jump_guard.get(1).unwrap());
+                if jump_tuple.appendable_first() == old.get() {
+                    drop(jump_guard);
+                    for _ in 0..burst {
+                        append(&relation, &keys, first, next.get());
+                        next.set(next.get() + 1);
+                    }
+                }
+            };
+            for _ in 0..2 {
+                let (_, _, other) = list(&relation, first);
+                let jump_guard = relation.read(first);
+                old.set(JumpTuple::deserialize_ref(jump_guard.get(1).unwrap()).appendable_first());
+                drop(jump_guard);
+                let prefetch = MakePlainPrefetcher { index: &relation };
+                let maintain = maintain::<_, O>(
+                    &relation,
+                    prefetch,
+                    &mut All,
+                    memory,
+                    &Pending::default(),
+                    check,
+                );
+                let (payloads, tuples, now) = list(&relation, first);
+                assert_eq!(payloads, (1..next.get()).collect::<Vec<_>>());
+                assert_eq!(
+                    (tuples, maintain.number_of_tuples),
+                    (payloads.len() as u64, tuples)
+                );
+                assert_eq!(now, other, "a page is lost");
+            }
+        }
+    }
+
+    #[test]
+    fn abandoned() {
+        for keys in keys() {
+            let calls = Cell::new(0);
+            let relation = M::new([]);
+            index(&relation, &keys, 3000);
+            let prefetch = MakePlainPrefetcher { index: &relation };
+            maintain::<_, O>(
+                &relation,
+                prefetch,
+                &mut All,
+                1 << 12,
+                &Pending::default(),
+                || calls.set(calls.get() + 1),
+            );
+            for k in 1..=calls.get() {
+                let relation = M::new([]);
+                let first = index(&relation, &keys, 3000);
+                let (_, _, other) = list(&relation, first);
+                let (pending, calls) = (Pending::default(), Cell::new(0));
+                let check = || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == k {
+                        append(&relation, &keys, first, 3001);
+                        std::panic::panic_any(k);
+                    }
+                };
+                let prefetch = MakePlainPrefetcher { index: &relation };
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    maintain::<_, O>(&relation, prefetch, &mut All, 1 << 12, &pending, check)
+                }));
+                assert_eq!(*result.err().unwrap().downcast::<u32>().unwrap(), k);
+                pending.give_back(&relation);
+                let (payloads, _, now) = list(&relation, first);
+                assert_eq!(payloads, (1..=3001).collect::<Vec<_>>());
+                assert_eq!(now, other, "a page is lost at delay point {k}");
+            }
+        }
     }
 }
