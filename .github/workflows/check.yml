@@ -397,6 +397,8 @@ jobs:
     runs-on: ${{ matrix.arch == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
 
     env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
@@ -406,12 +408,6 @@ jobs:
     steps:
       - name: Set up Environment
         run: |
-          # The hosted image's unrelated Vagrant tap can break brew update.
-          if brew tap | grep -qx 'hashicorp/tap'; then
-            brew untap --force hashicorp/tap
-          fi
-          brew update
-
           d=$(mktemp -d)
           curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-${{ matrix.arch }}-apple-darwin.tar.gz"
           tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
@@ -422,7 +418,9 @@ jobs:
 
       - name: Install Clang
         run: |
-          brew install llvm@18
+          if [ ! -x "$(brew --prefix llvm@18)/bin/clang" ]; then
+            brew install llvm@18
+          fi
           echo CC=$(brew --prefix llvm@18)/bin/clang >> $GITHUB_ENV
           echo CLANG_PATH=$(brew --prefix llvm@18)/bin/clang >> $GITHUB_ENV
           echo LIBCLANG_PATH=$(brew --prefix llvm@18)/lib >> $GITHUB_ENV
