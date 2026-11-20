@@ -16,10 +16,7 @@ use pgrx::pg_sys::Datum;
 pub enum Io {
     Plain,
     Simple,
-    #[cfg_attr(
-        any(feature = "pg14", feature = "pg15", feature = "pg16"),
-        expect(dead_code)
-    )]
+    #[cfg_attr(any(feature = "pg15", feature = "pg16"), expect(dead_code))]
     Stream,
 }
 

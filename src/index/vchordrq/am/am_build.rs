@@ -1010,7 +1010,7 @@ unsafe fn parallel_build(
     }
 
     let check = || {
-        pgrx::check_for_interrupts!();
+        pgrx::check_for_interrupts();
     };
 
     let order = sync_0();
@@ -1164,7 +1164,7 @@ unsafe fn sequential_build(
     }
 
     let check = || {
-        pgrx::check_for_interrupts!();
+        pgrx::check_for_interrupts();
     };
 
     sync_0();
@@ -1265,7 +1265,7 @@ unsafe fn options(
     index_relation: pgrx::pg_sys::Relation,
 ) -> (VectorOptions, VchordrqIndexingOptions) {
     let att = unsafe { &mut *(*index_relation).rd_att };
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+    #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
     let atts = unsafe { att.attrs.as_slice(att.natts as _) };
     #[cfg(any(feature = "pg18", feature = "pg19"))]
     let atts = unsafe {
@@ -1525,7 +1525,7 @@ fn make_internal_build(
             }
         };
         for i in 0..num_iterations {
-            pgrx::check_for_interrupts!();
+            pgrx::check_for_interrupts();
             if result.is_empty() {
                 let percentage =
                     ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;

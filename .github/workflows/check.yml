@@ -14,6 +14,7 @@ on:
         default: false
 
 env:
+  CLANG_NO_DEFAULT_CONFIG: "1"
   SCCACHE_GHA_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.gha_cache }}
 
 concurrency:
@@ -147,7 +148,10 @@ jobs:
           d=$(mktemp -d)
           curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
           sudo bash "$d/llvm.sh" 18
+          sudo apt-get install -y --no-install-recommends llvm-18 libclang-18-dev
           echo CC=clang-18 >> $GITHUB_ENV
+          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
+          echo LIBCLANG_PATH=/usr/lib/llvm-18/lib >> $GITHUB_ENV
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -205,7 +209,10 @@ jobs:
           d=$(mktemp -d)
           curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
           sudo bash "$d/llvm.sh" 18
+          sudo apt-get install -y --no-install-recommends llvm-18 libclang-18-dev
           echo CC=clang-18 >> $GITHUB_ENV
+          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
+          echo LIBCLANG_PATH=/usr/lib/llvm-18/lib >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -247,7 +254,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["15", "16", "17", "18", "19"]
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
@@ -276,7 +283,10 @@ jobs:
           d=$(mktemp -d)
           curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
           sudo bash "$d/llvm.sh" 18
+          sudo apt-get install -y --no-install-recommends llvm-18 libclang-18-dev
           echo CC=clang-18 >> $GITHUB_ENV
+          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
+          echo LIBCLANG_PATH=/usr/lib/llvm-18/lib >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -330,7 +340,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.arch }}-linux-gnu
+          name: postgresql-${{ matrix.version }}-vchord_1.4.0_${{ matrix.arch }}-linux-gnu
           path: ./build
           compression-level: 9
           retention-days: 14
@@ -355,8 +365,10 @@ jobs:
         run: |
           ./devtools/check-symbols.sh "$($PG_CONFIG --pkglibdir)/vchord.so"
           if ! grep -q "^default_version = '0.0.0'$" vchord.control; then
-            sudo cp sql/install/vchord--1.1.1.sql "$($PG_CONFIG --sharedir)/extension/"
-            ./devtools/check-upgrade.sh 1.1.1
+            for version in 1.1.1 1.2.0 1.3.0; do
+              sudo cp "sql/install/vchord--$version.sql" "$($PG_CONFIG --sharedir)/extension/"
+              ./devtools/check-upgrade.sh "$version"
+            done
           fi
 
       - name: Logging
@@ -379,7 +391,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["15", "16", "17", "18", "19"]
         arch: ["aarch64", "x86_64"]
 
     runs-on: ${{ matrix.arch == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
@@ -409,7 +421,11 @@ jobs:
         run: rustup update
 
       - name: Install Clang
-        run: echo CC=$(brew --prefix llvm@18)/bin/clang >> $GITHUB_ENV
+        run: |
+          brew install llvm@18
+          echo CC=$(brew --prefix llvm@18)/bin/clang >> $GITHUB_ENV
+          echo CLANG_PATH=$(brew --prefix llvm@18)/bin/clang >> $GITHUB_ENV
+          echo LIBCLANG_PATH=$(brew --prefix llvm@18)/lib >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -418,23 +434,32 @@ jobs:
 
       - name: Install PostgreSQL & pgvector
         run: |
-          brew install postgresql@${{ matrix.version }}
-          brew services start postgresql@${{ matrix.version }}
-          for i in {1..60}; do [ -S /tmp/.s.PGSQL.5432 ] && echo "PostgreSQL ready" && break || sleep 1; done
-          [ -S /tmp/.s.PGSQL.5432 ] || echo "PostgreSQL socket not found after 60 seconds"
-
-          $(brew --prefix postgresql@${{ matrix.version }})/bin/createdb -O $(whoami) $(whoami)
-          $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'ALTER SYSTEM SET max_worker_processes = 1024'
-          $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
-          brew services stop postgresql@${{ matrix.version }}
-
-          $(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config
-          echo PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config >> $GITHUB_ENV
+          if [ "${{ matrix.version }}" = "19" ]; then
+            # Homebrew does not yet provide postgresql@19 on every runner.
+            mkdir ~/postgresql-install
+            curl -fsSL --retry 3 https://ftp.postgresql.org/pub/source/v19.0/postgresql-19.0.tar.bz2 | tar -xj -C ~/postgresql-install
+            pushd ~/postgresql-install/postgresql-19.0
+            ./configure --prefix="$RUNNER_TEMP/pg19" --enable-cassert --without-icu --without-readline --without-zlib
+            make -j$(sysctl -n hw.ncpu)
+            make install
+            popd
+            PG_CONFIG="$RUNNER_TEMP/pg19/bin/pg_config"
+          else
+            brew install postgresql@${{ matrix.version }}
+            PG_CONFIG="$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config"
+          fi
+          "$PG_CONFIG"
+          echo "PG_CONFIG=$PG_CONFIG" >> $GITHUB_ENV
+          pg_bindir="$("$PG_CONFIG" --bindir)"
+          echo "$pg_bindir" >> $GITHUB_PATH
+          "$pg_bindir/initdb" -D "$RUNNER_TEMP/vchord-pgdata" -A trust
+          echo 'max_worker_processes = 1024' >> "$RUNNER_TEMP/vchord-pgdata/postgresql.conf"
+          echo "shared_preload_libraries = 'vchord'" >> "$RUNNER_TEMP/vchord-pgdata/postgresql.conf"
 
           mkdir ~/pgvector-install
-          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang' OPTFLAGS=""
-          sudo make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=$(brew --prefix postgresql@${{ matrix.version }})/bin/pg_config CC='sccache clang' OPTFLAGS="" install
+          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.tar.gz | tar -xz -C ~/pgvector-install
+          make -C ~/pgvector-install/pgvector-0.8.7 PG_CONFIG="$PG_CONFIG" CC="sccache $CC" OPTFLAGS=""
+          sudo make -C ~/pgvector-install/pgvector-0.8.7 PG_CONFIG="$PG_CONFIG" CC="sccache $CC" OPTFLAGS="" install
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -451,17 +476,16 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.arch }}-apple-darwin
+          name: postgresql-${{ matrix.version }}-vchord_1.4.0_${{ matrix.arch }}-apple-darwin
           path: ./build
           compression-level: 9
           retention-days: 14
 
       - name: Service
         run: |
-          brew services start postgresql@${{ matrix.version }}
-          for i in {1..60}; do [ -S /tmp/.s.PGSQL.5432 ] && echo "PostgreSQL ready" && break || sleep 1; done
-          [ -S /tmp/.s.PGSQL.5432 ] || echo "PostgreSQL socket not found after 60 seconds"
-          $(brew --prefix postgresql@${{ matrix.version }})/bin/psql -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
+          pg_ctl -D "$RUNNER_TEMP/vchord-pgdata" -l "$RUNNER_TEMP/vchord-postgresql.log" -w start
+          createdb -O $(whoami) $(whoami)
+          psql -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
 
       - name: Sqllogictest
         run: |
@@ -475,11 +499,15 @@ jobs:
       - name: Logging
         if: always()
         run: |
-          cat $(brew --prefix)/var/log/postgresql@${{ matrix.version }}.log
+          cat "$RUNNER_TEMP/vchord-postgresql.log"
 
       - name: Server log check
         run: |
-          ! grep -nE 'TRAP:|PANIC:|terminated by signal|was not closed|reference leak|refcount leak|not owned by resource owner|after release started' $(brew --prefix)/var/log/postgresql@${{ matrix.version }}.log
+          ! grep -nE 'TRAP:|PANIC:|terminated by signal|was not closed|reference leak|refcount leak|not owned by resource owner|after release started' "$RUNNER_TEMP/vchord-postgresql.log"
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: pg_ctl -D "$RUNNER_TEMP/vchord-pgdata" -m fast -w stop
 
   psql_windows:
     if: |
@@ -490,7 +518,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["15", "16", "17", "18", "19"]
         arch: ["x86_64"]
 
     runs-on: "windows-2022"
@@ -519,9 +547,6 @@ jobs:
         run: |
           'PGBIN','PGDATA','PGROOT', 'PGUSER', 'PGPASSWORD' | ForEach-Object { Remove-Item "env:$_" }
 
-          if ( "${{ matrix.version }}" -eq "14" ) {
-            $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-14.20-2-windows-x64-binaries.zip"
-          }
           if ( "${{ matrix.version }}" -eq "15" ) {
             $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-15.15-2-windows-x64-binaries.zip"
           }
@@ -533,6 +558,9 @@ jobs:
           }
           if ( "${{ matrix.version }}" -eq "18" ) {
             $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-18.1-2-windows-x64-binaries.zip"
+          }
+          if ( "${{ matrix.version }}" -eq "19" ) {
+            $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-19.0-1-windows-x64-binaries.zip"
           }
           Invoke-WebRequest -Uri $postgresql_url -OutFile "$env:TEMP\postgresql-install.zip"
           Expand-Archive -Path "$env:TEMP\postgresql-install.zip" -DestinationPath "D:\postgresql-install" -Force
@@ -549,16 +577,20 @@ jobs:
           D:\postgresql-install\pgsql\bin\pg_config.exe
           Add-Content -Path $env:GITHUB_ENV -Value "PG_CONFIG=D:\postgresql-install\pgsql\bin\pg_config.exe"
 
-          Invoke-WebRequest -Uri "https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.zip" -OutFile "$env:TEMP\pgvector-install.zip"
+          Invoke-WebRequest -Uri "https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.zip" -OutFile "$env:TEMP\pgvector-install.zip"
           Expand-Archive -Path "$env:TEMP\pgvector-install.zip" -DestinationPath "D:\pgvector-install" -Force
           & 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Launch-VsDevShell.ps1' -HostArch amd64 -Arch amd64
-          Push-Location -Path D:\pgvector-install\pgvector-0.8.1
+          Push-Location -Path D:\pgvector-install\pgvector-0.8.7
           nmake /F Makefile.win PGROOT="D:\postgresql-install\pgsql"
           nmake /F Makefile.win PGROOT="D:\postgresql-install\pgsql" install
           Pop-Location
 
       - name: Install Clang
-        run: Add-Content -Path $env:GITHUB_ENV -Value "CC=clang-cl.exe"
+        run: |
+          Add-Content -Path $env:GITHUB_ENV -Value "CC=clang-cl.exe"
+          $clang_bin = Split-Path (Get-Command clang.exe).Source
+          Add-Content -Path $env:GITHUB_ENV -Value "CLANG_PATH=$clang_bin\clang.exe"
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$clang_bin"
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -575,7 +607,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.arch }}-pc-windows-msvc
+          name: postgresql-${{ matrix.version }}-vchord_1.4.0_${{ matrix.arch }}-pc-windows-msvc
           path: ./build
           compression-level: 9
           retention-days: 14
@@ -650,8 +682,10 @@ jobs:
 
       - name: Install Clang
         run: |
-          sudo apk add --no-cache clang18 clang18-dev
+          sudo apk add --no-cache clang18 clang18-dev llvm18
           echo CC=clang-18 >> $GITHUB_ENV
+          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
+          echo LIBCLANG_PATH=/usr/lib/llvm18/lib >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -682,9 +716,9 @@ jobs:
           echo PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config >> $GITHUB_ENV
 
           mkdir ~/pgvector-install
-          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS=""
-          make -C ~/pgvector-install/pgvector-0.8.1 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS="" install
+          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.tar.gz | tar -xz -C ~/pgvector-install
+          make -C ~/pgvector-install/pgvector-0.8.7 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS=""
+          make -C ~/pgvector-install/pgvector-0.8.7 PG_CONFIG=/usr/libexec/postgresql${{ matrix.version }}/pg_config CC='sccache clang-18' OPTFLAGS="" install
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -711,7 +745,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.arch }}-linux-musl
+          name: postgresql-${{ matrix.version }}-vchord_1.4.0_${{ matrix.arch }}-linux-musl
           path: ./build
           compression-level: 9
           retention-days: 14
@@ -753,12 +787,6 @@ jobs:
             rust_triple: "s390x-unknown-linux-gnu"
             gcc_version: "14"
             debian_version: "trixie"
-          - version: "14"
-            platform: "ppc64le"
-            clang_triple: "powerpc64le-linux-gnu"
-            rust_triple: "powerpc64le-unknown-linux-gnu"
-            gcc_version: "12"
-            debian_version: "bookworm"
           - version: "15"
             platform: "ppc64le"
             clang_triple: "powerpc64le-linux-gnu"
@@ -778,6 +806,12 @@ jobs:
             gcc_version: "12"
             debian_version: "bookworm"
           - version: "18"
+            platform: "ppc64le"
+            clang_triple: "powerpc64le-linux-gnu"
+            rust_triple: "powerpc64le-unknown-linux-gnu"
+            gcc_version: "12"
+            debian_version: "bookworm"
+          - version: "19"
             platform: "ppc64le"
             clang_triple: "powerpc64le-linux-gnu"
             rust_triple: "powerpc64le-unknown-linux-gnu"
@@ -848,7 +882,10 @@ jobs:
           d=$(mktemp -d)
           curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
           sudo bash "$d/llvm.sh" 18
+          sudo apt-get install -y --no-install-recommends llvm-18 libclang-18-dev
           echo CC=clang-18 >> $GITHUB_ENV
+          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
+          echo LIBCLANG_PATH=/usr/lib/llvm-18/lib >> $GITHUB_ENV
 
       - name: Set up Sccache
         uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -891,9 +928,9 @@ jobs:
           echo PG_CONFIG=pg_config >> $GITHUB_ENV
 
           mkdir ~/pgvector-install
-          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          make -C ~/pgvector-install/pgvector-0.8.1 with_llvm=no CC='sccache clang' CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS=""
-          sudo make -C ~/pgvector-install/pgvector-0.8.1 with_llvm=no CC='sccache clang' CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS="" install
+          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.tar.gz | tar -xz -C ~/pgvector-install
+          make -C ~/pgvector-install/pgvector-0.8.7 with_llvm=no CC='sccache clang' CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS=""
+          sudo make -C ~/pgvector-install/pgvector-0.8.7 with_llvm=no CC='sccache clang' CFLAGS="-fuse-ld=lld --target=${{ matrix.clang_triple }} --sysroot=/sysroot" OPTFLAGS="" install
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -931,7 +968,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: postgresql-${{ matrix.version }}-vchord_0.0.0_${{ matrix.clang_triple }}
+          name: postgresql-${{ matrix.version }}-vchord_1.4.0_${{ matrix.clang_triple }}
           path: ./build
           compression-level: 9
           retention-days: 14
@@ -964,7 +1001,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["17", "18"]
+        version: ["17", "18", "19"]
 
     runs-on: "ubuntu-24.04"
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_valgrind && 360 || 90 }}
@@ -1028,6 +1065,10 @@ jobs:
           if [ "${{ matrix.version }}" = "18" ]; then
             curl -fsSL https://ftp.postgresql.org/pub/source/v18.0/postgresql-18.0.tar.bz2 | tar -xj -C ~/postgresql-install
             pushd ~/postgresql-install/postgresql-18.0
+          fi
+          if [ "${{ matrix.version }}" = "19" ]; then
+            curl -fsSL https://ftp.postgresql.org/pub/source/v19.0/postgresql-19.0.tar.bz2 | tar -xj -C ~/postgresql-install
+            pushd ~/postgresql-install/postgresql-19.0
           fi
           ./configure \
               --prefix=/usr \
@@ -1093,8 +1134,8 @@ jobs:
           echo PG_CONFIG=pg_config >> $GITHUB_ENV
 
           mkdir ~/pgvector-install
-          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.1.tar.gz | tar -xz -C ~/pgvector-install
-          pushd ~/pgvector-install/pgvector-0.8.1
+          curl -fsSL https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.tar.gz | tar -xz -C ~/pgvector-install
+          pushd ~/pgvector-install/pgvector-0.8.7
           make OPTFLAGS="" -j$(nproc)
           sudo make OPTFLAGS="" install
           popd
