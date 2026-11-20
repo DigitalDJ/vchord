@@ -872,7 +872,8 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup default beta
+          # Keep experimental architecture APIs on the validated toolchain.
+          rustup default 1.99.1
           rustup component add rustfmt clippy
           rustup target add ${{ matrix.rust_triple }}
           echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV

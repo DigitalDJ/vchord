@@ -472,7 +472,9 @@ unsafe fn parallel_build(
             heap_relation,
             tablescandesc,
             #[cfg(feature = "pg19")]
-            pgrx::pg_sys::ScanOptions::SO_NONE,
+            {
+                pgrx::pg_sys::ScanOptions::SO_NONE as _
+            },
         )
     };
     let opfamily = unsafe { opfamily(index_relation) };
