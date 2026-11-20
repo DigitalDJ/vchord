@@ -247,7 +247,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["14", "15", "16", "17", "18", "19"]
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
@@ -379,7 +379,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["14", "15", "16", "17", "18", "19"]
         arch: ["aarch64", "x86_64"]
 
     runs-on: ${{ matrix.arch == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
@@ -490,7 +490,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["14", "15", "16", "17", "18", "19"]
         arch: ["x86_64"]
 
     runs-on: "windows-2022"
@@ -533,6 +533,9 @@ jobs:
           }
           if ( "${{ matrix.version }}" -eq "18" ) {
             $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-18.1-2-windows-x64-binaries.zip"
+          }
+          if ( "${{ matrix.version }}" -eq "19" ) {
+            $postgresql_url = "https://get.enterprisedb.com/postgresql/postgresql-19.0-1-windows-x64-binaries.zip"
           }
           Invoke-WebRequest -Uri $postgresql_url -OutFile "$env:TEMP\postgresql-install.zip"
           Expand-Archive -Path "$env:TEMP\postgresql-install.zip" -DestinationPath "D:\postgresql-install" -Force
@@ -964,7 +967,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["17", "18"]
+        version: ["17", "18", "19"]
 
     runs-on: "ubuntu-24.04"
     timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_valgrind && 360 || 90 }}
@@ -1028,6 +1031,10 @@ jobs:
           if [ "${{ matrix.version }}" = "18" ]; then
             curl -fsSL https://ftp.postgresql.org/pub/source/v18.0/postgresql-18.0.tar.bz2 | tar -xj -C ~/postgresql-install
             pushd ~/postgresql-install/postgresql-18.0
+          fi
+          if [ "${{ matrix.version }}" = "19" ]; then
+            curl -fsSL https://ftp.postgresql.org/pub/source/v19.0/postgresql-19.0.tar.bz2 | tar -xj -C ~/postgresql-install
+            pushd ~/postgresql-install/postgresql-19.0
           fi
           ./configure \
               --prefix=/usr \

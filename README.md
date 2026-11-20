@@ -6,7 +6,7 @@
 [![Version: v1.3.0](https://img.shields.io/badge/Version-v1.3.0-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
-[![PostgreSQL: 14-18](https://img.shields.io/badge/PostgreSQL-14--18-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![PostgreSQL: 14-19](https://img.shields.io/badge/PostgreSQL-14--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
 
 **`vchord`** is a PostgreSQL extension engineered for scalable, high-performance, and disk-friendly vector similarity search, serving as the successor to `pgvecto.rs`.
 
@@ -55,7 +55,7 @@ For full setup instructions (Debian/Ubuntu packages, PGXN, Kubernetes, and sourc
 
 ### 1. Install via Native Linux Packages ([`pig`](https://pig.pgsty.com/))
 
-On EL 8/9/10, Debian 12/13, and Ubuntu 22.04/24.04 (PostgreSQL 14–18), you can install pre-built native packages from the [Pigsty repository](https://pigsty.io/ext/e/vchord) (see package matrix on [pgext.cloud](https://pgext.cloud/ext/vchord)):
+On EL 8/9/10, Debian 12/13, and Ubuntu 22.04/24.04 (PostgreSQL 14–19), you can install pre-built native packages from the [Pigsty repository](https://pigsty.io/ext/e/vchord) (see package matrix on [pgext.cloud](https://pgext.cloud/ext/vchord)):
 
 ```bash
 curl -fsSL https://repo.pigsty.io/pig | bash
@@ -72,7 +72,7 @@ sudo systemctl restart postgresql
 
 ### 2. Run with Docker
 
-For a PostgreSQL 18 demo with upstream **1.1.1** preloaded
+For a PostgreSQL 19 demo with upstream **1.1.1** preloaded
 (this image does not contain PGSTY 1.3.0):
 
 ```bash
@@ -80,11 +80,11 @@ docker run \
   --name vchord-demo \
   -e POSTGRES_PASSWORD=mysecretpassword \
   -p 5432:5432 \
-  -d ghcr.io/tensorchord/vchord-postgres:pg18-v1.1.1
+  -d ghcr.io/tensorchord/vchord-postgres:pg19-v1.1.1
 ```
 
 > [!NOTE]
-> For hybrid vector + full-text search, use the all-in-one [`tensorchord/vchord-suite:pg18-latest`](https://vchord.pgsty.com/docs/vchord/getting-started/vectorchord-suite/) image, which bundles [`vchord`](https://github.com/pgsty/vchord), [`vchord_bm25`](https://github.com/pgsty/vchord_bm25), and [`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer).
+> For hybrid vector + full-text search, use the all-in-one [`tensorchord/vchord-suite:pg19-latest`](https://vchord.pgsty.com/docs/vchord/getting-started/vectorchord-suite/) image, which bundles [`vchord`](https://github.com/pgsty/vchord), [`vchord_bm25`](https://github.com/pgsty/vchord_bm25), and [`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer).
 
 Connect to the instance with `psql`:
 
@@ -128,7 +128,7 @@ all below `2.0`.
 ### Upgrading to 1.3.0
 
 The [1.3.0 release](https://github.com/pgsty/vchord/releases/tag/1.3.0) provides
-Linux ZIP archives and Debian packages for PostgreSQL 14–18 on x86_64 and
+Linux ZIP archives and Debian packages for PostgreSQL 14–19 on x86_64 and
 aarch64, built on Ubuntu 22.04 (glibc 2.35 or newer). Distribution repositories
 may update on a different schedule.
 
@@ -197,36 +197,10 @@ Review both dotted keys and `[build.external]` sections. Every external table mu
 name, such as `public.centroids`. See [Query sampling](https://vchord.pgsty.com/docs/vchord/usage/measure-recall/#query-sampling)
 and [External builds](https://vchord.pgsty.com/docs/vchord/usage/external-build/).
 
-### PostgreSQL 19 RC1 validation
-
-PostgreSQL 19 is a prerelease. The `pg19` feature and C API compatibility
-code are available in `main` for development validation; official support
-and packages remain PostgreSQL 14–18. RC1 source builds have been validated
-on Linux x86_64 and macOS arm64 with Rust 1.99.1, pgrx 0.19.3, and
-pgvector 0.8.7, including PostgreSQL assertions and the full SQL regression
-suite.
-
-Install pgvector for PostgreSQL 19, then build and install `vchord` against
-the RC1 installation's `pg_config`:
-
-```bash
-git clone https://github.com/pgsty/vchord.git
-cd vchord
-PG_CONFIG=/path/to/pg19/bin/pg_config make build
-make PG_CONFIG=/path/to/pg19/bin/pg_config install # use sudo if required
-```
-
-Add `vchord` to that server's `shared_preload_libraries`, restart it, and run
-`CREATE EXTENSION IF NOT EXISTS vchord CASCADE;`. PostgreSQL 19 is not
-included in the CI or release matrices. Formal release support will be
-considered after PostgreSQL 19 GA and a fresh compatibility check.
-
----
-
 ## Testing
 
 The **Check** workflow is manually dispatched. Regular jobs retain the full
-Rust and SQL suites, Clippy, and platform coverage. Valgrind on PostgreSQL 17/18
+Rust and SQL suites, Clippy, and platform coverage. Valgrind on PostgreSQL 17/18/19
 defaults to the two existing `scan_abort.slt` regressions (100-row fixtures),
 covering scans, reranking, rescans, errors, cancellation, and resource cleanup.
 The SQL step has a 20-minute timeout; the job including debug builds has a
